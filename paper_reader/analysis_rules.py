@@ -27,7 +27,7 @@ LABELS = {
 }
 CAPTION = re.compile(
     r"^(?:(?:fig(?:ure)?|table|algorithm|abbildung|tabelle|tabla|figure|tableau)\.?\s*\d+"
-    r"(?:[.：:．|]\s*|(?=\s+\w))|第?\s*[０-９\d]*\s*[図表]\s*[０-９\d]+\s*[.：:．]?)",
+    r"(?:\s*[.：:．|]\s*|(?=\s+\w))|第?\s*[０-９\d]*\s*[図表]\s*[０-９\d]+\s*[.：:．]?)",
     re.I,
 )
 NUMBER = re.compile(r"[-–—―\s]*([0-9０-９]+)[-–—―\s]*$")
@@ -254,7 +254,9 @@ def classify(lines, width, height, neighbours, evidence, options, regions=()):
                                         if abs(line.box[0] - caption.box[0]) < 25
                                         and abs(line.size - caption.size) <= size * .07
                                         and (line.paragraph == caption.paragraph or caption.size < size * .94)
-                                        and -2 <= line.box[1] - caption.box[3] < max(3, size * .55)), None)
+                                        and line.box[1] - caption.box[1] > caption.size * .35
+                                        and (-max(2, caption.size * .7) if line.paragraph == caption.paragraph else -2)
+                                        <= line.box[1] - caption.box[3] < max(3, size * .55)), None)
         if side and (_similar_edge(line, side, furniture_key(text), neighbours, height)
                      or NUMBER.fullmatch(text) or re.match(r"^(?:https?://doi\.org/|doi\s*:)", text, re.I)):
             kind = "furniture"

@@ -92,6 +92,7 @@ class Document(QObject):
     changed = Signal()
     note_changed = Signal(object)
     note_jobs_changed = Signal(object, bool)
+    drafts_changed = Signal()
     input_error = Signal(str)
 
     def __init__(self, store, identifier, path, key):
@@ -451,6 +452,8 @@ class Document(QObject):
 
     def save(self, destination=None, callback=None):
         if self.loading or self.disposed:
+            if callback:
+                callback(False)
             return
         overwrite = destination is None or Path(destination).resolve() == self.path
         if overwrite and (not self.dirty or self.external):

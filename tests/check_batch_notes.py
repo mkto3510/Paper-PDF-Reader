@@ -68,6 +68,10 @@ def exercise(app, root, endpoint):
 
         click(a)
         assert panel.cards[a].editing
+        panel.cards[a].editor.setFocus()
+        QTest.keyClick(panel.cards[a].editor, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+        assert panel.cards[a].editor.textCursor().selectedText() == "Original 0"
+        assert not panel.multiple
         panel.cards[a].editor.setPlainText("Draft kept")
         panel.cards[a].editor.document().setModified(True)
         click(c, Qt.KeyboardModifier.ShiftModifier)
@@ -87,6 +91,9 @@ def exercise(app, root, endpoint):
         wait(lambda: all(doc.get_note(key)["color"] == red for key in (a, c, e)), "Bulk color did not apply")
         assert all(doc.get_note(key)["color"] != red for key in (b, d))
         panel.set_filter(red, True)
+        click(c)
+        panel.cards[c].setFocus()
+        QTest.keyClick(panel.cards[c], Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
         assert panel.multiple == {a, c, e}
         panel.reset_filter()
 

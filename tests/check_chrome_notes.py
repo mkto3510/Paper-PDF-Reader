@@ -205,6 +205,9 @@ def exercise(app, folder, count):
         assert first in panel.keys and second not in panel.keys
         panel.reset_filter()
         assert len(panel.keys) == count
+        pane.pick_note(first, focus_card=True)
+        QTest.keyClick(panel.cards[first], Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+        assert len(panel.multiple) == count and len(panel.cards) < 60
 
         pane.pick_note(first, focus_card=True)
         QTest.keyClick(panel.cards[first], Qt.Key.Key_Delete)

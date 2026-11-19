@@ -5,8 +5,8 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtCore import QPoint, QSize, QTimer, Qt
+from PySide6.QtGui import QColor, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea, QSpinBox,
@@ -14,7 +14,10 @@ from PySide6.QtWidgets import (
 )
 
 from .analysis_rules import LABELS, RULES
+from .icons import swatch
+from .notes import COLORS
 from .preferences import DEFAULTS
+from .sidebar import ButtonGrid
 from .translation import DEFAULT_PROFILE, request_url
 
 
@@ -23,6 +26,12 @@ def spin(low, high, value):
     box.setRange(low, high)
     box.setValue(value)
     return box
+
+
+def dialog_corner(work_area, frame_size, preferred):
+    x = max(work_area.x(), min(preferred.x(), work_area.x() + work_area.width() - frame_size.width()))
+    y = max(work_area.y(), min(preferred.y(), work_area.y() + work_area.height() - frame_size.height()))
+    return QPoint(x, y)
 
 
 class SettingsDialog(QDialog):
@@ -243,7 +252,7 @@ class SettingsDialog(QDialog):
 
 
 class TranslationDialog(QDialog):
-    def __init__(self, pane, choices=None, point=None, key=None, source="", comment=""):
+    def __init__(self, pane, choices=None, point=None, key=None, source="", comment="", color=None):
         super().__init__(pane, Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.pane, self.document = pane, pane.document
@@ -252,11 +261,26 @@ class TranslationDialog(QDialog):
         self.choices, self.key = choices, key
         self.job = None
         self.selected = choices[0] if choices else None
+        self.source_drafts = {}
+        self.source_mode = False
+        self.anchor = point
+        self.preferred_size = QSize(*self.preferences.data["dialogSize"])
+        self.fitting = False
+        self.work_screen = None
+        self.screen_monitoring = False
+        self.resize(self.preferred_size)
         t = pane.t
         self.setWindowTitle(t("翻訳", "Translate"))
-        self.resize(*self.preferences.data["dialogSize"])
         layout = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll, 1)
+        content = QWidget()
+        scroll.setWidget(content)
+        controls = QVBoxLayout(content)
+        controls.setContentsMargins(0, 0, 0, 0)
         form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.source = QTextEdit()
         self.source.setPlainText(self.selected.source if choices else source)
         self.output = QTextEdit()
@@ -268,28 +292,56 @@ class TranslationDialog(QDialog):
             self.profile.addItem(profile["name"], identifier)
         self.profile.setCurrentIndex(self.profile.findData(self.preferences.data["activeProfile"]))
         form.addRow(t("翻訳サービス", "Translation service"), self.profile)
+        self.color = None
+        if choices:
+            self.color = QComboBox()
+            for shade, labels in COLORS.items():
+                self.color.addItem(swatch(QColor(shade)), t(*labels), shade)
+            self.color.setCurrentIndex(self.color.findData(color or pane.last_color))
+            form.addRow(t("ハイライトの色", "Highlight color"), self.color)
         if self.selected and self.selected.skipped:
-            include = QCheckBox(t("除外した箇所を含める", "Include excluded text"))
-            include.setToolTip(" / ".join(t(*LABELS[name]) for name in self.selected.skipped if name in LABELS))
+            items = {}
+            for item in self.selected.exclusions:
+                items.setdefault((item.page, item.kind), []).append(item.text)
+            headings = {}
+            for page, kind in items:
+                label = t(*LABELS.get(kind, (kind, kind)))
+                headings[page, kind] = t(f"{label}（{page + 1}ページ）", f"{label} (p. {page + 1})")
+            summary = QLabel()
+            summary.setTextFormat(Qt.TextFormat.PlainText)
+            summary.setWordWrap(True)
+            summary.setText(t("除外した箇所", "Excluded text") + "\n" + " / ".join(headings.values()))
+            form.addRow(summary)
+            details = QPushButton(t("除外した原文を表示", "Show excluded text"))
+            details.setCheckable(True)
+            excerpt = QTextEdit()
+            excerpt.setReadOnly(True)
+            excerpt.setPlainText("\n\n".join(headings[key] + "\n" + "\n".join(parts)
+                                             for key, parts in items.items()))
+            excerpt.setMaximumHeight(110)
+            excerpt.hide()
+            details.toggled.connect(excerpt.setVisible)
+            form.addRow(details)
+            form.addRow(excerpt)
+            include = QCheckBox(t("除外した箇所を戻す", "Restore excluded text"))
             include.toggled.connect(self.include)
+            include.toggled.connect(lambda restored: include.setText(
+                t("除外を再適用するにはチェックを外す", "Uncheck to reapply exclusions") if restored
+                else t("除外した箇所を戻す", "Restore excluded text")))
             form.addRow(include)
-        layout.addLayout(form)
+        controls.addLayout(form)
         self.status = QLabel()
         self.status.setWordWrap(True)
-        layout.addWidget(self.status)
-        row = QHBoxLayout()
-        layout.addLayout(row)
+        controls.addWidget(self.status)
         self.start = QPushButton(t("翻訳", "Translate"))
         self.start.clicked.connect(self.preview)
         self.source.textChanged.connect(self.update_start)
         self.update_start()
-        row.addWidget(self.start)
         self.save = QPushButton(t("注釈に保存", "Save to annotation"))
         self.save.clicked.connect(self.accept_annotation)
-        row.addWidget(self.save)
         reset = QPushButton(t("既定のサイズ", "Reset size"))
-        reset.clicked.connect(lambda: self.resize(*DEFAULTS["dialogSize"]))
-        row.addWidget(reset)
+        reset.clicked.connect(self.reset_size)
+        controls.addWidget(ButtonGrid([self.start, self.save, reset]))
         for widget, callback in ((self.source, self.preview), (self.output, self.accept_annotation)):
             shortcut = QShortcut(QKeySequence("Ctrl+Return"), widget)
             shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -299,17 +351,74 @@ class TranslationDialog(QDialog):
             enter.activated.connect(callback)
         QShortcut(QKeySequence("Alt+T"), self, activated=self.preview)
         self.finished.connect(self.cleanup)
-        if point is not None:
-            screen = self.screen().availableGeometry()
-            self.move(min(point.x(), screen.right() - self.width()),
-                      min(point.y() + 8, screen.bottom() - self.height()))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if event.spontaneous():
+            return
+        at = self.anchor
+        parent = self.pane.window.windowHandle()
+        screen = ((QGuiApplication.screenAt(at) if at is not None else None)
+                  or (parent.screen() if parent else None) or QGuiApplication.primaryScreen())
+        self.fit_screen(screen, at, use_preferred=True)
+        if not self.screen_monitoring:
+            self.windowHandle().screenChanged.connect(self.schedule_fit)
+            QGuiApplication.instance().screenRemoved.connect(self.schedule_fit)
+            self.screen_monitoring = True
+        self.schedule_fit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.isVisible() and not self.fitting and self.work_screen is not None:
+            self.preferred_size = event.size()
+
+    def schedule_fit(self, *_):
+        QTimer.singleShot(0, self, lambda: self.fit_screen(self.screen()))
+
+    def reset_size(self):
+        self.preferred_size = QSize(*DEFAULTS["dialogSize"])
+        self.fit_screen(self.screen(), use_preferred=True)
+
+    def fit_screen(self, screen, anchor=None, *, use_preferred=False):
+        if screen is None:
+            return
+        if self.work_screen is not screen:
+            if self.work_screen in QGuiApplication.screens():
+                self.work_screen.availableGeometryChanged.disconnect(self.schedule_fit)
+            self.work_screen = screen
+            screen.availableGeometryChanged.connect(self.schedule_fit)
+        area = screen.availableGeometry()
+        frame = self.frameGeometry()
+        margins = self.windowHandle().frameMargins()
+        chrome = QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        limit = (area.size() - chrome).expandedTo(QSize(1, 1))
+        desired = self.preferred_size if use_preferred else self.size()
+        self.fitting = True
+        try:
+            self.setMaximumSize(limit)
+            self.resize(desired.boundedTo(limit))
+            size = self.size() + chrome
+            if anchor is not None:
+                corner = anchor + QPoint(0, 8)
+            elif use_preferred:
+                corner = area.center() - QPoint(size.width() // 2, size.height() // 2)
+            else:
+                corner = frame.topLeft()
+            position = dialog_corner(area, size, corner)
+            if frame.topLeft() != position:
+                self.move(position)
+        finally:
+            self.fitting = False
 
     def include(self, enabled):
         if self.job and self.job.state in ("running", "waiting"):
             self.job.cancel()
+        self.source_drafts[self.source_mode] = self.source.toPlainText()
+        self.source_mode = enabled
         self.selected = self.choices[int(enabled)]
-        self.source.setPlainText(self.selected.source)
+        self.source.setPlainText(self.source_drafts.get(enabled, self.selected.source))
         self.output.clear()
+        self.status.clear()
 
     def update_start(self):
         running = self.job and self.job.state in ("waiting", "running")
@@ -363,7 +472,7 @@ class TranslationDialog(QDialog):
                 self.document.detach_job(targets, cancel=True)
                 self.document.modify(targets, comment=comment)
         elif self.selected and self.selected.quads:
-            self.document.add_highlight(self.selected.quads, self.pane.last_color, "" if running else comment,
+            self.document.add_highlight(self.selected.quads, self.color.currentData(), "" if running else comment,
                                         attached, job.cancel if running else None)
         elif running:
             job.cancel()
@@ -374,7 +483,7 @@ class TranslationDialog(QDialog):
             self.job.changed.disconnect(self.update_job)
             if self.job.state in ("running", "waiting"):
                 self.job.cancel()
-        size = [self.width(), self.height()]
+        size = [self.preferred_size.width(), self.preferred_size.height()]
         if size != self.preferences.data["dialogSize"]:
             try:
                 self.preferences.save(self.preferences.data | {"dialogSize": size})

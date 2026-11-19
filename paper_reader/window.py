@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import QEvent, QEventLoop, QTimer, Qt
+from PySide6.QtCore import QEvent, QEventLoop, QSignalBlocker, QTimer, Qt
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
     QDialog, QFileDialog, QFormLayout, QInputDialog, QLabel, QLineEdit, QMainWindow,
@@ -33,6 +33,7 @@ class Reader(QMainWindow):
         self.actions = {}
         self.action_groups = []
         self.opening = set()
+        self.switching = False
         self.tabs = QTabWidget()
         self.tabs.setTabBar(DocumentTabs())
         self.tabs.setMovable(True)
@@ -61,10 +62,37 @@ class Reader(QMainWindow):
             self.refresh_settings()
 
     def active_tab_changed(self, _):
-        if self.last_pane and self.last_pane is not self.pane:
-            self.last_pane.notes.commit_selected()
+        previous, target = self.last_pane, self.pane
+        if self.switching:
+            if previous is not None and self.tabs.indexOf(previous) >= 0:
+                with QSignalBlocker(self.tabs):
+                    self.tabs.setCurrentWidget(previous)
+            return
+        if (previous is not None and target is not None and self.tabs.indexOf(previous) >= 0
+                and previous.document is not target.document
+                and self.controller.has_unsaved_changes(previous.document)):
+            focus = previous.focusWidget()
+            with QSignalBlocker(self.tabs):
+                self.tabs.setCurrentWidget(previous)
+            self.switching = True
+            try:
+                proceed = self.confirm_switch(previous.document)
+                if proceed and self.tabs.indexOf(target) >= 0:
+                    with QSignalBlocker(self.tabs):
+                        self.tabs.setCurrentWidget(target)
+                    target.view.setFocus()
+                elif focus is not None:
+                    focus.setFocus()
+            finally:
+                self.switching = False
+        elif previous and previous is not target and self.tabs.indexOf(previous) >= 0:
+            previous.notes.commit_selected()
+        self.sync_active_tab()
+
+    def sync_active_tab(self):
+        if self.last_pane is not self.pane:
+            self.chrome.clear_notice()
         self.last_pane = self.pane
-        self.chrome.clear_notice()
         self.chrome.page.setModified(False)
         self.chrome.select_pane(self.pane)
         if self.tab_list.isVisible():
@@ -89,6 +117,7 @@ class Reader(QMainWindow):
     def action(self, menu, key, names, callback, shortcut="", required=True, check=False):
         action = QAction(self.t(*names), self)
         symbols = {"open": "open", "page_previous": "page-up", "page_next": "page-down",
+                   "single": "single", "spread": "spread",
                    "width": "width", "fit": "fit", "left": "left", "right": "right",
                    "bigger": "zoom-in", "smaller": "zoom-out", "find": "find",
                    "find_previous": "previous", "find_next": "next", "outline": "outline",
@@ -207,6 +236,21 @@ class Reader(QMainWindow):
         SettingsDialog(self).open()
 
     def update_status(self, *_):
+        drafts = {pane.document for pane in self.controller.panes() if pane.notes.has_drafts()}
+        tabs_changed = False
+        for i in range(self.tabs.count()):
+            doc = self.tabs.widget(i).document
+            unsaved = doc.dirty or doc.mutating or doc in drafts
+            name = doc.path.name + (" *" if unsaved else "")
+            if self.tabs.tabText(i) != name:
+                self.tabs.setTabText(i, name)
+                tabs_changed = True
+            state = self.t("未保存の変更あり", "Unsaved changes") if unsaved else ""
+            tip = "\n".join(part for part in (str(doc.path), state) if part)
+            if self.tabs.tabToolTip(i) != tip:
+                self.tabs.setTabToolTip(i, tip)
+        if tabs_changed and self.tab_list.isVisible():
+            self.tab_list.refresh()
         pane = self.pane
         ready = bool(pane and pane.document.info and not pane.document.loading)
         for key, (action, required) in self.actions.items():
@@ -218,13 +262,13 @@ class Reader(QMainWindow):
             self.actions["notes"][0].setText(self.t("注釈一覧", "Annotations"))
             self.chrome.menus.actions()[1].setText(self.t("表示", "View"))
             self.chrome.set_external("")
+            self.chrome.set_save_state("")
             return
         doc = pane.document
-        name = doc.path.name + (" *" if doc.dirty else "")
-        for i in range(self.tabs.count()):
-            if self.tabs.widget(i).document is doc:
-                if self.tabs.tabText(i) != name:
-                    self.tabs.setTabText(i, name)
+        unsaved = doc.dirty or doc.mutating or doc in drafts
+        state = (self.t("保存中…", "Saving…") if doc.saving else
+                 self.t("未保存の変更があります", "Unsaved changes") if unsaved else "")
+        self.chrome.set_save_state(state)
         for key, active in ((pane.view.layout_mode, True), ("continuous", pane.view.continuous),
                             ("rtl", pane.view.rtl), ("outline", not pane.outline.isHidden()),
                             ("notes", not pane.notes.isHidden())):
@@ -232,7 +276,7 @@ class Reader(QMainWindow):
         failed = any(job.state == "failed" for job in doc.jobs.values())
         self.actions["notes"][0].setText(self.t("注釈一覧", "Annotations") + (" ●" if failed else ""))
         self.chrome.menus.actions()[1].setText(self.t("表示", "View") + (" ●" if failed and pane.notes.isHidden() else ""))
-        self.actions["save"][0].setEnabled(doc.dirty and not doc.external and not doc.busy)
+        self.actions["save"][0].setEnabled(unsaved and not doc.saving)
         self.actions["back"][0].setEnabled(pane.history_index > 0)
         self.actions["forward"][0].setEnabled(pane.history_index + 1 < len(pane.history))
         current = pane.view.current_page()
@@ -293,11 +337,13 @@ class Reader(QMainWindow):
         pane = DocumentPane(self, doc)
         pane.location_changed.connect(self.update_status)
         pane.message.connect(self.show_message)
+        doc.drafts_changed.connect(pane.location_changed)
         self.chrome.search.addWidget(pane.search_panel)
         index = self.tabs.addTab(pane, doc.path.name)
-        self.tabs.setTabToolTip(index, str(doc.path))
         self.tabs.setCurrentIndex(index)
-        pane.view.setFocus()
+        if self.pane is pane:
+            pane.view.setFocus()
+        self.update_status()
         return pane
 
     def duplicate(self, new_window):
@@ -320,6 +366,8 @@ class Reader(QMainWindow):
         if index < 0:
             return
         self.tabs.setCurrentIndex(index)
+        if self.tabs.currentIndex() != index:
+            return
         menu = QMenu(self)
         menu.addAction(self.t("タブを複製", "Duplicate tab"), lambda: self.duplicate(False))
         menu.addAction(self.t("別ウインドウに複製", "Duplicate in new window"), lambda: self.duplicate(True))
@@ -352,17 +400,16 @@ class Reader(QMainWindow):
         QMessageBox.warning(self, "Paper PDF Reader", self.error_text(message))
 
     def reload(self):
-        self.pane.notes.commit_selected()
         doc = self.pane.document
         if self.confirm_discard(doc, reload=True):
             self.load_document(doc, reload=True)
 
     def confirm_discard(self, doc, reload=False):
-        if doc.busy:
+        if doc.loading:
             self.show_message(self.t("PDF を更新しています。", "The PDF is being updated."))
             return False
-        drafts = self.controller.has_comment_drafts(doc)
-        if not doc.dirty and not doc.has_active_jobs and not drafts:
+        unsaved = self.controller.has_unsaved_changes(doc)
+        if not unsaved and not doc.has_active_jobs and not doc.saving:
             return True
         box = QMessageBox(self)
         box.setWindowTitle(doc.path.name)
@@ -371,47 +418,95 @@ class Reader(QMainWindow):
                                  self.t("破棄して閉じる", "Discard and close"), QMessageBox.ButtonRole.DestructiveRole)
         cancel = box.addButton(self.t("キャンセル", "Cancel"), QMessageBox.ButtonRole.RejectRole)
         save = box.addButton(self.t("保存して続行", "Save and continue"), QMessageBox.ButtonRole.AcceptRole)
-        save.setEnabled(doc.dirty and not doc.has_active_jobs and not drafts)
+        save.setEnabled((unsaved or bool(doc.saving)) and not doc.has_active_jobs)
         box.setDefaultButton(cancel)
         box.exec()
         if box.clickedButton() is discard:
             return True
         if box.clickedButton() is not save:
             return False
-        path = self.save_destination(doc) if doc.external else None
-        if doc.external and not path:
+        return self.save_document(doc)
+
+    def confirm_switch(self, doc):
+        box = QMessageBox(self)
+        box.setWindowTitle(doc.path.name)
+        box.setText(self.t("未保存の変更があります。", "This document has unsaved changes."))
+        save = box.addButton(self.t("保存して切り替え", "Save and switch"), QMessageBox.ButtonRole.AcceptRole)
+        keep = box.addButton(self.t("未保存のまま切り替え", "Switch without saving"), QMessageBox.ButtonRole.ActionRole)
+        cancel = box.addButton(self.t("キャンセル", "Cancel"), QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        chosen = box.clickedButton()
+        return chosen is keep or (chosen is save and self.save_document(doc))
+
+    def save_document(self, doc, destination=None):
+        if doc.loading or doc.disposed:
             return False
-        loop = QEventLoop()
+        if doc.external and destination is None:
+            destination = self.save_destination(doc)
+            if not destination:
+                return False
+        panels = [pane.notes for pane in self.controller.panes() if pane.document is doc]
+        drafts = {}
+        for panel in panels:
+            for key, value in panel.comment_drafts().items():
+                if key in drafts and drafts[key] != value:
+                    self.show_message(self.t("同じ注釈に異なる下書きがあります。各タブでコメントを確認してください。",
+                                             "Tabs have different drafts for the same annotation. Review their comments."))
+                    return False
+                drafts[key] = value
+        for panel in panels:
+            panel.commit_drafts()
+
+        wait = QEventLoop()
+
+        def settled():
+            if not doc.busy:
+                wait.quit()
+
+        if doc.busy:
+            doc.changed.connect(settled)
+            try:
+                wait.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            finally:
+                doc.changed.disconnect(settled)
+        if self.controller.has_comment_drafts(doc):
+            return False
+        doc.auto_save.stop()
         result = []
 
         def ready(ok):
             result.append(ok)
-            loop.quit()
-        doc.save(path, ready)
+            wait.quit()
+
+        doc.save(destination, ready)
         if not result:
-            loop.exec()
-        return bool(result and result[0])
+            wait.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        if not result or not result[0]:
+            return False
+        return destination is not None or not self.controller.has_unsaved_changes(doc)
 
     def close_tabs(self, indices):
         panes = [pane for i in sorted(set(indices)) if (pane := self.tabs.widget(i))]
         surviving = set(self.controller.panes()) - set(panes)
         ending = {pane.document for pane in panes} - {pane.document for pane in surviving}
-        for pane in panes:
-            pane.notes.commit_selected()
         if any(not self.confirm_discard(doc) for doc in sorted(ending, key=lambda d: d.identifier)):
             return False
-        for pane in panes:
-            if pane.annotation_dialog:
-                pane.annotation_dialog.reject()
-            self.tabs.removeTab(self.tabs.indexOf(pane))
-            self.chrome.search.removeWidget(pane.search_panel)
-            pane.search_panel.deleteLater()
-            pane.deleteLater()
+        with QSignalBlocker(self.tabs):
+            for pane in panes:
+                if pane.document not in ending:
+                    pane.notes.commit_selected()
+                if pane.annotation_dialog:
+                    pane.annotation_dialog.reject()
+                self.tabs.removeTab(self.tabs.indexOf(pane))
+                self.chrome.search.removeWidget(pane.search_panel)
+                pane.search_panel.deleteLater()
+                pane.deleteLater()
         if self.tab_list.isVisible():
             self.tab_list.refresh()
         for doc in ending:
             self.controller.documents.remove(doc)
-        self.update_status()
+        self.sync_active_tab()
         return True
 
     def closeEvent(self, event):
@@ -424,7 +519,7 @@ class Reader(QMainWindow):
 
     def save(self):
         if self.pane:
-            self.pane.document.save()
+            self.save_document(self.pane.document)
 
     def save_destination(self, doc):
         path, _ = QFileDialog.getSaveFileName(self, self.t("名前を付けて保存", "Save as"),
@@ -435,7 +530,7 @@ class Reader(QMainWindow):
         if self.pane:
             doc = self.pane.document
             if path := self.save_destination(doc):
-                doc.save(path)
+                self.save_document(doc, path)
 
     def toggle_continuous(self):
         self.pane.view.set_layout(continuous=not self.pane.view.continuous)

@@ -5,7 +5,7 @@ from bisect import bisect_left, bisect_right
 from PySide6.QtCore import QEvent, QTimer, Qt
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QShortcut, QTextOption
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QMenu, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
+    QApplication, QFrame, QHBoxLayout, QMenu, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
     QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -64,6 +64,7 @@ class Card(QFrame):
         self.editor.setMinimumWidth(0)
         self.editor.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.editor.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.editor.document().modificationChanged.connect(self.pane.document.drafts_changed)
         layout.addWidget(self.editor)
         self.commit, self.translate, self.delete = QPushButton(), QPushButton(), QPushButton()
         self.commit.clicked.connect(self.commit_comment)
@@ -257,6 +258,9 @@ class Notes(QWidget):
             button.toggled.connect(lambda on, shade=color: self.set_filter(shade, on))
             self.colors[color] = button
         layout.addWidget(ButtonGrid(list(self.colors.values())))
+        select_all = QShortcut(QKeySequence.StandardKey.SelectAll, self)
+        select_all.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        select_all.activated.connect(self.select_all_cards)
         self.relabel()
 
     def relabel(self):
@@ -295,6 +299,20 @@ class Notes(QWidget):
 
     def delete_multiple(self):
         self.pane.delete_notes(self.multiple)
+
+    def select_all_cards(self):
+        focused = QApplication.focusWidget()
+        if isinstance(focused, QPlainTextEdit):
+            focused.selectAll()
+            return
+        self.sync_membership()
+        if self.keys:
+            self.commit_selected()
+            self.pane.view.selected_note = None
+            self.pane.view.viewport().update()
+            self.set_selection(None)
+            self.selection_anchor = self.keys[0]
+            self.set_multiple(set(self.keys))
 
     def select_card(self, key, modifiers=Qt.KeyboardModifier.NoModifier):
         extend = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
@@ -344,6 +362,18 @@ class Notes(QWidget):
         return bool(self.drafts) or any(card.editing and card.editor.document().isModified()
                                         for card in self.cards.values())
 
+    def comment_drafts(self):
+        return self.drafts | {key: card.editor.toPlainText() for key, card in self.cards.items()
+                              if card.editing and card.editor.document().isModified()}
+
+    def commit_drafts(self):
+        for key, value in self.comment_drafts().items():
+            if card := self.cards.get(key):
+                if card.editing and card.editor.document().isModified():
+                    card.commit_comment()
+                    continue
+            self.save_comment(key, value)
+
     def save_comment(self, key, value):
         doc = self.pane.document
         if not doc.get_note(key):
@@ -357,6 +387,7 @@ class Notes(QWidget):
                 self.pending_comments.pop(key, None)
                 self.drafts.setdefault(key, value)
                 self.update_cards({key})
+                doc.drafts_changed.emit()
 
         targets = doc.targets(key)
         doc.detach_job(targets, cancel=True)
