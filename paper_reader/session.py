@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-from heapq import heappop, heappush
+from heapq import heapify, heappop, heappush
 from itertools import count
 from multiprocessing import get_context
+from tempfile import TemporaryDirectory
 from threading import Thread
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 
 
-def _run_worker(peer):
+def _run_worker(peer, working_directory):
     from .pdf import worker
 
-    worker(peer)
+    worker(peer, working_directory)
 
 
 class PdfSession(QObject):
@@ -23,8 +24,9 @@ class PdfSession(QObject):
     def __init__(self, parent):
         super().__init__(parent)
         context = get_context("spawn")
+        self.working_directory = TemporaryDirectory(prefix="paper-reader-documents-")
         self.pipe, peer = context.Pipe()
-        self.process = context.Process(target=_run_worker, args=(peer,), daemon=True)
+        self.process = context.Process(target=_run_worker, args=(peer, self.working_directory.name), daemon=True)
         self.process.start()
         peer.close()
         self.queue = []
@@ -69,7 +71,14 @@ class PdfSession(QObject):
         callback, _ = self.current
         self.current = None
         callback(result, error)
-        self._pump()
+        QTimer.singleShot(0, self._pump)
+
+    def promote(self, key, priority):
+        for index, request in enumerate(self.queue):
+            if request[2] == key and request[0] > priority:
+                self.queue[index] = (priority, *request[1:])
+                heapify(self.queue)
+                break
 
     def discard(self, key):
         keep = []
@@ -92,12 +101,19 @@ class PdfSession(QObject):
             heappop(self.queue)[5](None, message)
 
     def shutdown(self):
+        if self.pipe.closed:
+            return
         self.closed = True
         self.queue.clear()
         self.current = None
-        self.pipe.close()
+        try:
+            self.pipe.send(None)
+        except (OSError, EOFError):
+            pass
         self.process.join(timeout=0.7)
         if self.process.is_alive():
             self.process.terminate()
             self.process.join()
-        self.reader.join(timeout=0.1)
+        self.reader.join(timeout=0.7)
+        self.pipe.close()
+        self.working_directory.cleanup()

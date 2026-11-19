@@ -1,615 +1,563 @@
-"""The reader, translation popup, and portable self-test entry point."""
+"""Qt windows and actions for the tabbed reader."""
 
 from __future__ import annotations
 
-import argparse
-import json
 from pathlib import Path
 import sys
-from tempfile import TemporaryDirectory
 
-from PySide6.QtCore import QPoint, Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence, QShortcut
+from PySide6.QtCore import QEvent, QEventLoop, QTimer, Qt
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QDialogButtonBox, QDockWidget, QFileDialog,
-    QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QSpinBox, QTextEdit,
-    QToolBar, QVBoxLayout,
+    QDialog, QFileDialog, QFormLayout, QInputDialog, QLabel, QLineEdit, QMainWindow,
+    QMenu, QMessageBox, QTabWidget, QTextEdit, QToolButton, QVBoxLayout,
 )
 
 from . import VERSION
-from .paths import data_dir, write_json
-from .session import PdfSession
-from .translation import DEFAULTS, Translations
-from .view import PaperView, tile_image
-
-
-COLORS = {
-    "黄": "#ffd400", "赤": "#ff6666", "緑": "#5fb236", "青": "#2ea8e5",
-    "紫": "#a28ae5", "赤紫": "#e56eee", "橙": "#f19837", "灰": "#aaaaaa",
-}
-VALUE = Qt.ItemDataRole.UserRole
+from .chrome import DocumentTabs, Header, TabList
+from .dialogs import SettingsDialog
+from .icons import icon
+from .pane import DocumentPane
+from .view import ACTUAL_SIZE
 
 
 class Reader(QMainWindow):
-    def __init__(self, folder=None):
+    def __init__(self, controller):
         super().__init__()
-        self.resize(1130, 820)
-        self.setAcceptDrops(True)
-        self.folder = folder if folder is not None else data_dir()
-        self.settings = DEFAULTS.copy()
-        try:
-            saved = json.loads((self.folder / "settings.json").read_text(encoding="utf-8"))
-            for key, default in DEFAULTS.items():
-                if type(saved.get(key)) is type(default):
-                    self.settings[key] = saved[key]
-        except (OSError, AttributeError, ValueError):
-            pass
-        self.settings["backupCount"] = min(200, max(0, self.settings["backupCount"]))
-        self.settings["concurrency"] = min(8, max(1, self.settings["concurrency"]))
-        self.path = None
-        self.opening = False
-        self.revision = self.saved_revision = 0
-        self.modifying = 0
-        self.saving = 0
-        self.popup = None
-        self.annotations = {}
-        self.groups = {}
-        self.jobs = {}
-        self.failed = {}
-        self.last_color = next(iter(COLORS.values()))
-        self.session = PdfSession(self)
-        self.translator = Translations(self, self.settings["concurrency"])
-        self.auto_save = QTimer(self, singleShot=True, interval=240)
-        self.auto_save.timeout.connect(self.save)
-        self.view = PaperView(self.session, self)
-        self.view.chosen.connect(self.show_selection)
-        self.view.clicked.connect(self.show_at)
-        self.view.message.connect(self.notify)
-        self.setCentralWidget(self.view)
-        bar = QToolBar("PDF", self)
-        bar.setMovable(False)
-        self.addToolBar(bar)
-        self.add_action(bar, "開く", "Ctrl+O", self.browse)
-        self.add_action(bar, "保存", "Ctrl+S", self.save)
-        self.add_action(bar, "名前を付けて保存", "Ctrl+Shift+S", self.save_as)
-        bar.addSeparator()
-        self.add_action(bar, "縮小", "Ctrl+-", lambda: self.view.change_zoom(1 / 1.2))
-        self.add_action(bar, "拡大", "Ctrl++", lambda: self.view.change_zoom(1.2))
-        self.add_action(bar, "幅に合わせる", "Ctrl+0", self.view.change_zoom)
-        self.add_action(bar, "ページへ移動", "Ctrl+G", self.go_to_page)
-        self.add_action(bar, "目次", "", self.show_outline)
-        self.add_action(bar, "注釈", "", self.toggle_annotations)
-        self.add_action(bar, "翻訳設定", "", self.configure)
+        self.controller = controller
+        self.preferences = controller.preferences
+        self.setMinimumWidth(530)
+        self.resize(1180, 820)
         self.setWindowTitle("Paper PDF Reader")
-        self.outline = []
-        self.note_panel = QDockWidget("ハイライトと注釈", self)
-        self.note_list = QListWidget(self.note_panel)
-        self.note_list.itemActivated.connect(self.open_note)
-        self.note_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.note_list.customContextMenuRequested.connect(self.note_actions)
-        self.note_panel.setWidget(self.note_list)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.note_panel)
-        self.note_panel.hide()
+        self.setAcceptDrops(True)
+        self.language = None
+        self.actions = {}
+        self.action_groups = []
+        self.opening = set()
+        self.tabs = QTabWidget()
+        self.tabs.setTabBar(DocumentTabs())
+        self.tabs.setMovable(True)
+        self.tabs.setTabsClosable(True)
+        self.tabs.tabCloseRequested.connect(lambda index: self.close_tabs([index]))
+        bar = self.tabs.tabBar()
+        bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        bar.customContextMenuRequested.connect(self.tab_menu)
+        self.setCentralWidget(self.tabs)
+        self.chrome = Header(self)
+        self.setMenuWidget(self.chrome)
+        self.tabs.currentChanged.connect(self.active_tab_changed)
+        self.tab_list_button = QToolButton()
+        self.tabs.setCornerWidget(self.tab_list_button, Qt.Corner.TopRightCorner)
+        self.tab_list = TabList(self, self.tab_list_button)
+        self.tab_list_button.clicked.connect(self.tab_list.open_list)
+        bar.tabMoved.connect(lambda *_: self.tab_list.refresh() if self.tab_list.isVisible() else None)
+        self.last_pane = None
+        self.preferences.changed.connect(self.refresh_settings)
+        self.refresh_settings()
 
-    def add_action(self, bar, text, key, callback):
-        action = QAction(text, self)
-        if key:
-            action.setShortcut(QKeySequence(key))
-        action.triggered.connect(lambda: callback())
-        bar.addAction(action)
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.PaletteChange and hasattr(self, "chrome"):
+            self.language = None
+            self.refresh_settings()
 
-    def notify(self, text):
-        self.statusBar().showMessage(text, 6500)
+    def active_tab_changed(self, _):
+        if self.last_pane and self.last_pane is not self.pane:
+            self.last_pane.notes.commit_selected()
+        self.last_pane = self.pane
+        self.chrome.clear_notice()
+        self.chrome.page.setModified(False)
+        self.chrome.select_pane(self.pane)
+        if self.tab_list.isVisible():
+            self.tab_list.refresh()
+        self.update_status()
 
-    def ask(self, title, text):
-        return QMessageBox.question(
-            self, title, text, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        ) == QMessageBox.StandardButton.Yes
+    def t(self, ja, en):
+        return self.preferences.tr_text(ja, en)
 
-    def allow_leave(self):
-        if self.saving or self.modifying:
-            self.notify("PDF を更新しています。処理が終わってから操作してください。")
-            return False
-        if self.revision != self.saved_revision or self.jobs:
-            return self.ask("PDF を閉じる", "保存していない変更や翻訳中の注釈を破棄しますか？")
-        return True
+    @property
+    def pane(self):
+        return self.tabs.currentWidget()
+
+    def dispatch(self, name, *args):
+        pane = self.pane
+        if pane and not pane.document.loading:
+            if name.startswith("view."):
+                getattr(pane.view, name.removeprefix("view."))(*args)
+            else:
+                getattr(pane, name)(*args)
+
+    def action(self, menu, key, names, callback, shortcut="", required=True, check=False):
+        action = QAction(self.t(*names), self)
+        symbols = {"open": "open", "page_previous": "page-up", "page_next": "page-down",
+                   "width": "width", "fit": "fit", "left": "left", "right": "right",
+                   "bigger": "zoom-in", "smaller": "zoom-out", "find": "find",
+                   "find_previous": "previous", "find_next": "next", "outline": "outline",
+                   "notes": "notes", "save": "save", "save_as": "save", "properties": "properties"}
+        if key in symbols:
+            action.setIcon(icon(self, symbols[key]))
+            action.setIconVisibleInMenu(True)
+        if shortcut:
+            action.setShortcut(QKeySequence(shortcut))
+        action.setCheckable(check)
+        action.triggered.connect(lambda checked=False: callback())
+        if menu is not None:
+            menu.addAction(action)
+        self.addAction(action)
+        self.actions[key] = action, required
+        return action
+
+    def refresh_settings(self):
+        if self.language != self.preferences.data["language"]:
+            self.language = self.preferences.data["language"]
+            self.build_menu()
+        self.tab_list_button.setArrowType(Qt.ArrowType.DownArrow)
+        self.tab_list_button.setToolTip(self.t("開いているPDF一覧", "Open PDFs"))
+        self.tab_list_button.setAccessibleName(self.tab_list_button.toolTip())
+        self.tab_list.relabel()
+        for i in range(self.tabs.count()):
+            self.tabs.widget(i).relabel()
+        self.update_status()
+
+    def build_menu(self):
+        for action, _ in self.actions.values():
+            self.removeAction(action)
+            action.deleteLater()
+        self.actions.clear()
+        for group in self.action_groups:
+            group.deleteLater()
+        self.action_groups.clear()
+        menu = self.chrome.menus
+        old_menus = [action.menu() for action in menu.actions()]
+        menu.clear()
+        for old in old_menus:
+            if old:
+                old.deleteLater()
+        file, view, go, zoom, selection, help_ = [menu.addMenu(self.t(*names)) for names in (
+            ("ファイル", "File"), ("表示", "View"), ("移動", "Go to"), ("ズーム", "Zoom"),
+            ("選択", "Selection"), ("ヘルプ", "Help"),
+        )]
+        self.action(file, "new", ("新しいウインドウ", "New window"), self.controller.new_window, "Ctrl+N", False)
+        self.action(file, "open", ("開く…", "Open…"), self.browse, "Ctrl+O", False)
+        self.action(file, "close", ("文書を閉じる", "Close document"), lambda: self.close_tabs([self.tabs.currentIndex()]), "Ctrl+W")
+        self.action(file, "reload", ("再読み込み", "Reload"), self.reload, "Ctrl+R")
+        self.action(file, "duplicate_tab", ("タブを複製", "Duplicate tab"), lambda: self.duplicate(False))
+        self.action(file, "duplicate_window", ("別ウインドウに複製", "Duplicate in new window"), lambda: self.duplicate(True))
+        file.addSeparator()
+        self.action(file, "save_as", ("名前を付けて保存…", "Save as…"), self.save_as, "Ctrl+Shift+S")
+        self.action(file, "save", ("注釈を保存", "Save annotations"), self.save, "Ctrl+S")
+        self.action(file, "properties", ("文書のプロパティ", "Document properties"), self.properties, "Ctrl+D")
+        self.action(file, "exit", ("終了", "Exit"), self.close, required=False)
+
+        modes = QActionGroup(self)
+        modes.setExclusive(True)
+        self.action_groups.append(modes)
+        for mode, names in (("single", ("単ページ", "Single page")), ("spread", ("見開き", "Facing pages")),
+                            ("book", ("表紙付き見開き", "Book view"))):
+            modes.addAction(self.action(view, mode, names,
+                                       lambda value=mode: self.dispatch("view.set_layout", value), check=True))
+        self.action(view, "continuous", ("連続表示", "Continuous"), self.toggle_continuous, check=True)
+        self.action(view, "rtl", ("右開き", "Right to left"), self.toggle_rtl, check=True)
+        self.action(view, "left", ("左に90度回転", "Rotate left"), lambda: self.rotate(-90))
+        self.action(view, "right", ("右に90度回転", "Rotate right"), lambda: self.rotate(90))
+        self.action(view, "outline", ("目次", "Outline"), lambda: self.toggle_sidebar("outline"), check=True)
+        self.action(view, "notes", ("注釈一覧", "Annotations"), lambda: self.toggle_sidebar("notes"), check=True)
+
+        self.action(go, "page_previous", ("前のページ", "Previous page"), lambda: self.step_page(-1))
+        self.action(go, "page_next", ("次のページ", "Next page"), lambda: self.step_page(1))
+        self.action(go, "first", ("最初のページ", "First page"), lambda: self.dispatch("navigate", 0), "Ctrl+Home")
+        self.action(go, "last", ("最後のページ", "Last page"), lambda: self.dispatch("navigate", len(self.pane.view.pages) - 1), "Ctrl+End")
+        self.action(go, "page", ("ページへ移動…", "Go to page…"), self.go_page, "Ctrl+G")
+        self.action(go, "back", ("戻る", "Back"), lambda: self.dispatch("back_forward", -1), "Alt+Left")
+        self.action(go, "forward", ("進む", "Forward"), lambda: self.dispatch("back_forward", 1), "Alt+Right")
+        self.action(go, "find", ("文書内で検索…", "Find in document…"), lambda: self.dispatch("open_find"), "Ctrl+F")
+        self.action(go, "find_next", ("次の一致", "Next match"), lambda: self.dispatch("move_match", 1), "F3")
+        self.action(go, "find_previous", ("前の一致", "Previous match"), lambda: self.dispatch("move_match", -1), "Shift+F3")
+
+        self.action(zoom, "fit", ("ページ全体に合わせる", "Fit page"), lambda: self.dispatch("view.set_zoom", "fit"))
+        self.action(zoom, "actual", ("実寸", "Actual size"), lambda: self.dispatch("view.set_zoom", "custom", ACTUAL_SIZE))
+        self.action(zoom, "width", ("幅に合わせる", "Fit width"), lambda: self.dispatch("view.set_zoom", "width"), "Ctrl+0")
+        self.action(zoom, "content", ("内容に合わせる", "Fit content"), lambda: self.dispatch("view.set_zoom", "content"))
+        self.action(zoom, "bigger", ("拡大", "Zoom in"), lambda: self.dispatch("view.change_zoom", 1.2), "Ctrl++")
+        self.action(zoom, "smaller", ("縮小", "Zoom out"), lambda: self.dispatch("view.change_zoom", 1 / 1.2), "Ctrl+-")
+        self.action(zoom, "cycle", ("倍率を切り替える", "Cycle fit modes"), self.cycle_zoom, "Ctrl+Shift+0")
+        zoom.addSeparator()
+        for percent in (6400, 3200, 1600, 800, 400, 200, 150, 125, 100, 50, 25, 12.5, 8.33):
+            name = f"{percent:g}%"
+            self.action(zoom, name, (name, name),
+                        lambda value=percent: self.dispatch("view.set_zoom", "custom", ACTUAL_SIZE * value / 100))
+        self.action(zoom, "custom", ("倍率を指定…", "Custom zoom…"), self.custom_zoom)
+
+        for key, names, command in (
+            ("copy", ("選択範囲をコピー", "Copy selection"), "copy_selection"),
+            ("translate", ("翻訳…", "Translate…"), "translate_selection"),
+            ("find_selection", ("文書内で検索", "Find in document"), "find_selection"),
+            ("google", ("Google で検索", "Search Google"), "google_selection"),
+            ("all", ("すべて選択", "Select all"), "view.select_all"),
+        ):
+            self.action(selection, key, names, lambda method=command: self.dispatch(method))
+        settings = self.action(None, "preferences", ("設定", "Settings"), self.open_settings, required=False)
+        menu.insertAction(help_.menuAction(), settings)
+        self.action(help_, "keys", ("ショートカット", "Keyboard shortcuts"), self.shortcuts, required=False)
+        self.action(help_, "about", ("Paper PDF Reader について", "About Paper PDF Reader"), self.about, required=False)
+        self.action(None, "next_tab", ("次のタブ", "Next tab"), lambda: self.cycle_tab(1), "Ctrl+Tab", False)
+        self.action(None, "previous_tab", ("前のタブ", "Previous tab"), lambda: self.cycle_tab(-1), "Ctrl+Shift+Tab", False)
+        self.chrome.bind(self.actions, zoom)
+
+    def open_settings(self):
+        SettingsDialog(self).open()
+
+    def update_status(self, *_):
+        pane = self.pane
+        ready = bool(pane and pane.document.info and not pane.document.loading)
+        for key, (action, required) in self.actions.items():
+            action.setEnabled(not required or ready)
+            if ready and key in ("copy", "translate", "find_selection", "google"):
+                action.setEnabled(bool(pane.view.selection_range))
+        self.chrome.set_location(pane)
+        if not ready:
+            self.actions["notes"][0].setText(self.t("注釈一覧", "Annotations"))
+            self.chrome.menus.actions()[1].setText(self.t("表示", "View"))
+            self.chrome.set_external("")
+            return
+        doc = pane.document
+        name = doc.path.name + (" *" if doc.dirty else "")
+        for i in range(self.tabs.count()):
+            if self.tabs.widget(i).document is doc:
+                if self.tabs.tabText(i) != name:
+                    self.tabs.setTabText(i, name)
+        for key, active in ((pane.view.layout_mode, True), ("continuous", pane.view.continuous),
+                            ("rtl", pane.view.rtl), ("outline", not pane.outline.isHidden()),
+                            ("notes", not pane.notes.isHidden())):
+            self.actions[key][0].setChecked(active)
+        failed = any(job.state == "failed" for job in doc.jobs.values())
+        self.actions["notes"][0].setText(self.t("注釈一覧", "Annotations") + (" ●" if failed else ""))
+        self.chrome.menus.actions()[1].setText(self.t("表示", "View") + (" ●" if failed and pane.notes.isHidden() else ""))
+        self.actions["save"][0].setEnabled(doc.dirty and not doc.external and not doc.busy)
+        self.actions["back"][0].setEnabled(pane.history_index > 0)
+        self.actions["forward"][0].setEnabled(pane.history_index + 1 < len(pane.history))
+        current = pane.view.current_page()
+        self.actions["page_previous"][0].setEnabled(current > 0)
+        self.actions["page_next"][0].setEnabled(current + 1 < len(pane.view.pages))
+        self.chrome.set_external(self.t("元の PDF が変更されました。別名保存または再読み込みを選んでください。",
+                                     "The PDF has changed on disk. Save a copy or reload.") if doc.external else "")
 
     def browse(self):
-        path, _ = QFileDialog.getOpenFileName(self, "PDF を開く", "", "PDF (*.pdf)")
-        if path:
-            self.open_pdf(path)
+        files, _ = QFileDialog.getOpenFileNames(self, self.t("PDF を開く", "Open PDFs"), "", "PDF (*.pdf)")
+        self.open_paths(files)
 
     def dragEnterEvent(self, event):
         if any(url.isLocalFile() and url.toLocalFile().lower().endswith(".pdf") for url in event.mimeData().urls()):
             event.acceptProposedAction()
 
     def dropEvent(self, event):
-        for url in event.mimeData().urls():
-            if url.isLocalFile() and url.toLocalFile().lower().endswith(".pdf"):
-                self.open_pdf(url.toLocalFile())
-                event.acceptProposedAction()
-                break
+        paths = [url.toLocalFile() for url in event.mimeData().urls()
+                 if url.isLocalFile() and url.toLocalFile().lower().endswith(".pdf")]
+        if paths:
+            self.open_paths(paths)
+            event.acceptProposedAction()
 
-    def open_pdf(self, filename, password="", confirmed=False):
-        if self.opening or (not confirmed and not self.allow_leave()):
-            return
-        self.opening = True
-        self.dismiss_popup()
-        self.auto_save.stop()
-        # Freeze annotation jobs before issuing an open on the same PDF worker.
-        for job in tuple(self.jobs.values()):
-            self.translator.cancel(job)
-        self.jobs.clear()
+    def open_paths(self, paths):
+        for path in paths:
+            doc = self.controller.documents.for_path(path)
+            same = next((pane for pane in self.controller.panes() if pane.document is doc), None)
+            if same:
+                same.window.tabs.setCurrentWidget(same)
+                same.window.raise_()
+                same.window.activateWindow()
+            elif doc not in self.opening and not doc.loading:
+                self.opening.add(doc)
+                self.load_document(doc)
 
-        def opened(result, error):
-            self.opening = False
+    def load_document(self, doc, reload=False, password=None):
+        def ready(info, error):
             if error:
-                QMessageBox.warning(self, "PDF を開けませんでした", error)
-            elif result.get("password"):
-                value, accepted = QInputDialog.getText(self, "PDF のパスワード", "パスワード", QLineEdit.EchoMode.Password)
-                if accepted:
-                    self.open_pdf(filename, value, confirmed=True)
-            else:
-                self.path = Path(filename).resolve()
-                self.outline = result["outline"]
-                self.annotations.clear()
-                self.groups.clear()
-                self.failed.clear()
-                self.revision = self.saved_revision = 0
-                self.view.set_document(result["pages"])
-                self.update_title()
-                self.reload_annotations()
-
-        self.session.request("open", (filename, password), opened)
-
-    def update_title(self):
-        filename = self.path.name if self.path else ""
-        mark = " *" if self.revision != self.saved_revision else ""
-        self.setWindowTitle(f"{filename}{mark} — Paper PDF Reader" if filename else "Paper PDF Reader")
-
-    def go_to_page(self):
-        if not self.view.pages:
-            return
-        page, accepted = QInputDialog.getInt(self, "ページへ移動", "ページ番号", 1, 1, len(self.view.pages))
-        if accepted:
-            self.view.go_to(page - 1)
-
-    def show_outline(self):
-        if not self.outline:
-            self.notify("目次がありません。")
-            return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("目次")
-        dialog.resize(420, 470)
-        layout = QVBoxLayout(dialog)
-        listing = QListWidget(dialog)
-        layout.addWidget(listing)
-        for level, title, page in self.outline:
-            item = QListWidgetItem("  " * (level - 1) + title, listing)
-            item.setData(VALUE, page - 1)
-        listing.itemActivated.connect(lambda item: (self.view.go_to(item.data(VALUE)), dialog.accept()))
-        dialog.exec()
-
-    def toggle_annotations(self):
-        self.note_panel.setVisible(not self.note_panel.isVisible())
-
-    def reload_annotations(self, indices=None):
-        doc = self.view.generation
-        indices = tuple(indices) if indices is not None else (None,)
-
-        def request(index):
-            def ready(notes, error):
-                if doc != self.view.generation or self.opening:
-                    return
-                if error:
-                    self.notify(error)
-                    return
-                if index is None:
-                    self.annotations.clear()
+                self.opening.discard(doc)
+                self.show_error(error)
+                if doc.info is None:
+                    self.controller.documents.remove(doc)
+            elif info.get("password"):
+                value, ok = QInputDialog.getText(self, self.t("PDF のパスワード", "PDF password"),
+                                                 self.t("パスワード", "Password"), QLineEdit.EchoMode.Password)
+                if ok:
+                    self.load_document(doc, reload, value)
                 else:
-                    for key in [key for key in self.annotations if key[0] == index]:
-                        self.annotations.pop(key)
-                for note in notes:
-                    self.annotations[note["page"], note["xref"]] = note
-                self.refresh_notes()
-            self.session.request("annotation_list", (index,), ready, priority=12,
-                                 needed=lambda: doc == self.view.generation and not self.opening)
+                    self.opening.discard(doc)
+                    if doc.info is None:
+                        self.controller.documents.remove(doc)
+            elif not reload:
+                self.opening.discard(doc)
+                self.add_tab(doc)
+        doc.load(ready, reload=reload, password=password)
 
-        for index in indices:
-            request(index)
+    def add_tab(self, doc):
+        pane = DocumentPane(self, doc)
+        pane.location_changed.connect(self.update_status)
+        pane.message.connect(self.show_message)
+        self.chrome.search.addWidget(pane.search_panel)
+        index = self.tabs.addTab(pane, doc.path.name)
+        self.tabs.setTabToolTip(index, str(doc.path))
+        self.tabs.setCurrentIndex(index)
+        pane.view.setFocus()
+        return pane
 
-    def targets(self, key):
-        return self.groups.get(key, (key,))
+    def duplicate(self, new_window):
+        original = self.pane
+        window = self.controller.new_window() if new_window else self
+        pane = window.add_tab(original.document)
+        target, source = pane.view, original.view
+        target.zoom_mode, target.zoom = source.zoom_mode, source.zoom
+        target.set_layout(source.layout_mode, source.continuous, source.rtl, source.rotation)
+        target.restore(source.location())
 
-    def refresh_notes(self):
-        self.note_list.clear()
-        for key, note in sorted(self.annotations.items()):
-            targets = self.targets(key)
-            status = "翻訳中" if targets in self.jobs else ("翻訳失敗" if targets in self.failed else "")
-            comment = " ".join(note["comment"].splitlines())
-            label = f"{note['page'] + 1}ページ　{status or comment[:68] or 'ハイライト'}"
-            item = QListWidgetItem(label, self.note_list)
-            item.setData(VALUE, key)
-            item.setToolTip(self.failed[targets][1] if targets in self.failed else note["comment"])
+    def cycle_tab(self, step):
+        count = self.tabs.count()
+        if count:
+            self.tabs.setCurrentIndex((self.tabs.currentIndex() + step) % count)
 
-    def open_note(self, item):
-        key = tuple(item.data(VALUE))
-        if note := self.annotations.get(key):
-            self.view.go_to(note["page"], max(0, note["box"][1] - 32))
-            self.edit_annotation(key)
-
-    def show_at(self, index, x, y):
-        self.dismiss_popup()
-        if self.opening:
+    def tab_menu(self, point):
+        bar = self.tabs.tabBar()
+        index = bar.tabAt(point)
+        if index < 0:
             return
-        for key, note in reversed(tuple(self.annotations.items())):
-            x0, y0, x1, y1 = note["box"]
-            if index == note["page"] and x0 <= x <= x1 and y0 <= y <= y1:
-                self.edit_annotation(key)
-                break
-
-    def note_actions(self, point):
-        item = self.note_list.itemAt(point)
-        if item is None:
-            return
-        key = tuple(item.data(VALUE))
-        targets = self.targets(key)
+        self.tabs.setCurrentIndex(index)
         menu = QMenu(self)
-        menu.addAction("編集", lambda: self.open_note(item))
-        if targets in self.jobs:
-            menu.addAction("翻訳を取り消す", lambda: self.cancel_job(targets))
-        if targets in self.failed:
-            menu.addAction("翻訳を再試行する", lambda: self.translate_note(targets, self.failed[targets][0]))
-        menu.exec(self.note_list.mapToGlobal(point))
+        menu.addAction(self.t("タブを複製", "Duplicate tab"), lambda: self.duplicate(False))
+        menu.addAction(self.t("別ウインドウに複製", "Duplicate in new window"), lambda: self.duplicate(True))
+        menu.addSeparator()
+        count = self.tabs.count()
+        for names, targets in (
+            (("このタブを閉じる", "Close tab"), [index]), (("左側のタブを閉じる", "Close tabs to the left"), list(range(index))),
+            (("右側のタブを閉じる", "Close tabs to the right"), list(range(index + 1, count))),
+            (("他のタブを閉じる", "Close other tabs"), [i for i in range(count) if i != index]),
+            (("すべてのタブを閉じる", "Close all tabs"), list(range(count))),
+        ):
+            menu.addAction(self.t(*names), lambda checked=False, selection=targets: self.close_tabs(selection)).setEnabled(bool(targets))
+        menu.exec(bar.mapToGlobal(point))
+        menu.deleteLater()
 
-    def dismiss_popup(self):
-        if self.popup is not None:
-            self.popup.reject()
+    def error_text(self, message):
+        if self.language != "en":
+            return message
+        return {
+            "ページのある PDF を指定してください。": "Select a PDF containing pages.",
+            "注釈が見つかりません。": "Annotation not found.",
+            "別のアプリで PDF が変更されました。名前を付けて保存してください。":
+                "Another application changed the PDF. Save a copy.",
+        }.get(message, message)
 
-    def note_dialog(self, title, source, translation="", point=None, selection=False):
-        self.dismiss_popup()
-        dialog = QDialog(self, Qt.WindowType.Tool)
-        self.popup = dialog
-        dialog.setWindowTitle(title)
-        dialog.resize(486, 356)
-        layout = QVBoxLayout(dialog)
-        form = QFormLayout()
-        source_edit = QTextEdit()
-        source_edit.setPlainText(source)
-        translated = QTextEdit()
-        translated.setPlainText(translation)
-        form.addRow("原文", source_edit)
-        form.addRow("訳文", translated)
-        layout.addLayout(form)
-        status = QLabel()
-        status.setWordWrap(True)
-        status.hide()
-        layout.addWidget(status)
-        colors = QHBoxLayout()
-        buttons = {}
-        for name, color in COLORS.items():
-            button = QPushButton(name)
-            button.setAccessibleName(f"{name}のハイライト")
-            button.setStyleSheet(f"background-color: {color}; color: black;")
-            colors.addWidget(button)
-            buttons[color] = button
-        layout.addLayout(colors)
-        footer = QHBoxLayout()
-        layout.addLayout(footer)
-        translate = QPushButton("翻訳")
-        footer.addWidget(translate)
-        active_job = None
-        preview_ready = False
+    def show_message(self, message):
+        self.chrome.show_notice(self.error_text(message))
 
-        def show_status(text):
-            status.setText(text)
-            status.setVisible(bool(text))
+    def show_error(self, message):
+        QMessageBox.warning(self, "Paper PDF Reader", self.error_text(message))
 
-        def preview():
-            nonlocal active_job, preview_ready
-            text = source_edit.toPlainText().strip()
-            if not text:
-                return
-            translate.setEnabled(False)
-            preview_ready = False
-            show_status("翻訳中…")
+    def reload(self):
+        self.pane.notes.commit_selected()
+        doc = self.pane.document
+        if self.confirm_discard(doc, reload=True):
+            self.load_document(doc, reload=True)
 
-            def completed(result, error):
-                nonlocal active_job, preview_ready
-                active_job = None
-                translate.setEnabled(True)
-                show_status(error or "")
-                if not error:
-                    preview_ready = True
-                    translated.setPlainText(result)
+    def confirm_discard(self, doc, reload=False):
+        if doc.busy:
+            self.show_message(self.t("PDF を更新しています。", "The PDF is being updated."))
+            return False
+        drafts = self.controller.has_comment_drafts(doc)
+        if not doc.dirty and not doc.has_active_jobs and not drafts:
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle(doc.path.name)
+        box.setText(self.t("未保存の変更または翻訳中の注釈があります。", "There are unsaved changes or active translations."))
+        discard = box.addButton(self.t("破棄して再読み込み", "Discard and reload") if reload else
+                                 self.t("破棄して閉じる", "Discard and close"), QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton(self.t("キャンセル", "Cancel"), QMessageBox.ButtonRole.RejectRole)
+        save = box.addButton(self.t("保存して続行", "Save and continue"), QMessageBox.ButtonRole.AcceptRole)
+        save.setEnabled(doc.dirty and not doc.has_active_jobs and not drafts)
+        box.setDefaultButton(cancel)
+        box.exec()
+        if box.clickedButton() is discard:
+            return True
+        if box.clickedButton() is not save:
+            return False
+        path = self.save_destination(doc) if doc.external else None
+        if doc.external and not path:
+            return False
+        loop = QEventLoop()
+        result = []
 
-            try:
-                active_job = self.translator.submit(self.settings, text, translated.setPlainText, completed)
-            except ValueError as error:
-                completed("", str(error))
+        def ready(ok):
+            result.append(ok)
+            loop.quit()
+        doc.save(path, ready)
+        if not result:
+            loop.exec()
+        return bool(result and result[0])
 
-        def closed():
-            if active_job is not None:
-                self.translator.cancel(active_job)
-            if self.popup is dialog:
-                self.popup = None
-            if selection:
-                self.view.clear_selection()
-            dialog.deleteLater()
-
-        translate.clicked.connect(preview)
-        QShortcut(QKeySequence("Alt+T"), dialog, activated=preview)
-        dialog.finished.connect(closed)
-        if point:
-            screen = QApplication.screenAt(point)
-            if screen:
-                area = screen.availableGeometry()
-                x = min(max(point.x(), area.left()), max(area.left(), area.right() - dialog.width()))
-                y = point.y() + 12
-                if y + dialog.height() > area.bottom():
-                    y = max(area.top(), point.y() - dialog.height() - 12)
-                dialog.move(QPoint(x, y))
-        return dialog, layout, footer, source_edit, translated, buttons, lambda: preview_ready
-
-    def show_selection(self, choices, point):
-        if self.opening:
-            return
-        original, restored = choices
-        dialog, layout, footer, source, translated, colors, ready = self.note_dialog("選択した本文", original.source, point=point, selection=True)
-        chosen = original
-        if original.skipped:
-            include = QCheckBox("除外した箇所を含める")
-            include.setToolTip("、".join(original.skipped))
-            layout.insertWidget(1, include)
-
-            def include_changed(enabled):
-                nonlocal chosen
-                chosen = restored if enabled else original
-                self.view.selection = chosen
-                self.view.viewport().update()
-                source.setPlainText(chosen.source)
-                translated.clear()
-
-            include.toggled.connect(include_changed)
-
-        def add(color, request_translation):
-            original_text = source.toPlainText().strip()
-            comment = translated.toPlainText().strip()
-            if request_translation and not ready():
-                comment = ""
-            dialog.accept()
-            self.last_color = color
-
-            def added(targets):
-                group = tuple(targets)
-                for key in group:
-                    self.groups[key] = group
-                if request_translation and not comment and original_text:
-                    self.translate_note(group, original_text)
-                elif self.settings["autoSave"]:
-                    self.auto_save.start()
-
-            self.mutate("add_highlight", (chosen.quads, color, comment), set(chosen.quads), added)
-
-        for color, button in colors.items():
-            button.clicked.connect(lambda checked=False, value=color: add(value, True))
-        annotate = QPushButton("ハイライトを保存")
-        annotate.clicked.connect(lambda: add(self.last_color, False))
-        footer.addWidget(annotate)
-        QShortcut(QKeySequence("Alt+Shift+T"), dialog, activated=lambda: add(self.last_color, True))
-        dialog.show()
-
-    def edit_annotation(self, key):
-        if self.opening or key not in self.annotations:
-            return
-        doc = self.view.generation
-
-        def ready(original, error):
-            if doc != self.view.generation or key not in self.annotations:
-                return
-            if error:
-                self.notify(error)
-                return
-            note = self.annotations[key]
-            targets = self.targets(key)
-            dialog, _, footer, source, translated, colors, _ = self.note_dialog(
-                "ハイライトの注釈", original, note["comment"],
-            )
-            indices = {page for page, _ in targets}
-
-            def modify(color=None, comment=None, delete=False):
-                self.cancel_job(targets)
-                self.failed.pop(targets, None)
-                dialog.accept()
-                self.mutate("modify_highlight", (list(targets), color, comment, delete), indices,
-                            lambda _: self.auto_save.start() if self.settings["autoSave"] else None)
-
-            for color, button in colors.items():
-                button.clicked.connect(lambda checked=False, value=color: modify(color=value))
-            save = QPushButton("コメントを保存")
-            save.clicked.connect(lambda: modify(comment=translated.toPlainText()))
-            footer.addWidget(save)
-            again = QPushButton("翻訳して保存")
-
-            def queue():
-                text = source.toPlainText().strip()
-                if text:
-                    dialog.accept()
-                    self.translate_note(targets, text)
-
-            again.clicked.connect(queue)
-            footer.addWidget(again)
-            delete = QPushButton("削除")
-            delete.clicked.connect(lambda: modify(delete=True) if self.ask("ハイライトの削除", "このハイライトを削除しますか？") else None)
-            footer.addWidget(delete)
-            dialog.show()
-
-        self.session.request("highlight_text", key, ready)
-
-    def cancel_job(self, targets):
-        if (job := self.jobs.pop(targets, None)) is not None:
-            self.translator.cancel(job)
-            self.refresh_notes()
-
-    def translate_note(self, targets, source):
-        self.cancel_job(targets)
-        self.failed.pop(targets, None)
-
-        def finished(result, error):
-            self.jobs.pop(targets, None)
-            if error:
-                self.failed[targets] = (source, error)
-                self.notify(error)
-                self.note_panel.show()
-            else:
-                self.mutate("modify_highlight", (list(targets), None, result),
-                            {page for page, _ in targets}, lambda _: self.auto_save.start() if self.settings["autoSave"] else None)
-            self.refresh_notes()
-
-        try:
-            self.jobs[targets] = self.translator.submit(self.settings, source, lambda _: None, finished)
-            self.notify("翻訳を開始しました。")
-            self.refresh_notes()
-        except ValueError as error:
-            finished("", str(error))
-
-    def mutate(self, command, args, indices, on_success):
-        self.modifying += 1
-
-        def done(result, error):
-            self.modifying -= 1
-            if error:
-                self.notify(error)
-                return
-            self.revision += 1
-            self.update_title()
-            self.view.invalidate(indices)
-            self.reload_annotations(indices)
-            on_success(result)
-
-        self.session.request(command, args, done)
-
-    def save(self, destination=None):
-        if self.path is None or self.opening:
-            return
-        if destination is None and self.revision == self.saved_revision:
-            return
-        self.saving += 1
-        revision = self.revision
-        overwrite = destination is None or Path(destination).resolve() == self.path
-
-        def saved(_, error):
-            self.saving -= 1
-            if error:
-                QMessageBox.warning(self, "PDF を保存できませんでした", error)
-                return
-            if overwrite:
-                self.saved_revision = revision
-                self.update_title()
-            self.notify("PDF を保存しました。")
-
-        self.session.request("save", (str(self.folder / "backups"), self.settings["backupCount"], destination), saved)
-
-    def save_as(self):
-        if self.path:
-            name, _ = QFileDialog.getSaveFileName(self, "名前を付けて保存", str(self.path.with_stem(self.path.stem + "-notes")), "PDF (*.pdf)")
-            if name:
-                self.save(name if name.lower().endswith(".pdf") else name + ".pdf")
-
-    def configure(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("翻訳設定")
-        dialog.resize(520, 360)
-        form = QFormLayout(dialog)
-        fields = {
-            key: QLineEdit(str(self.settings[key])) for key in ("endpoint", "model", "apiKey", "langFrom", "langTo")
-        }
-        fields["apiKey"].setEchoMode(QLineEdit.EchoMode.Password)
-        for key, label in (("endpoint", "接続先 URL"), ("model", "モデル"), ("apiKey", "API キー"),
-                           ("langFrom", "原文の言語"), ("langTo", "翻訳先の言語")):
-            form.addRow(label, fields[key])
-        prompt = QTextEdit()
-        prompt.setPlainText(self.settings["systemPrompt"])
-        form.addRow("システムプロンプト", prompt)
-        concurrency = QSpinBox()
-        concurrency.setRange(1, 8)
-        concurrency.setValue(self.settings["concurrency"])
-        form.addRow("同時翻訳数", concurrency)
-        backups = QSpinBox()
-        backups.setRange(0, 200)
-        backups.setValue(self.settings["backupCount"])
-        form.addRow("バックアップの保存数", backups)
-        autosave = QCheckBox("訳文をコメントに入れた後、自動で保存する")
-        autosave.setChecked(self.settings["autoSave"])
-        form.addRow(autosave)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            settings = {key: field.text() for key, field in fields.items()}
-            settings.update(systemPrompt=prompt.toPlainText(), concurrency=concurrency.value(),
-                            backupCount=backups.value(), autoSave=autosave.isChecked())
-            try:
-                write_json(self.folder / "settings.json", settings)
-            except OSError as error:
-                self.notify(str(error))
-                return
-            self.settings = settings
-            self.translator.limit = settings["concurrency"]
+    def close_tabs(self, indices):
+        panes = [pane for i in sorted(set(indices)) if (pane := self.tabs.widget(i))]
+        surviving = set(self.controller.panes()) - set(panes)
+        ending = {pane.document for pane in panes} - {pane.document for pane in surviving}
+        for pane in panes:
+            pane.notes.commit_selected()
+        if any(not self.confirm_discard(doc) for doc in sorted(ending, key=lambda d: d.identifier)):
+            return False
+        for pane in panes:
+            if pane.annotation_dialog:
+                pane.annotation_dialog.reject()
+            self.tabs.removeTab(self.tabs.indexOf(pane))
+            self.chrome.search.removeWidget(pane.search_panel)
+            pane.search_panel.deleteLater()
+            pane.deleteLater()
+        if self.tab_list.isVisible():
+            self.tab_list.refresh()
+        for doc in ending:
+            self.controller.documents.remove(doc)
+        self.update_status()
+        return True
 
     def closeEvent(self, event):
-        if self.opening or not self.allow_leave():
+        if self.opening or not self.close_tabs(range(self.tabs.count())):
             event.ignore()
         else:
-            self.dismiss_popup()
-            self.session.shutdown()
+            self.controller.windows.remove(self)
+            self.deleteLater()
             event.accept()
 
+    def save(self):
+        if self.pane:
+            self.pane.document.save()
 
-def smoke_test(app, report):
-    with TemporaryDirectory(prefix="paper-reader-smoke-") as temporary:
-        try:
-            window = Reader(Path(temporary))
-        except Exception as error:
-            report.write_text(f"Reader initialization failed: {error}", encoding="utf-8")
-            return 1
-        try:
-            def finish(result, error):
-                try:
-                    if error:
-                        raise RuntimeError(error)
-                    _, _, image = tile_image(result)
-                    if image.isNull() or image.width() != 500:
-                        raise ValueError("Qt could not read the MuPDF raster.")
-                except (RuntimeError, TypeError, ValueError) as failure:
-                    report.write_text(str(failure), encoding="utf-8")
-                    app.exit(1)
-                else:
-                    report.write_text(f"PASS Paper PDF Reader {VERSION}\n", encoding="utf-8")
-                    app.exit(0)
+    def save_destination(self, doc):
+        path, _ = QFileDialog.getSaveFileName(self, self.t("名前を付けて保存", "Save as"),
+                                              str(doc.path.with_stem(doc.path.stem + "-notes")), "PDF (*.pdf)")
+        return path if not path or path.lower().endswith(".pdf") else path + ".pdf"
 
-            QTimer.singleShot(0, lambda: window.session.request("smoke", (temporary,), finish))
-            QTimer.singleShot(30_000, lambda: finish(None, "PDF process timed out."))
-            return app.exec()
-        finally:
-            window.session.shutdown()
+    def save_as(self):
+        if self.pane:
+            doc = self.pane.document
+            if path := self.save_destination(doc):
+                doc.save(path)
 
+    def toggle_continuous(self):
+        self.pane.view.set_layout(continuous=not self.pane.view.continuous)
+        self.update_status()
 
-def main():
-    parser = argparse.ArgumentParser(prog="PaperPdfReader")
-    parser.add_argument("pdf", nargs="?")
-    parser.add_argument("--smoke-test", type=Path)
-    args = parser.parse_args()
-    app = QApplication([sys.argv[0]])
-    app.setApplicationName("Paper PDF Reader")
-    app.setApplicationVersion(VERSION)
-    if args.smoke_test is not None:
-        return smoke_test(app, args.smoke_test)
-    window = Reader()
-    window.show()
-    if args.pdf:
-        QTimer.singleShot(0, lambda: window.open_pdf(args.pdf))
-    return app.exec()
+    def toggle_rtl(self):
+        self.pane.view.set_layout(rtl=not self.pane.view.rtl)
+        self.update_status()
+
+    def toggle_sidebar(self, name):
+        sidebar = getattr(self.pane, name)
+        self.pane.show_sidebar(name, sidebar.isHidden())
+
+    def rotate(self, degrees):
+        self.pane.view.set_layout(rotation=self.pane.view.rotation + degrees)
+
+    def step_page(self, step):
+        pane = self.pane
+        pane.navigate(pane.view.current_page() + step)
+
+    def go_page(self):
+        view = self.pane.view
+        page, ok = QInputDialog.getInt(self, self.t("ページへ移動", "Go to page"), self.t("ページ番号", "Page number"),
+                                       view.current_page() + 1, 1, len(view.pages))
+        if ok:
+            self.pane.navigate(page - 1)
+
+    def cycle_zoom(self):
+        view = self.pane.view
+        view.set_zoom({"fit": "width", "width": "content"}.get(view.zoom_mode, "fit"))
+
+    def custom_zoom(self):
+        view = self.pane.view
+        percent, ok = QInputDialog.getDouble(self, self.t("倍率", "Zoom"), "%", view.zoom / ACTUAL_SIZE * 100, 8.33, 6400, 2)
+        if ok:
+            view.set_zoom("custom", ACTUAL_SIZE * percent / 100)
+
+    def properties(self):
+        if not self.pane:
+            return
+        doc = self.pane.document
+
+        def ready(info, error):
+            if error or not info:
+                self.show_error(error or "Could not read document properties.")
+                return
+            dialog = QDialog(self)
+            dialog.resize(560, 530)
+            dialog.setWindowTitle(self.t("文書のプロパティ", "Document properties"))
+            form = QFormLayout(dialog)
+            for key, names in (
+                ("title", ("タイトル", "Title")), ("author", ("著者", "Author")), ("subject", ("件名", "Subject")),
+                ("keywords", ("キーワード", "Keywords")), ("creationDate", ("作成日時", "Created")),
+                ("modDate", ("更新日時", "Modified")), ("format", ("形式", "Format")), ("pages", ("ページ数", "Pages")),
+                ("filename", ("ファイル", "File")), ("size", ("容量（バイト）", "Size (bytes)")),
+            ):
+                cell = QLabel(str(info.get(key) or "—"))
+                cell.setTextFormat(Qt.TextFormat.PlainText)
+                cell.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                cell.setWordWrap(True)
+                form.addRow(self.t(*names), cell)
+            fonts = QTextEdit()
+            fonts.setReadOnly(True)
+            fonts.setPlainText(self.t("フォントを読み込んでいます…", "Loading fonts…"))
+            form.addRow(self.t("フォント", "Fonts"), fonts)
+            pages = iter(range(info["pages"]))
+            found = set()
+            ended = False
+
+            def stop():
+                nonlocal ended
+                ended = True
+            dialog.finished.connect(stop)
+
+            def advance():
+                if ended or doc.disposed:
+                    return
+                index = next(pages, None)
+                if index is None:
+                    fonts.setPlainText("\n".join(f"{name} · {kind} · {encoding} · " +
+                                                 (self.t("埋め込み", "Embedded") if embedded else
+                                                  self.t("埋め込みなし", "Not embedded"))
+                                                 for name, kind, encoding, embedded in sorted(found)))
+                    return
+
+                def loaded(values, failure):
+                    if values:
+                        found.update(values)
+                    QTimer.singleShot(0, advance)
+                doc.request("fonts", (index,), loaded, priority=8, needed=lambda: not ended)
+
+            QTimer.singleShot(0, advance)
+            dialog.exec()
+            dialog.deleteLater()
+        doc.request("properties", (), ready)
+
+    def shortcuts(self):
+        lines = [f"{action.text()}    {action.shortcut().toString()}"
+                 for action, _ in self.actions.values() if not action.shortcut().isEmpty()]
+        lines.extend(("Ctrl+C", "Ctrl+A"))
+        self.text_dialog(self.t("ショートカット", "Keyboard shortcuts"), "\n".join(lines))
+
+    def about(self):
+        packaged = getattr(sys, "frozen", False)
+        root = Path(sys.executable).parent if packaged else Path(__file__).resolve().parents[1]
+        files = [root / "LICENSE.txt", *(root / "LICENSES").rglob("*")] if packaged else [
+            root / "LICENSE", root / "THIRD_PARTY.md", *(root / "licenses").glob("*.txt")
+        ]
+        sections = [f"Paper PDF Reader {VERSION}"]
+        for path in files:
+            if path.is_file():
+                sections.append(path.read_text(encoding="utf-8", errors="replace"))
+        self.text_dialog(self.t("Paper PDF Reader について", "About Paper PDF Reader"), "\n\n".join(sections))
+
+    def text_dialog(self, title, text):
+        dialog = QDialog(self)
+        dialog.resize(620, 520)
+        dialog.setWindowTitle(title)
+        layout = QVBoxLayout(dialog)
+        body = QTextEdit()
+        body.setPlainText(text)
+        body.setReadOnly(True)
+        layout.addWidget(body)
+        dialog.exec()
+        dialog.deleteLater()

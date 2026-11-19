@@ -9,7 +9,7 @@ import sys
 def collect(output: Path) -> None:
     notices = output / "LICENSES"
     notices.mkdir(exist_ok=True)
-    for name in ("PyMuPDF", "PySide6-Essentials", "shiboken6", "PyInstaller"):
+    for name in ("PyMuPDF", "PySide6-Essentials", "shiboken6", "PyInstaller", "pypdf"):
         for file in distribution(name).files:
             filename = file.name.lower()
             if "licenses" in file.parts or filename.startswith(("license", "copying", "notice", "copyright")):

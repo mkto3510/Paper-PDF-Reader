@@ -5,6 +5,6 @@ if __name__ == "__main__":
 
     freeze_support()
 
-    from paper_reader.window import main
+    from paper_reader.application import main
 
     raise SystemExit(main())

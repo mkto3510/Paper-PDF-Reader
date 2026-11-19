@@ -31,7 +31,9 @@ try {
     Invoke-BuildStep $python @(
         '-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed',
         '--name', 'PaperPdfReader', '--specpath', 'build',
+        '--icon', (Join-Path $PSScriptRoot 'paper_reader\icons\app.ico'),
         '--collect-binaries', 'pymupdf',
+        '--add-data', ('{0}:paper_reader/icons' -f (Join-Path $PSScriptRoot 'paper_reader\icons')),
         'run_reader.py'
     )
 } finally {

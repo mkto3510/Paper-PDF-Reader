@@ -15,6 +15,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
 UsePreviousAppDir=yes
 DisableProgramGroupPage=yes
+SetupIconFile=..\paper_reader\icons\app.ico
 UninstallDisplayIcon={app}\{#AppExe}
 CloseApplications=yes
 RestartApplications=no
