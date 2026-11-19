@@ -16,7 +16,7 @@ import pymupdf as mu
 from .analysis_rules import DEFAULT_RULES, classify, page_evidence
 from .artifacts import artifact_glyphs
 from .search import find_page
-from .selection import Glyph, Line, bounds, edge_band, furniture_key, reading_regions, select
+from .selection import Glyph, Line, bounds, correct_stream_order, edge_band, furniture_key, reading_regions, select
 
 
 _SPACING_ACCENTS = {"´": "\u0301", "ˆ": "\u0302", "˜": "\u0303",
@@ -176,7 +176,7 @@ class PdfEngine:
 
     def _read_lines(self, index: int, mark_artifacts=False):
         page = self.doc[index]
-        text = page.get_text("rawdict", flags=mu.TEXTFLAGS_RAWDICT & ~mu.TEXT_PRESERVE_IMAGES)
+        text = page.get_text("rawdict", flags=mu.TEXTFLAGS_RAWDICT & ~mu.TEXT_PRESERVE_IMAGES, sort=False)
         artifacts = artifact_glyphs(page) if mark_artifacts else set()
         lines: list[Line] = []
         for block_index, block in enumerate(text["blocks"]):
@@ -238,11 +238,16 @@ class PdfEngine:
                 if near != index:
                     neighbours.update(self._edge_keys(near))
         regions = reading_regions(lines, width)
-        ordered = tuple(line for region in regions for line in region)
-        classified = classify(ordered, width, height, neighbours, page_evidence(page), self.options, regions)
+        evidence = page_evidence(page)
+        classified = classify(lines, width, height, neighbours, evidence, self.options, regions)
         leading, content, trailing = [], [], []
         horizontal_body = sum(len(line.glyphs) for line in classified if line.horizontal) > sum(
             len(line.glyphs) for line in classified if not line.horizontal)
+        if horizontal_body:
+            classified = correct_stream_order(classified, width, (*evidence[0], *evidence[3]))
+        else:
+            ranks = {id(line): rank for rank, line in enumerate(lines)}
+            classified = tuple(classified[ranks[id(line)]] for region in regions for line in region)
         for line in classified:
             side_mark = (horizontal_body and not line.horizontal and line.kind in ("margin", "small")
                          and (line.box[2] <= width * .07 or line.box[0] >= width * .93))

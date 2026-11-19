@@ -36,6 +36,13 @@ class Line:
 
 
 @dataclass(frozen=True, slots=True)
+class Exclusion:
+    page: int
+    kind: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class Selection:
     source: str
     quads: dict[int, list[Quad]]
@@ -44,6 +51,7 @@ class Selection:
     raw_source: str = ""
     hyphenated: frozenset[str] = frozenset()
     starts_paragraph: bool = False
+    exclusions: tuple[Exclusion, ...] = ()
 
 
 def bounds(boxes) -> Box:
@@ -182,6 +190,71 @@ def reading_order(lines, width):
     return tuple(line for region in reading_regions(lines, width) for line in region)
 
 
+def correct_stream_order(lines, width, graphics=()):
+    """Repair repeated column crossings while preserving the PDF's order elsewhere."""
+    main = [line for line in lines if line.horizontal and not line.kind]
+    if len(main) < 6:
+        return lines
+    typical = median(line.size for line in main)
+    gutter = max(typical * .75, width * .012)
+    evidence = [line for line in main if line.box[2] - line.box[0] >= width * .13
+                and not any(g[0] <= line.box[0] and line.box[2] <= g[2]
+                            and g[1] <= line.box[1] and line.box[3] <= g[3] for g in graphics)]
+    rows = []
+    for line in sorted(evidence, key=lambda item: item.box[1] + item.box[3]):
+        y = (line.box[1] + line.box[3]) / 2
+        if not rows or y - rows[-1][0] > typical * .65:
+            rows.append((y, []))
+        rows[-1][1].append(line)
+    candidates = set()
+    for _, row in rows:
+        right = None
+        for line in sorted(row, key=lambda item: item.box[0]):
+            left = line.box[0]
+            if right is not None and left - right >= gutter:
+                candidates.add(round((left + right) / 2, 1))
+            right = max(line.box[2], right if right is not None else left)
+
+    # A gutter can disappear behind a figure, leaving only one occupied side.
+    # A body line crossing the gutter, in contrast, bounds the repair vertically.
+    bands = []
+    for x in sorted(candidates):
+        top, pairs = float("-inf"), 0
+        for y, row in (*rows, (float("inf"), ())):
+            left = any(line.box[2] <= x - gutter / 2 for line in row)
+            right = any(line.box[0] >= x + gutter / 2 for line in row)
+            barrier = not row or any(line.box[0] < x < line.box[2] for line in row)
+            if barrier:
+                if pairs >= 3:
+                    bands.append((pairs, top, y, x))
+                top, pairs = y, 0
+            elif left and right:
+                pairs += 1
+    if not bands:
+        return lines
+
+    ordered = list(lines)
+    stable_ids = {id(line) for line in evidence}
+    # The strongest split first. Further splits can repair a third column.
+    for _, top, bottom, x in sorted(bands, key=lambda band: (-band[0], abs(band[3] - width / 2))):
+        slots, sides = [], []
+        for index, line in enumerate(ordered):
+            y = (line.box[1] + line.box[3]) / 2
+            if line.kind or not line.horizontal or not top < y < bottom:
+                continue
+            if line.box[2] <= x or line.box[0] >= x:
+                slots.append(index)
+                sides.append(line.box[0] >= x)
+        sequence = [right for index, right in zip(slots, sides) if id(ordered[index]) in stable_ids]
+        if sum(a != b for a, b in zip(sequence, sequence[1:])) < 3:
+            continue
+        left_column = [ordered[index] for index, right in zip(slots, sides) if not right]
+        right_column = [ordered[index] for index, right in zip(slots, sides) if right]
+        for index, line in zip(slots, (*left_column, *right_column)):
+            ordered[index] = line
+    return tuple(ordered)
+
+
 def furniture_key(text: str) -> str:
     text = unicodedata.normalize("NFKC", text).casefold()
     return re.sub(r"\s+", " ", re.sub(r"\d+", "#", text)).strip()
@@ -231,7 +304,8 @@ def join_selections(parts: list[Selection]) -> Selection:
     return Selection(clean_source(raw, hyphenated),
                      {key: value for part in parts for key, value in part.quads.items()},
                      {key: value for part in parts for key, value in part.boxes.items()},
-                     tuple(sorted({kind for part in parts for kind in part.skipped})))
+                     tuple(sorted({kind for part in parts for kind in part.skipped})),
+                     exclusions=tuple(item for part in parts for item in part.exclusions))
 
 
 def select(pages: dict[int, tuple[Line, ...]], first: tuple[int, int, int],
@@ -239,11 +313,22 @@ def select(pages: dict[int, tuple[Line, ...]], first: tuple[int, int, int],
     start, end = sorted((first, last))
     text: list[str] = []
     skipped: set[str] = set()
+    exclusions: list[Exclusion] = []
     quads: dict[int, list[Quad]] = {}
     boxes: dict[int, list[Box]] = {}
     previous = None
     starts_paragraph = False
     hyphenated: set[str] = set()
+    last_run = None
+
+    def exclude(page, kind, glyphs):
+        nonlocal last_run
+        value = "".join(glyph.text for glyph in glyphs).strip()
+        if value:
+            skipped.add(kind)
+            exclusions.append(Exclusion(page, kind, value))
+        last_run = None
+
     for page in sorted(p for p in pages if start[0] <= p <= end[0]):
         lines = pages[page]
         for index, line in enumerate(lines):
@@ -253,17 +338,6 @@ def select(pages: dict[int, tuple[Line, ...]], first: tuple[int, int, int],
                 continue
             edge = position in (start[:2], end[:2])
             kind = line.kind
-            if not include_skipped:
-                enabled = bool(kind and (rules is None or rules.get(kind, True)))
-                if origin == "caption":
-                    omit = kind != "caption" and (not kind or enabled)
-                elif not origin:
-                    omit = enabled
-                else:
-                    omit = enabled and (not edge or kind in ("furniture", "ruby", "line_number"))
-                if omit:
-                    skipped.add(kind or "body")
-                    continue
             left = start[2] if position == start[:2] else 0
             right = end[2] + 1 if position == end[:2] else len(line.glyphs)
             selected = list(line.glyphs[left:right])
@@ -273,6 +347,17 @@ def select(pages: dict[int, tuple[Line, ...]], first: tuple[int, int, int],
                 selected.pop()
             if not selected:
                 continue
+            if not include_skipped:
+                enabled = bool(kind and (rules is None or rules.get(kind, True)))
+                if origin == "caption":
+                    omit = kind != "caption" and (not kind or enabled)
+                elif not origin:
+                    omit = enabled
+                else:
+                    omit = enabled and (not edge or kind in ("furniture", "ruby", "line_number"))
+                if omit:
+                    exclude(page, kind or "body", selected)
+                    continue
             if previous is not None and page == previous[0] and line.paragraph != previous[1]:
                 # A PDF often starts new blocks at columns. Keep the separator
                 # for an indented paragraph or a clear gap within one column.
@@ -280,15 +365,19 @@ def select(pages: dict[int, tuple[Line, ...]], first: tuple[int, int, int],
                 same_column = abs(line.box[0] - previous[2][0]) < line.size * 3
                 if moved_right or (same_column and line.box[1] - previous[2][3] > line.size * 0.65):
                     text.append("")
-            runs = [[]]
-            for glyph in selected:
-                if glyph.artifact and not include_skipped and (rules is None or rules.get("artifact", True)):
-                    skipped.add("artifact")
-                    if runs[-1]:
-                        runs.append([])
-                else:
-                    runs[-1].append(glyph)
-            if any(runs):
+            runs = []
+            exclude_artifacts = not include_skipped and (rules is None or rules.get("artifact", True))
+            for offset, glyph in enumerate(selected):
+                omitted = exclude_artifacts and glyph.artifact
+                if omitted and kind == "caption" and glyph.text in ".,:;!?":
+                    # Some PDF producers mark linked caption punctuation as an artifact.
+                    # Keep it when it touches the visible text of that same caption.
+                    neighbours = selected[max(0, offset - 1):offset] + selected[offset + 1:offset + 2]
+                    omitted = not any(not char.artifact and char.text.isalnum() for char in neighbours)
+                if not runs or runs[-1][0] != omitted:
+                    runs.append((omitted, []))
+                runs[-1][1].append(glyph)
+            if any(not omitted for omitted, _ in runs):
                 if not text and len(lines) > index + 1 and left == 0:
                     following = lines[index + 1]
                     gap = following.box[1] - line.box[1]
@@ -297,11 +386,41 @@ def select(pages: dict[int, tuple[Line, ...]], first: tuple[int, int, int],
                     starts_paragraph = (line.horizontal and following.horizontal and overlap > line.size * 3
                                         and 0 < gap < line.size * 2.2 and 3 < indent < line.size * 3)
                 previous = page, line.paragraph, line.box
-                text.append("".join(glyph.text for run in runs for glyph in run))
-            for run in filter(None, runs):
+                text.append("".join(glyph.text for omitted, run in runs if not omitted for glyph in run))
+            for omitted, run in runs:
+                if omitted:
+                    exclude(page, "artifact", run)
+                    continue
                 a, b = run[0].quad, run[-1].quad
-                quads.setdefault(page, []).append((a[0], b[1], a[2], b[3]))
-                boxes.setdefault(page, []).append(bounds(glyph.box for glyph in run))
+                box = bounds(glyph.box for glyph in run)
+                if not line.horizontal:
+                    quads.setdefault(page, []).append((a[0], b[1], a[2], b[3]))
+                    boxes.setdefault(page, []).append(box)
+                    last_run = None
+                    continue
+                # Glyph quads are in the unrotated coordinate system required by PDF annotations.
+                geometry = bounds((x, y, x, y) for glyph in run for x, y in glyph.quad)
+                merge = False
+                if last_run and last_run[0] == page and last_run[1] != index:
+                    _, _, previous_geometry, previous_size, previous_kind = last_run
+                    px0, py0, px1, py1 = previous_geometry
+                    x0, y0, x1, y1 = geometry
+                    size = max(line.size, previous_size)
+                    merge = (kind == previous_kind and px0 <= x0 and -size * .45 <= x0 - px1 <= size * .85
+                             and min(py1, y1) > max(py0, y0)
+                             and abs(py0 + py1 - y0 - y1) <= size * 1.1)
+                    if merge:
+                        geometry = bounds((previous_geometry, geometry))
+                        box = bounds((boxes[page][-1], box))
+                x0, y0, x1, y1 = geometry
+                quad = ((x0, y0), (x1, y0), (x0, y1), (x1, y1))
+                if merge:
+                    quads[page][-1] = quad
+                    boxes[page][-1] = box
+                else:
+                    quads.setdefault(page, []).append(quad)
+                    boxes.setdefault(page, []).append(box)
+                last_run = page, index, geometry, line.size, kind
     raw = "\n".join(text)
     return Selection(clean_source(raw, hyphenated), quads, boxes, tuple(sorted(skipped)),
-                     raw, frozenset(hyphenated), starts_paragraph)
+                     raw, frozenset(hyphenated), starts_paragraph, tuple(exclusions))

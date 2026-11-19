@@ -64,9 +64,6 @@ class DocumentPane(QWidget):
         self.sidebar.setSizes([300, 700])
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setSizes([270, 850])
-        self.outline.hide()
-        self.notes.hide()
-        self.sidebar.hide()
         self.view.location_changed.connect(self.location_changed)
         self.view.message.connect(self.message)
         self.view.clicked.connect(self.clicked)
@@ -395,9 +392,17 @@ class DocumentPane(QWidget):
             if self.view.selection_range:
                 menu.addAction(t("選択範囲をコピー", "Copy selection"), self.copy_selection)
                 menu.addAction(icon(self, "highlight"), t("ハイライトを作成", "Create highlight"), self.highlight_selection)
-                menu.addAction(icon(self, "translate"), t("翻訳…", "Translate…"), lambda: self.translate_selection(point))
-                menu.addAction(icon(self, "translate"), t("翻訳して注釈を追加", "Translate and add annotation"),
-                               self.translate_to_note)
+                for label, callback in (
+                    (t("翻訳…", "Translate…"), lambda color: self.translate_selection(point, color)),
+                    (t("翻訳して注釈を追加", "Translate and add annotation"), self.translate_to_note),
+                ):
+                    colors = menu.addMenu(icon(self, "translate"), label)
+                    for shade, names in COLORS.items():
+                        action = colors.addAction(swatch(QColor(shade)), t(*names))
+                        action.setIconVisibleInMenu(True)
+                        action.setCheckable(True)
+                        action.setChecked(shade == self.last_color)
+                        action.triggered.connect(lambda _checked, color=shade, run=callback: run(color))
                 menu.addAction(icon(self, "find"), t("文書内で検索", "Find in document"), self.find_selection)
                 menu.addAction(t("Google で検索", "Search Google"), self.google_selection)
                 menu.addSeparator()
@@ -438,8 +443,9 @@ class DocumentPane(QWidget):
         self.with_selection(lambda choices: QDesktopServices.openUrl(
             QUrl("https://www.google.com/search?" + urlencode({"q": choices[1].source}))))
 
-    def translate_selection(self, point=None):
-        self.with_selection(lambda choices: self.open_translation(choices=choices, point=point))
+    def translate_selection(self, point=None, color=None):
+        chosen = color or self.last_color
+        self.with_selection(lambda choices: self.open_translation(choices=choices, point=point, color=chosen))
 
     def highlight_selection(self):
         def create(choices):
@@ -448,10 +454,10 @@ class DocumentPane(QWidget):
                 self.document.add_highlight(selection.quads, self.last_color, on_success=self.new_comment)
         self.with_selection(create)
 
-    def translate_to_note(self):
+    def translate_to_note(self, color=None):
         doc = self.document
         generation = doc.generation
-        selected_color = self.last_color
+        selected_color = color or self.last_color
         settings = self.preferences.data
         profile = settings["profiles"][settings["activeProfile"]]
         revision = self.view.selection_revision
@@ -531,6 +537,9 @@ class DocumentPane(QWidget):
         self.annotation_dialog = dialog
         dialog.finished.connect(lambda: setattr(self, "annotation_dialog", None))
         dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        dialog.source.setFocus()
 
     def translate_note(self, key):
         self.notes.commit_selected()

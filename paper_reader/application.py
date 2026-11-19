@@ -48,6 +48,9 @@ class Application:
     def has_comment_drafts(self, document):
         return any(pane.document is document and pane.notes.has_drafts() for pane in self.panes())
 
+    def has_unsaved_changes(self, document):
+        return bool(document.dirty or document.mutating or self.has_comment_drafts(document))
+
     def receive_paths(self, paths):
         active = self.app.activeWindow()
         window = active if isinstance(active, Reader) else (self.windows[-1] if self.windows else self.new_window())

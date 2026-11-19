@@ -12,6 +12,7 @@ import sys
 from tempfile import TemporaryDirectory
 from threading import Thread
 from time import sleep
+from unittest.mock import patch
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -195,9 +196,11 @@ def main():
             wait(lambda: pane.annotation_dialog, "Explicit translation dialog did not open")
             dialog = pane.annotation_dialog
             assert "Marked artifact" not in dialog.source.toPlainText()
+            assert QTest.qWaitForWindowActive(dialog)
             dialog.source.setFocus()
             QTest.keyClick(dialog.source, Qt.Key.Key_Return, Qt.KeyboardModifier.ControlModifier)
-            wait(lambda: dialog.job and dialog.job.state == "running" and dialog.job.output, "Stream did not start")
+            wait(lambda: dialog.job and dialog.job.state == "running" and dialog.job.output,
+                 f"Stream did not start (focus: {app.focusWidget()}, job: {dialog.job})")
             dialog.output.setFocus()
             QTest.keyClick(dialog.output, Qt.Key.Key_Return, Qt.KeyboardModifier.ControlModifier)
             wait(lambda: len(LocalTranslation.requests) == 1 and len(doc.annotations) == 6
@@ -279,8 +282,9 @@ def main():
             folder.mkdir()
             named = folder / "同名の長いファイル名でタブ表示を検証する論文.pdf"
             make_pdf(named)
-            window.open_paths([str(named)])
-            wait(lambda: window.pane.document.path == named and window.pane.view.pages, "Quick translate fixture was not opened")
+            with patch.object(window, "confirm_switch", return_value=True):
+                window.open_paths([str(named)])
+                wait(lambda: window.pane.document.path == named and window.pane.view.pages, "Quick translate fixture was not opened")
             quick = window.pane
             quick_doc = quick.document
             quick.view.select_all()
@@ -290,12 +294,14 @@ def main():
             def click_direct():
                 popup = app.activePopupWidget()
                 action = next((item for item in popup.actions() if item.text() == "Translate and add annotation"), None) if popup else None
+                menu = action.menu() if action else None
+                color = next((item for item in menu.actions() if item.text() == "Blue"), None) if menu else None
                 if popup:
                     popup.close()
-                if action is None:
-                    failures.append(AssertionError("The direct translation action is not at the top level"))
+                if color is None:
+                    failures.append(AssertionError("The direct translation color menu is missing"))
                 else:
-                    action.trigger()
+                    color.trigger()
 
             QTimer.singleShot(30, click_direct)
             QTimer.singleShot(800, lambda: app.activePopupWidget().close() if app.activePopupWidget() else None)
@@ -306,6 +312,7 @@ def main():
             key = next(iter(quick_doc.groups))
             assert quick.annotation_dialog is None and len(quick_doc.annotations) == 6
             assert quick_doc.get_note(key)["comment"] == ""
+            assert quick_doc.get_note(key)["color"] == "#2ea8e5"
             job = next(iter(quick_doc.jobs.values()))
             job.retry()
             wait(lambda: not quick_doc.jobs and quick_doc.get_note(key)["comment"] == "試験用の翻訳",

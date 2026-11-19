@@ -81,7 +81,7 @@ class TabList(QFrame):
                 title += " · " + doc.path.parent.name
             if identical_paths[doc.key] > 1:
                 title += " · " + self.window.t(f"タブ {index + 1}", f"Tab {index + 1}")
-            if doc.dirty:
+            if self.window.controller.has_unsaved_changes(doc):
                 title += " *"
             item = QListWidgetItem(("✓  " if pane is tabs.currentWidget() else "") + title)
             item.setToolTip(str(doc.path))
@@ -97,8 +97,9 @@ class TabList(QFrame):
             pane = self.matches[row]
             if self.window.tabs.indexOf(pane) >= 0:
                 self.window.tabs.setCurrentWidget(pane)
-                self.hide()
-                pane.view.setFocus()
+                if self.window.pane is pane:
+                    self.hide()
+                    pane.view.setFocus()
 
     def eventFilter(self, target, event):
         if target is self.query and event.type() == QEvent.Type.KeyPress:
@@ -114,7 +115,7 @@ class TabList(QFrame):
 
 
 class Header(QWidget):
-    TOOLS = ("page_previous", "page_next", "width", "fit", "left", "right", "smaller", "bigger")
+    TOOLS = ("page_previous", "page_next", "single", "spread", "width", "fit", "left", "right", "smaller", "bigger")
 
     def __init__(self, window):
         super().__init__(window)
@@ -159,8 +160,9 @@ class Header(QWidget):
         self.more.setMenu(self.overflow)
         self.tools.addWidget(self.more)
         self.external = QLabel()
+        self.save_state = QLabel()
         self.notice = QLabel()
-        for message in (self.external, self.notice):
+        for message in (self.external, self.save_state, self.notice):
             message.setContentsMargins(8, 3, 8, 3)
             message.setTextFormat(Qt.TextFormat.PlainText)
             message.setWordWrap(True)
@@ -179,6 +181,11 @@ class Header(QWidget):
         if self.external.text() != message:
             self.external.setText(message)
             self.external.setVisible(bool(message))
+
+    def set_save_state(self, message):
+        if self.save_state.text() != message:
+            self.save_state.setText(message)
+            self.save_state.setVisible(bool(message))
 
     def show_notice(self, message):
         self.notice.setText(message)
