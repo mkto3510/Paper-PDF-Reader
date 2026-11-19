@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from urllib.parse import urlencode
 
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu, QSizePolicy, QSplitter,
+    QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QSizePolicy, QSplitter,
     QToolButton, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -545,6 +546,37 @@ class DocumentPane(QWidget):
         else:
             self.document.request("highlight_text", key, ready, priority=1)
 
+    def annotation_groups(self, keys):
+        doc = self.document
+        if doc.loading:
+            return ()
+        groups = dict.fromkeys(doc.targets(key) for key in sorted(keys) if doc.get_note(key))
+        unavailable = doc.deleting_notes | doc.resizing_notes
+        return tuple(group for group in groups if unavailable.isdisjoint(group))
+
+    def translate_notes(self, keys):
+        groups = self.annotation_groups(keys)
+        if not groups:
+            return
+        self.notes.commit_selected()
+        settings = self.preferences.data
+        profile = deepcopy(settings["profiles"][settings["activeProfile"]])
+        languages = {key: settings[key] for key in ("langFrom", "langTo")}
+        try:
+            chat_request(profile, "", languages["langFrom"], languages["langTo"])
+        except (TypeError, ValueError):
+            self.message.emit(self.t("設定で翻訳サービスの接続先を確認してください。",
+                                     "Check the translation service URL in Preferences."))
+            return
+        if not profile["model"].strip():
+            self.message.emit(self.t("設定で翻訳モデルを選んでください。",
+                                     "Choose a translation model in Preferences."))
+            return
+        empty = self.t("一部の注釈から翻訳する文字を取得できませんでした。",
+                       "No translatable text was found in some selected annotations.")
+        for targets in groups:
+            self.document.translate_highlights(targets, profile, languages, empty)
+
     def add_note_actions(self, menu, key):
         t = self.t
         menu.addAction(t("コメントを編集", "Edit comment"), lambda: self.pick_note(key, edit=True))
@@ -557,9 +589,22 @@ class DocumentPane(QWidget):
         menu.addAction(icon(self, "delete"), t("注釈を削除", "Delete annotation"), lambda: self.delete_note(key))
 
     def delete_note(self, key):
-        if key is None or self.document.loading or not self.document.get_note(key):
+        if key is None:
             return
-        targets = self.document.targets(key)
+        self.delete_notes((key,), confirm=False)
+
+    def delete_notes(self, keys, confirm=True):
+        groups = self.annotation_groups(keys)
+        if not groups:
+            return
+        count = len(groups)
+        if confirm and QMessageBox.question(
+            self, self.t("注釈を削除", "Delete annotations"),
+            self.t(f"選択した注釈（{count}件）を削除しますか？", f"Delete the selected annotations ({count})?"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        targets = tuple(target for group in groups for target in group)
         if self.view.selected_note in targets:
             self.view.selected_note = None
             self.notes.set_selection(None)
@@ -582,7 +627,10 @@ class DocumentPane(QWidget):
         self.document.resized(key, first, last, moved, failed)
         self.view.viewport().update()
 
-    def recolor(self, key, color):
+    def recolor_notes(self, keys, color):
+        groups = self.annotation_groups(keys)
+        if not groups:
+            return
         self.notes.commit_selected()
         self.last_color = color
-        self.document.modify(self.document.targets(key), color=color)
+        self.document.modify(tuple(target for group in groups for target in group), color=color)

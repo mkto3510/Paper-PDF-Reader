@@ -112,6 +112,8 @@ class Document(QObject):
         self.groups = {}
         self.jobs = {}
         self.job_handlers = {}
+        self.translation_sources = {}
+        self.deleting_notes = set()
         self.annotation_reads = {}
         self.resizing_notes = set()
         self.source_pending = {}
@@ -131,7 +133,7 @@ class Document(QObject):
 
     @property
     def has_active_jobs(self):
-        return any(job.state in ("waiting", "running") for job in self.jobs.values())
+        return bool(self.translation_sources) or any(job.state in ("waiting", "running") for job in self.jobs.values())
 
     def promote(self, key, priority):
         self.store.session.promote(key, priority)
@@ -182,6 +184,8 @@ class Document(QObject):
             self.annotation_reads.clear()
             self.resizing_notes.clear()
             self.source_pending.clear()
+            self.translation_sources.clear()
+            self.deleting_notes.clear()
             self.detach_all_jobs(cancel=True)
             self.store.cache.discard(self.identifier)
             self.store.watch(self.path)
@@ -229,6 +233,7 @@ class Document(QObject):
                         self.annotations[page] = fresh
                     else:
                         self.annotations.pop(page, None)
+                    self.deleting_notes.difference_update(old.keys() - fresh.keys())
                     changed = {key for key in old.keys() | fresh.keys() if old.get(key) != fresh.get(key)}
                     if changed:
                         self.note_changed.emit(changed)
@@ -294,17 +299,34 @@ class Document(QObject):
         self.mutate("add_highlight", (quads, color, comment), set(quads), added, on_error)
 
     def modify(self, targets, color=None, comment=None, delete=False, autosave=True, on_error=None):
+        targets = tuple(target for target in targets if target not in self.deleting_notes)
+        if not targets:
+            return
         if delete:
-            self.detach_job(tuple(targets), cancel=True)
-            for target in targets:
-                self.groups.pop(target, None)
+            self.deleting_notes.update(targets)
+            for group in {self.targets(target) for target in targets}:
+                self.detach_job(group, cancel=True)
+
+        def updated(_):
+            if delete:
+                for target in targets:
+                    self.groups.pop(target, None)
+            if autosave:
+                self.schedule_save()
+
+        def failed():
+            if delete:
+                self.deleting_notes.difference_update(targets)
+            if on_error:
+                on_error()
+
         self.mutate("modify_highlight", (list(targets), color, comment, delete),
-                    {page for page, _ in targets}, lambda _: self.schedule_save() if autosave else None,
-                    on_error)
+                    {page for page, _ in targets}, updated, failed)
 
     def can_resize(self, key):
         job = self.jobs.get(self.targets(key))
         return (not self.loading and not self.disposed and key not in self.resizing_notes
+                and key not in self.deleting_notes
                 and self.get_note(key) is not None and (job is None or job.state not in ("waiting", "running")))
 
     def resized(self, key, first, last, selected, on_error):
@@ -331,6 +353,47 @@ class Document(QObject):
             on_error()
 
         self.mutate("resize_highlight", (page, xref, first, last), {page}, moved, failed)
+
+    def translate_highlights(self, targets, profile, settings, empty_message):
+        active = self.jobs.get(targets)
+        if (targets in self.translation_sources or (active and active.state in ("waiting", "running"))
+                or any(key in self.deleting_notes or key in self.resizing_notes for key in targets)):
+            return
+        sources = {}
+        self.translation_sources[targets] = sources
+
+        def pending():
+            return not self.disposed and self.translation_sources.get(targets) is sources
+
+        def received(key, source, error):
+            if not pending():
+                return
+            if error:
+                self.translation_sources.pop(targets)
+                self.input_error.emit(error)
+                return
+            sources[key] = source or ""
+            if len(sources) != len(targets):
+                return
+            self.translation_sources.pop(targets)
+            if self.loading:
+                return
+            source = "\n".join(sources[target].strip() for target in targets if sources[target].strip())
+            if not source:
+                self.input_error.emit(empty_message)
+                return
+            manager = self.store.translations
+            job = manager.create(profile, source, settings)
+            self.attach_job(targets, job)
+            manager.enqueue(job)
+
+        for key in targets:
+            note = self.get_note(key)
+            if note is not None and "source" in note:
+                received(key, note["source"], None)
+            else:
+                self.request("highlight_text", key, lambda source, error, target=key: received(target, source, error),
+                             priority=3, needed=pending)
 
     def attach_job(self, targets, job):
         self.detach_job(targets, cancel=True)
@@ -366,6 +429,8 @@ class Document(QObject):
             self.note_jobs_changed.emit(keys, False)
 
     def detach_job(self, targets, cancel=False):
+        if cancel:
+            self.translation_sources.pop(targets, None)
         job = self.jobs.pop(targets, None)
         handler = self.job_handlers.pop(targets, None)
         if job:
@@ -416,5 +481,6 @@ class Document(QObject):
     def dispose(self):
         self.disposed = True
         self.auto_save.stop()
+        self.translation_sources.clear()
         self.detach_all_jobs(cancel=True)
         self.request("close", (), lambda *_: None, priority=-10)

@@ -1,4 +1,4 @@
-"""Annotation cards, inline editing, and colour filters."""
+"""Annotation cards, inline editing, and bulk actions."""
 
 from bisect import bisect_left, bisect_right
 
@@ -20,15 +20,15 @@ COLORS = {
 }
 
 
-def color_menu(menu, pane, key):
-    note = pane.document.get_note(key)
-    active = note["color"] if note else None
+def color_menu(menu, pane, key=None):
+    keys = (key,) if key is not None else pane.notes.multiple
+    colors = {note["color"] for target in keys if (note := pane.document.get_note(target))}
     for shade, labels in COLORS.items():
         action = menu.addAction(swatch(QColor(shade)), pane.t(*labels))
         action.setIconVisibleInMenu(True)
         action.setCheckable(True)
-        action.setChecked(shade == active)
-        action.triggered.connect(lambda checked=False, color=shade: pane.recolor(key, color))
+        action.setChecked(colors == {shade})
+        action.triggered.connect(lambda checked=False, color=shade: pane.recolor_notes(keys, color))
 
 
 class Card(QFrame):
@@ -44,7 +44,8 @@ class Card(QFrame):
         header = QHBoxLayout()
         self.heading = QToolButton()
         self.heading.setAutoRaise(True)
-        self.heading.clicked.connect(lambda: self.pane.pick_note(self.key, jump=True, focus_card=True))
+        self.heading.installEventFilter(self)
+        self.heading.clicked.connect(lambda: self.panel.select_card(self.key))
         header.addWidget(self.heading)
         header.addStretch(1)
         self.color = QToolButton()
@@ -108,22 +109,36 @@ class Card(QFrame):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         palette = self.palette()
-        painter.setPen(palette.highlight().color() if self.editing else palette.mid().color())
+        selected = self.editing or self.key in self.panel.multiple
+        painter.setPen(palette.highlight().color() if selected else palette.mid().color())
         painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 3, 3)
         painter.end()
 
     def show_colors(self, menu):
         menu.clear()
-        color_menu(menu, self.pane, self.key)
+        color_menu(menu, self.pane, None if self.key in self.panel.multiple else self.key)
+
+    def eventFilter(self, watched, event):
+        if (watched is self.heading and event.type() == QEvent.Type.MouseButtonRelease and self.heading.isDown()
+                and event.button() == Qt.MouseButton.LeftButton
+                and self.heading.rect().contains(event.position().toPoint())
+                and event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)):
+            self.heading.setDown(False)
+            self.panel.select_card(self.key, event.modifiers())
+            return True
+        return super().eventFilter(watched, event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.pane.pick_note(self.key, jump=True, focus_card=True)
+            self.panel.select_card(self.key, event.modifiers())
         super().mousePressEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Delete and not event.isAutoRepeat():
-            self.pane.delete_note(self.pane.view.selected_note)
+            if self.panel.multiple:
+                self.panel.delete_multiple()
+            else:
+                self.pane.delete_note(self.pane.view.selected_note)
             event.accept()
         else:
             super().keyPressEvent(event)
@@ -206,12 +221,26 @@ class Notes(QWidget):
         self.reindex = True
         self.width_used = 0
         self.selected = None
+        self.multiple = set()
+        self.selection_anchor = None
         self.layout_timer = QTimer(self, singleShot=True, interval=0)
         self.layout_timer.timeout.connect(self.layout_cards)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         self.title = WrappedLabel()
         layout.addWidget(self.title)
+        self.bulk_color = QToolButton()
+        self.bulk_color.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.bulk_color.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        colors = QMenu(self.bulk_color)
+        colors.aboutToShow.connect(lambda: self.show_bulk_colors(colors))
+        self.bulk_color.setMenu(colors)
+        self.bulk_translate, self.bulk_delete = QPushButton(), QPushButton()
+        self.bulk_translate.clicked.connect(lambda: self.pane.translate_notes(self.multiple))
+        self.bulk_delete.clicked.connect(self.delete_multiple)
+        self.bulk_actions = ButtonGrid([self.bulk_color, self.bulk_translate, self.bulk_delete])
+        layout.addWidget(self.bulk_actions)
+        self.bulk_actions.hide()
         self.scroll = QScrollArea()
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.viewport = self.scroll.viewport()
@@ -232,7 +261,18 @@ class Notes(QWidget):
 
     def relabel(self):
         t = self.pane.t
-        self.title.setText(t("注釈", "Annotations"))
+        self.update_selection_label()
+        self.title.setToolTip(t("Ctrl+クリックで選択を切り替え、Shift+クリックで範囲を選択",
+                               "Ctrl-click to toggle a selection; Shift-click to select a range"))
+        for button, labels in ((self.bulk_color, ("色を変更", "Change color")),
+                               (self.bulk_translate, ("翻訳", "Translate")),
+                               (self.bulk_delete, ("削除", "Delete"))):
+            button.setText(t(*labels))
+            button.setAccessibleName(t(*labels))
+        self.bulk_color.setIcon(swatch(QColor(next(iter(COLORS)))))
+        self.bulk_translate.setIcon(icon(self, "translate"))
+        self.bulk_delete.setIcon(icon(self, "delete"))
+        self.bulk_actions.flow()
         for color, button in self.colors.items():
             name = t(*COLORS[color])
             button.setToolTip(name)
@@ -242,6 +282,55 @@ class Notes(QWidget):
         self.heights.clear()
         self.rebuild_offsets()
         self.refresh()
+
+    def update_selection_label(self):
+        count = len(self.multiple)
+        self.title.setText(self.pane.t(f"注釈（{count}件選択中）", f"Annotations ({count} selected)") if count
+                           else self.pane.t("注釈", "Annotations"))
+        self.bulk_actions.setVisible(bool(count))
+
+    def show_bulk_colors(self, menu):
+        menu.clear()
+        color_menu(menu, self.pane)
+
+    def delete_multiple(self):
+        self.pane.delete_notes(self.multiple)
+
+    def select_card(self, key, modifiers=Qt.KeyboardModifier.NoModifier):
+        extend = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        toggle = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        if key not in self.rows:
+            return
+        if not (extend or toggle):
+            self.pane.pick_note(key, jump=True, focus_card=True)
+            return
+        previous = self.selection_anchor
+        keys = self.multiple or ({self.selected} if self.selected in self.rows else set())
+        if extend:
+            anchor = previous if previous in self.rows else key
+            first, last = sorted((self.rows[anchor], self.rows[key]))
+            span = set(self.keys[first:last + 1])
+            keys = (keys | span) if toggle else span
+        else:
+            keys = keys ^ {key}
+            anchor = key
+        if self.selected is not None:
+            self.commit_selected()
+            self.pane.view.selected_note = None
+            self.pane.view.viewport().update()
+            self.set_selection(None)
+        self.selection_anchor = anchor
+        self.set_multiple(keys)
+        self.reveal(key, focus_card=True)
+
+    def set_multiple(self, keys):
+        if self.multiple == keys:
+            return
+        changed = self.multiple ^ keys
+        self.multiple = keys
+        self.update_selection_label()
+        for key in changed & self.cards.keys():
+            self.cards[key].update()
 
     def commit_selected(self):
         key = self.pane.view.selected_note
@@ -308,6 +397,8 @@ class Notes(QWidget):
         self.dirty.clear()
         self.keys.clear()
         self.selected = None
+        self.selection_anchor = None
+        self.set_multiple(set())
         self.rebuild_offsets()
         self.refresh()
 
@@ -327,6 +418,8 @@ class Notes(QWidget):
             self.layout_cards()
 
     def set_selection(self, key):
+        self.set_multiple(set())
+        self.selection_anchor = key
         previous, self.selected = self.selected, key
         if previous != key:
             self.dirty.update(target for target in (previous, key) if target is not None)
@@ -364,6 +457,7 @@ class Notes(QWidget):
         if visible != self.rows.keys():
             self.keys = sorted(visible)
             self.rebuild_offsets()
+            self.set_multiple(self.multiple & visible)
 
     def remove_card(self, key):
         card = self.cards.pop(key)

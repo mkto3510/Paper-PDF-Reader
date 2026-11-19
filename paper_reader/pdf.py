@@ -322,8 +322,10 @@ class PdfEngine:
 
     def modify_highlight(self, targets: list, color: str | None = None, comment: str | None = None,
                          delete: bool = False):
+        page = None
         for index, xref in targets:
-            page = self.doc[index]
+            if page is None or page.number != index:
+                page = self.doc[index]
             annot = page.load_annot(xref)
             if delete:
                 page.delete_annot(annot)
