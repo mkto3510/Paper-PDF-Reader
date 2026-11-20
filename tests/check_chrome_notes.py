@@ -9,15 +9,16 @@ from time import perf_counter
 from unittest.mock import patch
 
 import pymupdf as mu
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialogButtonBox, QStatusBar
+from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLabel, QStatusBar, QTabWidget, QTextBrowser
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from paper_reader.application import Application
+from paper_reader import VERSION
 from paper_reader.analysis_rules import RULES
-from paper_reader.dialogs import SettingsDialog
+from paper_reader.dialogs import AboutDialog, SettingsDialog
 from paper_reader.notes import Card
 from paper_reader.translation import Job
 
@@ -45,17 +46,20 @@ def make_annotated_pdf(path, count):
 
 
 def check_menu(window, save_settings=False):
+    QApplication.processEvents()
     menu_bar = window.chrome.menus
-    for position, key in ((0, "open"), (6, "about")):
-        assert window.actions[key][0].isEnabled()
-        action = menu_bar.actions()[position]
+    for key in ("open", "about"):
+        item = window.actions[key][0]
+        assert item.isEnabled()
+        action = next(action for action in menu_bar.actions() if action.menu() and item in action.menu().actions())
         menu = action.menu()
         QTest.mouseClick(menu_bar, Qt.MouseButton.LeftButton, pos=menu_bar.actionGeometry(action).center())
-        assert menu.isVisible()
+        assert menu.isVisible(), (key, item.text(), menu_bar.rect(), menu_bar.actionGeometry(action),
+                                  menu_bar.activeAction(), QApplication.activePopupWidget())
         QTest.keyClick(menu, Qt.Key.Key_Escape)
         assert not menu.isVisible()
     settings = window.actions["preferences"][0]
-    assert settings == menu_bar.actions()[5] and settings.isEnabled()
+    assert settings in menu_bar.actions() and settings.isEnabled()
     QTest.mouseClick(menu_bar, Qt.MouseButton.LeftButton, pos=menu_bar.actionGeometry(settings).center())
     dialog = window.findChild(SettingsDialog)
     assert dialog and dialog.isVisible()
@@ -70,6 +74,45 @@ def check_menu(window, save_settings=False):
     else:
         QTest.keyClick(dialog, Qt.Key.Key_Escape)
     wait(lambda: window.findChild(SettingsDialog) is None, "Settings did not close")
+
+
+def check_about(window, root):
+    def inspect():
+        dialog = QApplication.activeModalWidget()
+        tabs = dialog.findChild(QTabWidget)
+        labels = [child.text() for child in dialog.findChildren(QLabel)]
+        description = tabs.widget(0)
+        dialog.notice.setCurrentIndex(1)
+        seen.append((tabs.tabText(0), tabs.tabText(1), labels, description.toHtml(), dialog.notice_body.toHtml()))
+        if window.language == "en":
+            dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Close).click()
+        else:
+            QTest.keyClick(dialog, Qt.Key.Key_Escape)
+
+    seen = []
+    QTimer.singleShot(0, inspect)
+    window.actions["about"][0].trigger()
+    overview, licenses, labels, description, notices = seen[0]
+    assert (overview, licenses) == (window.t("概要", "Overview"), window.t("ライセンス", "Licenses"))
+    assert window.t(f"バージョン {VERSION}", f"Version {VERSION}") in labels
+    assert "https://github.com/mkto3510/Paper-PDF-Reader" in description
+    assert "https://github.com/pymupdf/PyMuPDF" in notices
+
+    bundle = root / "bundle"
+    folder = bundle / "LICENSES"
+    component = folder / "Component"
+    component.mkdir(parents=True, exist_ok=True)
+    (component / "LICENSE.txt").write_text("Third-party license", encoding="utf-8")
+    (bundle / "LICENSE.txt").write_text("Application license", encoding="utf-8")
+    with patch.object(sys, "frozen", True, create=True), patch.object(sys, "executable", str(bundle / "reader.exe")):
+        dialog = AboutDialog(window)
+    assert "Application license" == dialog.notice_body.toPlainText()
+    dialog.notice.setCurrentIndex(1)
+    assert "THIRD_PARTY.md" in dialog.notice_body.toPlainText()
+    dialog.notice.setCurrentIndex(2)
+    assert "Third-party license" == dialog.notice_body.toPlainText()
+    assert dialog.findChild(QTextBrowser).openExternalLinks()
+    dialog.deleteLater()
 
 
 def check_native_frame(window):
@@ -120,6 +163,7 @@ def exercise(app, folder, count):
         window = control.new_window()
         check_native_frame(window)
         check_menu(window, save_settings=True)
+        check_about(window, folder)
         window.open_paths([str(path)])
         wait(lambda: window.pane and sum(map(len, window.pane.document.annotations.values())) == count,
              "The annotations did not load")
@@ -134,6 +178,7 @@ def exercise(app, folder, count):
         control.preferences.save(control.preferences.data | {"language": "en"})
         assert window.chrome.menus.actions()[0].text() == "File"
         check_chrome(window)
+        check_about(window, folder)
         window.resize(1050, 810)
         pane.show_sidebar("notes", True)
         pane.splitter.setSizes([256, 800])
@@ -225,9 +270,9 @@ def exercise(app, folder, count):
         failed = Job(None, None)
         failed.set_state("failed", error="test failure")
         doc.attach_job((last,), failed)
-        assert window.chrome.menus.actions()[1].text() == "View ●"
+        assert window.view_menu.title() == "View ●"
         assert window.close_tabs(range(window.tabs.count()))
-        assert window.chrome.menus.actions()[1].text() == "View"
+        assert window.view_menu.title() == "View"
         check_menu(window)
     finally:
         control.shutdown()

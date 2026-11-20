@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-import sys
-
 from PySide6.QtCore import QEvent, QEventLoop, QSignalBlocker, QTimer, Qt
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
@@ -12,12 +9,14 @@ from PySide6.QtWidgets import (
     QMenu, QMessageBox, QTabWidget, QTextEdit, QToolButton, QVBoxLayout,
 )
 
-from . import VERSION
 from .chrome import DocumentTabs, Header, TabList
-from .dialogs import SettingsDialog
+from .dialogs import AboutDialog, SettingsDialog
 from .icons import icon
 from .pane import DocumentPane
 from .view import ACTUAL_SIZE
+
+
+MINIMUM_WIDTH = 530
 
 
 class Reader(QMainWindow):
@@ -25,7 +24,7 @@ class Reader(QMainWindow):
         super().__init__()
         self.controller = controller
         self.preferences = controller.preferences
-        self.setMinimumWidth(530)
+        self.setMinimumWidth(MINIMUM_WIDTH)
         self.resize(1180, 820)
         self.setWindowTitle("Paper PDF Reader")
         self.setAcceptDrops(True)
@@ -161,10 +160,11 @@ class Reader(QMainWindow):
         for old in old_menus:
             if old:
                 old.deleteLater()
-        file, view, go, zoom, selection, help_ = [menu.addMenu(self.t(*names)) for names in (
-            ("ファイル", "File"), ("表示", "View"), ("移動", "Go to"), ("ズーム", "Zoom"),
+        file, edit, view, go, zoom, selection, help_ = [menu.addMenu(self.t(*names)) for names in (
+            ("ファイル", "File"), ("編集", "Edit"), ("表示", "View"), ("移動", "Go to"), ("ズーム", "Zoom"),
             ("選択", "Selection"), ("ヘルプ", "Help"),
         )]
+        self.view_menu = view
         self.action(file, "new", ("新しいウインドウ", "New window"), self.controller.new_window, "Ctrl+N", False)
         self.action(file, "open", ("開く…", "Open…"), self.browse, "Ctrl+O", False)
         self.action(file, "close", ("文書を閉じる", "Close document"), lambda: self.close_tabs([self.tabs.currentIndex()]), "Ctrl+W")
@@ -176,6 +176,12 @@ class Reader(QMainWindow):
         self.action(file, "save", ("注釈を保存", "Save annotations"), self.save, "Ctrl+S")
         self.action(file, "properties", ("文書のプロパティ", "Document properties"), self.properties, "Ctrl+D")
         self.action(file, "exit", ("終了", "Exit"), self.close, required=False)
+
+        self.action(edit, "undo", ("注釈を元に戻す", "Undo annotation edit"),
+                    self.move_annotation_history, "Ctrl+Z")
+        redo = self.action(edit, "redo", ("注釈をやり直す", "Redo annotation edit"),
+                           lambda: self.move_annotation_history(True))
+        redo.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
 
         modes = QActionGroup(self)
         modes.setExclusive(True)
@@ -253,6 +259,9 @@ class Reader(QMainWindow):
             self.tab_list.refresh()
         pane = self.pane
         ready = bool(pane and pane.document.info and not pane.document.loading)
+        failed = ready and any(job.state == "failed" for job in pane.document.jobs.values())
+        self.view_menu.setTitle(self.t("表示", "View") + (" ●" if failed and pane.notes.isHidden() else ""))
+        self.setMinimumWidth(max(MINIMUM_WIDTH, self.chrome.menus.sizeHint().width()))
         for key, (action, required) in self.actions.items():
             action.setEnabled(not required or ready)
             if ready and key in ("copy", "translate", "find_selection", "google"):
@@ -260,7 +269,6 @@ class Reader(QMainWindow):
         self.chrome.set_location(pane)
         if not ready:
             self.actions["notes"][0].setText(self.t("注釈一覧", "Annotations"))
-            self.chrome.menus.actions()[1].setText(self.t("表示", "View"))
             self.chrome.set_external("")
             self.chrome.set_save_state("")
             return
@@ -273,10 +281,10 @@ class Reader(QMainWindow):
                             ("rtl", pane.view.rtl), ("outline", not pane.outline.isHidden()),
                             ("notes", not pane.notes.isHidden())):
             self.actions[key][0].setChecked(active)
-        failed = any(job.state == "failed" for job in doc.jobs.values())
         self.actions["notes"][0].setText(self.t("注釈一覧", "Annotations") + (" ●" if failed else ""))
-        self.chrome.menus.actions()[1].setText(self.t("表示", "View") + (" ●" if failed and pane.notes.isHidden() else ""))
         self.actions["save"][0].setEnabled(unsaved and not doc.saving)
+        self.actions["undo"][0].setEnabled(doc.can_undo and not doc.busy)
+        self.actions["redo"][0].setEnabled(doc.can_redo and not doc.busy)
         self.actions["back"][0].setEnabled(pane.history_index > 0)
         self.actions["forward"][0].setEnabled(pane.history_index + 1 < len(pane.history))
         current = pane.view.current_page()
@@ -404,6 +412,10 @@ class Reader(QMainWindow):
         if self.confirm_discard(doc, reload=True):
             self.load_document(doc, reload=True)
 
+    def move_annotation_history(self, redo=False):
+        if self.pane:
+            self.pane.document.move_history(redo)
+
     def confirm_discard(self, doc, reload=False):
         if doc.loading:
             self.show_message(self.t("PDF を更新しています。", "The PDF is being updated."))
@@ -473,16 +485,34 @@ class Reader(QMainWindow):
         if self.controller.has_comment_drafts(doc):
             return False
         doc.auto_save.stop()
-        result = []
 
-        def ready(ok):
-            result.append(ok)
-            wait.quit()
+        def write(allow_signature_loss=False):
+            result = []
 
-        doc.save(destination, ready)
-        if not result:
-            wait.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-        if not result or not result[0]:
+            def ready(ok):
+                result.append(ok)
+                wait.quit()
+
+            if destination:
+                doc.save(destination, ready, allow_signature_loss=allow_signature_loss,
+                         on_signature_loss=lambda: ready(None))
+            else:
+                doc.save(destination, ready)
+            if not result:
+                wait.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            return result[0] if result else False
+
+        saved = write()
+        if saved is None:
+            answer = QMessageBox.question(
+                self, self.t("電子署名付き PDF", "Digitally signed PDF"),
+                self.t("別名保存すると電子署名の検証に影響する可能性があります．別名で保存しますか？",
+                       "Saving this copy may affect validation of the digital signature. Save a copy?"),
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            saved = answer == QMessageBox.StandardButton.Save and write(True)
+        if not saved:
             return False
         return destination is not None or not self.controller.has_unsaved_changes(doc)
 
@@ -628,22 +658,15 @@ class Reader(QMainWindow):
         doc.request("properties", (), ready)
 
     def shortcuts(self):
-        lines = [f"{action.text()}    {action.shortcut().toString()}"
-                 for action, _ in self.actions.values() if not action.shortcut().isEmpty()]
+        lines = [f"{action.text()}    {' / '.join(key.toString() for key in action.shortcuts())}"
+                 for action, _ in self.actions.values() if action.shortcuts()]
         lines.extend(("Ctrl+C", "Ctrl+A"))
         self.text_dialog(self.t("ショートカット", "Keyboard shortcuts"), "\n".join(lines))
 
     def about(self):
-        packaged = getattr(sys, "frozen", False)
-        root = Path(sys.executable).parent if packaged else Path(__file__).resolve().parents[1]
-        files = [root / "LICENSE.txt", *(root / "LICENSES").rglob("*")] if packaged else [
-            root / "LICENSE", root / "THIRD_PARTY.md", *(root / "licenses").glob("*.txt")
-        ]
-        sections = [f"Paper PDF Reader {VERSION}"]
-        for path in files:
-            if path.is_file():
-                sections.append(path.read_text(encoding="utf-8", errors="replace"))
-        self.text_dialog(self.t("Paper PDF Reader について", "About Paper PDF Reader"), "\n\n".join(sections))
+        dialog = AboutDialog(self)
+        dialog.exec()
+        dialog.deleteLater()
 
     def text_dialog(self, title, text):
         dialog = QDialog(self)
