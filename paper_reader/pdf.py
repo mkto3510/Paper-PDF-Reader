@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import replace
 from datetime import datetime
+from itertools import count
 import os
 from pathlib import Path
 import shutil
@@ -48,6 +49,7 @@ class PdfEngine:
         self.working_directory = working_directory
         self.path: Path | None = None
         self.doc = None
+        self.analysis_doc = None
         self.temp: Path | None = None
         self.password = ""
         self.signature = None
@@ -56,7 +58,9 @@ class PdfEngine:
         self.edge_cache = {}
         self.display_lists = OrderedDict()
         self.options = DEFAULT_RULES.copy()
-        self.dirty = False
+        self.history = []
+        self.state_ids = count(1)
+        self.saved_revision = 0
 
     def open(self, filename: str, password: str = ""):
         path = Path(filename).resolve(strict=True)
@@ -78,10 +82,14 @@ class PdfEngine:
             pages = [tuple(doc[index].rect)[2:] for index in range(doc.page_count)]
             outline = [(level, title, number, tuple(dest["to"]) if dest.get("to") else None)
                        for level, title, number, dest in doc.get_toc(simple=False)]
+            doc.journal_enable()
             self.close()
             self.path, self.doc, self.password, self.signature = path, doc, password, stamp
             self.temp = snapshot
-            self.backed_up = self.dirty = False
+            self.backed_up = False
+            self.history = [(0, ())]
+            self.state_ids = count(1)
+            self.saved_revision = 0
             self.text_cache.clear()
             self.edge_cache.clear()
             return {"pages": pages, "outline": outline, "name": path.name, "signature": stamp}
@@ -93,6 +101,9 @@ class PdfEngine:
 
     def close(self):
         self.display_lists.clear()
+        if self.analysis_doc is not None:
+            self.analysis_doc.close()
+            self.analysis_doc = None
         if self.doc is not None:
             self.doc.close()
             self.doc = None
@@ -174,8 +185,21 @@ class PdfEngine:
             self.backed_up, self.options = backed_up, rules
         return result
 
-    def _read_lines(self, index: int, mark_artifacts=False):
+    def _analysis_page(self, index):
         page = self.doc[index]
+        if not page.rotation:
+            return page
+        # PyMuPDF temporarily writes /Rotate during text extraction. Use the
+        # immutable snapshot for that work so it doesn't enter the edit history.
+        if self.analysis_doc is None:
+            doc = mu.open(self.temp)
+            if doc.needs_pass and not doc.authenticate(self.password):
+                doc.close()
+                raise ValueError("PDF を開けませんでした。")
+            self.analysis_doc = doc
+        return self.analysis_doc[index]
+
+    def _read_lines(self, page, mark_artifacts=False):
         text = page.get_text("rawdict", flags=mu.TEXTFLAGS_RAWDICT & ~mu.TEXT_PRESERVE_IMAGES, sort=False)
         artifacts = artifact_glyphs(page) if mark_artifacts else set()
         lines: list[Line] = []
@@ -201,7 +225,7 @@ class PdfEngine:
 
     def _edge_keys(self, index):
         if index not in self.edge_cache:
-            page = self.doc[index]
+            page = self._analysis_page(index)
             height = page.rect.width if page.rotation in (90, 270) else page.rect.height
             limit = self.options["edge_band"] / 100
             keys = set()
@@ -226,11 +250,11 @@ class PdfEngine:
         if index in self.text_cache:
             self.text_cache.move_to_end(index)
             return self.text_cache[index]
-        page = self.doc[index]
+        page = self._analysis_page(index)
         width, height = page.rect.width, page.rect.height
         if page.rotation in (90, 270):
             width, height = height, width
-        lines = self._read_lines(index, self.options.get("artifact", True))
+        lines = self._read_lines(page, self.options.get("artifact", True))
         band = self.options["edge_band"] / 100
         neighbours = set()
         if any(edge_band(line, height, band) for line in lines):
@@ -307,22 +331,69 @@ class PdfEngine:
             annot.set_info(content=comment)
         annot.update()
 
+    def _pdf(self):
+        return mu.mupdf.pdf_document_from_fz_document(self.doc.this)
+
+    def _annotation(self, page, xref):
+        try:
+            annot = page.load_annot(xref)
+        except Exception as error:
+            raise ValueError("注釈が見つかりません。") from error
+        if annot is None or annot.type[0] != mu.PDF_ANNOT_HIGHLIGHT:
+            raise ValueError("注釈が見つかりません。")
+        return annot
+
+    def _history_result(self, step, keys, value=None, discarded=()):
+        for page, _ in keys:
+            self.display_lists.pop((page, False), None)
+        return {"value": value, "state": self.history[step][0], "undo": step > 0,
+                "redo": step + 1 < len(self.history), "keys": keys, "discarded": discarded}
+
+    def edit(self, command, args):
+        step, _ = self.doc.journal_position()
+        self.doc.journal_start_op(command)
+        try:
+            if command == "add_highlight":
+                result = self.add_highlight(*args)
+                keys = result
+            elif command == "modify_highlight":
+                result = self.modify_highlight(*args)
+                keys = args[0]
+            elif command == "resize_highlight":
+                result = self.resize_highlight(*args)
+                keys = {args[:2], (args[0], result)}
+            else:
+                raise ValueError(command)
+        except Exception:
+            mu.mupdf.pdf_abandon_operation(self._pdf())
+            raise
+        self.doc.journal_stop_op()
+        current, _ = self.doc.journal_position()
+        if current == step:
+            return self._history_result(current, (), result)
+        discarded = [state for state, _ in self.history[current:]]
+        keys = tuple(keys)
+        self.history[current:] = [(next(self.state_ids), keys)]
+        return self._history_result(current, keys, result, discarded)
+
+    def move_history(self, redo):
+        step, steps = self.doc.journal_position()
+        if (redo and step == steps) or (not redo and step == 0):
+            return self._history_result(step, ())
+        moved, keys = self.history[step + int(redo)]
+        if redo:
+            self.doc.journal_redo()
+        else:
+            self.doc.journal_undo()
+        return self._history_result(step + (1 if redo else -1), keys, moved)
+
     def add_highlight(self, quads: dict, color: str, comment: str):
         added = []
-        try:
-            for index, points in quads.items():
-                page = self.doc[index]
-                annot = page.add_highlight_annot([mu.Quad(*quad) for quad in points])
-                added.append((index, annot.xref))
-                self._set_annotation(annot, color, comment)
-        except Exception:
-            for index, xref in added:
-                page = self.doc[index]
-                annot = page.load_annot(xref)
-                if annot is not None:
-                    page.delete_annot(annot)
-            raise
-        self.dirty = bool(added) or self.dirty
+        for index, points in quads.items():
+            page = self.doc[index]
+            annot = page.add_highlight_annot([mu.Quad(*quad) for quad in points])
+            added.append((index, annot.xref))
+            self._set_annotation(annot, color, comment)
         return added
 
     def modify_highlight(self, targets: list, color: str | None = None, comment: str | None = None,
@@ -331,18 +402,22 @@ class PdfEngine:
         for index, xref in targets:
             if page is None or page.number != index:
                 page = self.doc[index]
-            annot = page.load_annot(xref)
+            annot = self._annotation(page, xref)
             if delete:
                 page.delete_annot(annot)
             else:
-                self._set_annotation(annot, color, comment)
-            self.dirty = True
+                new_comment = comment if comment is not None and comment != annot.info["content"] else None
+                new_color = color
+                if color is not None:
+                    rgb = annot.colors["stroke"]
+                    if len(rgb) == 3 and color.lower() == "#" + "".join(f"{round(c * 255):02x}" for c in rgb):
+                        new_color = None
+                if new_color is not None or new_comment is not None:
+                    self._set_annotation(annot, new_color, new_comment)
 
     def resize_highlight(self, index, xref, first, last):
         page = self.doc[index]
-        annot = page.load_annot(xref)
-        if annot is None:
-            raise ValueError("注釈が見つかりません。")
+        annot = self._annotation(page, xref)
         lines = self.text(index)
         chosen = select({index: lines}, (index, *first), (index, *last), include_skipped=True)
         if not chosen.quads:
@@ -350,19 +425,14 @@ class PdfEngine:
         color, opacity, info, flags = annot.colors["stroke"], annot.opacity, annot.info, annot.flags
         blend = annot.blendmode
         new = page.add_highlight_annot([mu.Quad(*quad) for quad in chosen.quads[index]])
-        try:
-            if color:
-                new.set_colors(stroke=color)
-            new.set_info({key: value for key, value in info.items()
-                          if key in ("content", "title", "subject", "creationDate", "modDate")})
-            new.set_flags(flags)
-            new.update(opacity=opacity, blend_mode=blend)
-        except Exception:
-            page.delete_annot(new)
-            raise
+        if color:
+            new.set_colors(stroke=color)
+        new.set_info({key: value for key, value in info.items()
+                      if key in ("content", "title", "subject", "creationDate", "modDate")})
+        new.set_flags(flags)
+        new.update(opacity=opacity, blend_mode=blend)
         new_xref = new.xref
         page.delete_annot(annot)
-        self.dirty = True
         return new_xref
 
     def highlight_text(self, index: int, xref: int):
@@ -403,27 +473,70 @@ class PdfEngine:
         for obsolete in sorted(folder.glob("????????-??????-??????-*.pdf"), reverse=True)[keep:]:
             obsolete.unlink(missing_ok=True)
 
-    def save(self, backup_directory: str, keep: int, destination: str | None = None):
+    def _signature_needs_copy(self, incremental):
+        ml = mu.mupdf
+        root = ml.pdf_dict_gets(ml.pdf_trailer(self._pdf()), "Root")
+        certification = ml.pdf_dict_gets(ml.pdf_dict_gets(root, "Perms"), "DocMDP")
+        if not ml.pdf_is_null(certification):
+            references = ml.pdf_dict_gets(certification, "Reference")
+            for index in range(ml.pdf_array_len(references)):
+                reference = ml.pdf_array_get(references, index)
+                if ml.pdf_to_name(ml.pdf_dict_gets(reference, "TransformMethod")) == "DocMDP":
+                    permission = ml.pdf_to_int(ml.pdf_dict_gets(ml.pdf_dict_gets(reference, "TransformParams"), "P"))
+                    return not incremental or permission != 3
+            return True
+        if incremental:
+            return False
+        flags = self.doc.get_sigflags()
+        return (flags >= 0 and bool(flags & 2)) or any(
+            widget.is_signed for page in self.doc for widget in page.widgets(types=(mu.PDF_WIDGET_TYPE_SIGNATURE,)))
+
+    def save(self, backup_directory: str, keep: int, destination: str | None = None,
+             allow_signature_loss: bool = False):
         target = Path(destination).resolve() if destination else self.path
         overwrite = target == self.path
+        step, _ = self.doc.journal_position()
+        revision = self.history[step][0]
         if overwrite:
-            if not self.dirty:
-                return self.signature
+            if revision == self.saved_revision:
+                return {"stamp": self.signature, "state": revision}
             self._check_original()
+        incremental = self.doc.can_save_incrementally()
+        if (overwrite or not allow_signature_loss) and self._signature_needs_copy(incremental):
+            if overwrite:
+                return {"signature_blocked": True}
+            return {"confirm_signature_loss": True}
+        if overwrite:
             self._backup(Path(backup_directory), keep)
         with NamedTemporaryFile(suffix=".pdf", dir=target.parent, delete=False) as handle:
             draft = Path(handle.name)
         try:
-            self.doc.save(draft, encryption=mu.PDF_ENCRYPT_KEEP)
+            self._write_draft(draft, incremental)
             if overwrite:
                 self._check_original()
             os.replace(draft, target)
             if overwrite:
                 self.signature = _signature(self.path)
-                self.dirty = False
-                return self.signature
+                self.saved_revision = revision
+            return {"stamp": self.signature, "state": revision}
         finally:
             draft.unlink(missing_ok=True)
+
+    def _write_draft(self, draft, incremental):
+        # MuPDF may journal bookkeeping for xref streams during serialization.
+        # Roll back that bookkeeping in the live document after writing the draft.
+        self.doc.journal_start_op("Save PDF")
+        try:
+            if incremental:
+                self.doc.save_snapshot(draft)
+            else:
+                # Skip PyMuPDF's pre-save catalog edits outside the annotation journal.
+                options = mu.mupdf.PdfWriteOptions()
+                options.do_encrypt = mu.PDF_ENCRYPT_KEEP
+                options.dont_regenerate_id = 1
+                mu.mupdf.pdf_save_document(self._pdf(), str(draft), options)
+        finally:
+            mu.mupdf.pdf_abandon_operation(self._pdf())
 
     def smoke(self, folder: str):
         root = Path(folder)
@@ -446,7 +559,7 @@ class PdfEngine:
         selection = select(pages, (0, 1, 0), (2, 10, 18))
         assert set(selection.quads) == {0, 1, 2} and "Journal Header" not in selection.source, "Three-page selection differs."
         comment = "日本語の注釈"
-        self.add_highlight(selection.quads, "#ffd400", comment)
+        self.edit("add_highlight", (selection.quads, "#ffd400", comment))
         self.save(str(root / "backups"), 1)
         self.open(str(source))
         assert [item["comment"] for item in self.annotation_list()] == [comment] * 3, "Annotations did not survive reopen."

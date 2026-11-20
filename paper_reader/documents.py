@@ -91,6 +91,7 @@ class Document(QObject):
     loaded = Signal(bool)
     changed = Signal()
     note_changed = Signal(object)
+    history_changed = Signal(object)
     note_jobs_changed = Signal(object, bool)
     drafts_changed = Signal()
     input_error = Signal(str)
@@ -108,9 +109,11 @@ class Document(QObject):
         self.external_message = ""
         self.stamp = None
         self.revision = self.saved_revision = 0
+        self.can_undo = self.can_redo = False
         self.mutating = self.saving = 0
         self.annotations = {}
         self.groups = {}
+        self.group_history = {}
         self.jobs = {}
         self.job_handlers = {}
         self.translation_sources = {}
@@ -180,8 +183,12 @@ class Document(QObject):
             self.external = False
             self.external_message = ""
             self.revision = self.saved_revision = 0
+            self.can_undo = self.can_redo = False
+            self.mutating = self.saving = 0
+            self.auto_save.stop()
             self.annotations.clear()
             self.groups.clear()
+            self.group_history.clear()
             self.annotation_reads.clear()
             self.resizing_notes.clear()
             self.source_pending.clear()
@@ -276,18 +283,66 @@ class Document(QObject):
 
         def done(result, error):
             self.mutating -= 1
-            if error:
-                self.input_error.emit(error)
+            if result is None:
+                if error:
+                    self.input_error.emit(error)
                 if on_error:
                     on_error()
             else:
-                self.revision += 1
+                keys = set(result["keys"])
+                group_keys = keys.union(*(self.targets(key) for key in keys))
+                groups_before = {key: self.groups.get(key) for key in group_keys}
+                self.update_history(result)
                 self.load_notes(indices)
                 if on_success:
-                    on_success(result)
+                    on_success(result["value"])
+                changes = {key: (before, self.groups.get(key)) for key, before in groups_before.items()
+                           if before != self.groups.get(key)}
+                if changes:
+                    self.group_history[self.revision] = changes
+                for state in result["discarded"]:
+                    self.group_history.pop(state, None)
             self.changed.emit()
 
-        self.request(command, args, done, priority=-4)
+        self.request("edit", (command, args), done, priority=-4)
+
+    def update_history(self, result):
+        self.revision = result["state"]
+        self.can_undo, self.can_redo = result["undo"], result["redo"]
+
+    def move_history(self, redo=False):
+        if self.busy or not (self.can_redo if redo else self.can_undo):
+            return
+        self.mutating += 1
+        self.changed.emit()
+
+        def moved(result, error):
+            self.mutating -= 1
+            if error:
+                self.input_error.emit(error)
+            elif result is not None:
+                self.update_history(result)
+                keys = set(result["keys"])
+                groups = self.group_history.get(result["value"], {})
+                affected = keys | groups.keys()
+                for targets in self.jobs.keys() | self.translation_sources.keys():
+                    if not affected.isdisjoint(targets):
+                        self.detach_job(targets, cancel=True)
+                for key, choices in groups.items():
+                    group = choices[int(redo)]
+                    if group is None:
+                        self.groups.pop(key, None)
+                    else:
+                        self.groups[key] = group
+                for key in keys:
+                    self.source_pending.pop(key, None)
+                self.deleting_notes.difference_update(keys)
+                self.history_changed.emit(keys)
+                self.load_notes({page for page, _ in keys})
+                self.schedule_save()
+            self.changed.emit()
+
+        self.request("move_history", (redo,), moved, priority=-4)
 
     def add_highlight(self, quads, color, comment="", on_success=None, on_error=None):
         def added(keys):
@@ -310,6 +365,11 @@ class Document(QObject):
 
         def updated(_):
             if delete:
+                removed = set(targets)
+                for group in {self.targets(target) for target in targets}:
+                    survivors = tuple(key for key in group if key not in removed)
+                    for key in survivors:
+                        self.groups[key] = survivors
                 for target in targets:
                     self.groups.pop(target, None)
             if autosave:
@@ -450,35 +510,47 @@ class Document(QObject):
         if self.store.preferences.data["autoSave"] and not self.external:
             self.auto_save.start()
 
-    def save(self, destination=None, callback=None):
+    def save(self, destination=None, callback=None, *, allow_signature_loss=False, on_signature_loss=None):
         if self.loading or self.disposed:
             if callback:
                 callback(False)
             return
         overwrite = destination is None or Path(destination).resolve() == self.path
-        if overwrite and (not self.dirty or self.external):
+        if overwrite and ((not self.dirty and not self.mutating) or self.external):
             if callback:
                 callback(not self.dirty)
             return
         self.saving += 1
-        revision = self.revision
         settings = self.store.preferences
         self.changed.emit()
 
-        def saved(stamp, error):
+        def saved(result, error):
             self.saving -= 1
+            confirmation = bool(result and result.get("confirm_signature_loss"))
+            okay = bool(result and "stamp" in result)
             if error:
                 self.input_error.emit(error)
-            elif overwrite:
-                self.stamp, self.saved_revision = stamp, revision
+            elif result and result.get("signature_blocked"):
+                self.input_error.emit(settings.tr_text(
+                    "元の PDF の電子署名を保護するため，上書きできません．名前を付けて保存してください．",
+                    "To protect the PDF's digital signature, save the changes to a different file."))
+            elif confirmation and not on_signature_loss:
+                self.input_error.emit(settings.tr_text(
+                    "別名保存すると電子署名の検証に影響する可能性があります．",
+                    "Saving a copy may affect validation of the digital signature."))
+            elif overwrite and okay:
+                self.stamp, self.saved_revision = result["stamp"], result["state"]
                 self.store.watch(self.path)
             if not self.saving:
                 self.store.debounce.start()
             self.changed.emit()
-            if callback:
-                callback(not error)
+            if confirmation and on_signature_loss:
+                on_signature_loss()
+            elif callback:
+                callback(okay)
 
-        self.request("save", (str(settings.directory / "backups"), settings.data["backupCount"], destination),
+        self.request("save", (str(settings.directory / "backups"), settings.data["backupCount"], destination,
+                              allow_signature_loss),
                      saved, priority=-4)
 
     def dispose(self):

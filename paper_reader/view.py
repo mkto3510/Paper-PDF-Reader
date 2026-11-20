@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import OrderedDict
 from dataclasses import dataclass
 from math import ceil
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, QTextBoundaryFinder, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF, QTransform
 from PySide6.QtWidgets import QAbstractScrollArea, QApplication
 
@@ -19,11 +19,25 @@ MARGIN = 16
 ACTUAL_SIZE = 96 / 72
 MIN_SCALE = ACTUAL_SIZE * 0.0833
 MAX_SCALE = ACTUAL_SIZE * 64
+DRAG_DISTANCE = 4
 
 
 def tile_image(result):
     width, height, stride, x, y, pixels = result
     return x, y, QImage(pixels, width, height, stride, QImage.Format.Format_RGB888).copy()
+
+
+def word_range(line, index):
+    # Qt's offsets count UTF-16 units, while each PDF glyph can carry several characters.
+    offsets = [0]
+    for glyph in line.glyphs:
+        offsets.append(offsets[-1] + sum(2 if ord(char) > 0xFFFF else 1 for char in glyph.text))
+    finder = QTextBoundaryFinder(QTextBoundaryFinder.BoundaryType.Word, line.text)
+    finder.setPosition(offsets[index])
+    first = offsets[index] if finder.isAtBoundary() else finder.toPreviousBoundary()
+    finder.setPosition(offsets[index])
+    last = finder.toNextBoundary()
+    return bisect_right(offsets, first) - 1, bisect_left(offsets, last) - 1
 
 
 @dataclass
@@ -110,6 +124,11 @@ class PaperView(QAbstractScrollArea):
         self.selection_origin = ""
         self.waiting = False
         self.press = self.pan_start = None
+        self.dragging_selection = False
+        self.press_clicks = 1
+        self.click_series = self.click_selection = None
+        self.click_timer = QTimer(self, singleShot=True, timerType=Qt.TimerType.PreciseTimer)
+        self.click_timer.timeout.connect(self.finish_click_series)
         self.panning = False
         self.wheel_remainder = QPointF()
         self.selection_revision = 0
@@ -191,6 +210,8 @@ class PaperView(QAbstractScrollArea):
         self._layout()
 
     def scrollContentsBy(self, dx, dy):
+        if dx or dy:
+            self.cancel_click_series()
         if dy:
             self.direction = (0, 1 if dy < 0 else -1)
         elif dx:
@@ -293,6 +314,7 @@ class PaperView(QAbstractScrollArea):
             self.set_zoom("custom", self.zoom * factor, point)
 
     def set_zoom(self, mode, scale=None, point=None):
+        self.cancel_click_series()
         if not self.pages:
             return
         location = self.location(point)
@@ -319,6 +341,7 @@ class PaperView(QAbstractScrollArea):
             self.session.request("content_bounds", (index,), ready, priority=4)
 
     def set_layout(self, mode=None, continuous=None, rtl=None, rotation=None):
+        self.cancel_click_series()
         location = self.location()
         if location:
             self.page = location[0]
@@ -651,6 +674,7 @@ class PaperView(QAbstractScrollArea):
                                  index in tuple(p[0] for p in (self.anchor, self.pointer) if p)))
 
     def clear_selection(self):
+        self.cancel_click_series()
         self.selection_revision += 1
         self.anchor = self.pointer = self.selection_range = None
         self.selection_origin = ""
@@ -700,17 +724,81 @@ class PaperView(QAbstractScrollArea):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
+            self.cancel_click_series()
             self.pan_start = event.position()
             self.panning = False
         elif event.button() == Qt.MouseButton.LeftButton:
-            self.setFocus()
-            if self._start_highlight_drag(event.position()):
+            self.start_left_press(event.position())
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.start_left_press(event.position(), double=True)
+        else:
+            self.mousePressEvent(event)
+
+    def start_left_press(self, point, double=False):
+        self.setFocus()
+        if self._start_highlight_drag(point):
+            return
+        position = self._position(point)
+        clicks = 2 if double else 1
+        if self.click_series:
+            previous, pixel, count = self.click_series
+            distance = max(abs(pixel.x() - point.x()), abs(pixel.y() - point.y()))
+            if (self.click_timer.isActive() and position and position[0] == previous[0]
+                    and (double or distance <= QApplication.styleHints().mouseDoubleClickDistance())):
+                clicks = count + 1
+            else:
+                self.finish_click_series()
+                position = self._position(point)
+        self.clear_selection()
+        self.press, self.press_clicks, self.dragging_selection = point, clicks, False
+        self.anchor = self.pointer = position
+        if position:
+            self.load_text(position[0])
+
+    def cancel_click_series(self):
+        self.click_timer.stop()
+        self.click_series = self.click_selection = None
+
+    def finish_click_series(self):
+        self.click_timer.stop()
+        series, self.click_series = self.click_series, None
+        if series and series[2] == 1:
+            self.clicked.emit(*series[0])
+
+    def hideEvent(self, event):
+        self.cancel_click_series()
+        super().hideEvent(event)
+
+    def select_by_click(self, position, clicks):
+        token = self.click_selection = object()
+        page, x, y = position
+
+        def ready(lines):
+            if self.click_selection is not token or not lines:
                 return
-            self.clear_selection()
-            self.press = event.position()
-            self.anchor = self.pointer = self._position(event.position())
-            if self.anchor:
-                self.load_text(self.anchor[0])
+            hit = nearest(lines, x, y)
+            if hit is None:
+                return
+            row, index = hit
+            line = lines[row]
+            glyph = line.glyphs[index]
+            left, top, right, bottom = glyph.box
+            if not (left <= x <= right and top <= y <= bottom):
+                return
+            if clicks == 2:
+                if not glyph.text.strip():
+                    return
+                first, last = word_range(line, index)
+            else:
+                first, last = 0, len(line.glyphs) - 1
+            self.selection_origin = line.kind
+            self.selection_range = (page, row, first), (page, row, last)
+            self.viewport().update()
+            self.location_changed.emit()
+
+        self.load_text(page, ready)
 
     def mouseMoveEvent(self, event):
         if self.highlight_drag and event.buttons() & Qt.MouseButton.LeftButton:
@@ -726,6 +814,9 @@ class PaperView(QAbstractScrollArea):
                 self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - round(change.x()))
                 self.verticalScrollBar().setValue(self.verticalScrollBar().value() - round(change.y()))
         elif self.anchor and event.buttons() & Qt.MouseButton.LeftButton:
+            self.dragging_selection |= (event.position() - self.press).manhattanLength() >= DRAG_DISTANCE
+            if not self.dragging_selection:
+                return
             y = event.position().y()
             if y < 0 or y >= self.viewport().height():
                 self.scroll_by(-32 if y < 0 else 32)
@@ -748,10 +839,14 @@ class PaperView(QAbstractScrollArea):
                     self._finish_highlight_drag()
             return
         if self.anchor:
-            if (event.position() - self.press).manhattanLength() < 4:
-                position = self.anchor
+            if not self.dragging_selection and (event.position() - self.press).manhattanLength() < DRAG_DISTANCE:
+                position, clicks = self.anchor, self.press_clicks
                 self.clear_selection()
-                self.clicked.emit(*position)
+                if clicks < 3:
+                    self.click_series = position, self.press, clicks
+                    self.click_timer.start(QApplication.doubleClickInterval())
+                if clicks > 1:
+                    self.select_by_click(position, clicks)
             else:
                 self.waiting = True
                 self.pointer = self._position(event.position(), clamp=True)

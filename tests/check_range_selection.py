@@ -6,7 +6,7 @@ import sys
 from tempfile import TemporaryDirectory
 
 import pymupdf as mu
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -38,6 +38,17 @@ def fixture(path):
             note.set_colors(stroke=(.2, .6, .8))
             note.set_info(content=f"Existing comment {number}")
             note.update(opacity=.37)
+        image_page = pdf.new_page(width=600, height=700)
+        image = mu.Pixmap(mu.csRGB, mu.IRect(0, 0, 16, 16), False)
+        image.clear_with(180)
+        image_page.insert_image(mu.Rect(60, 60, 180, 180), pixmap=image)
+        japanese = pdf.new_page(width=600, height=700)
+        writer = mu.TextWriter(japanese.rect)
+        writer.append((60, 120), "カタカナ テスト", font=mu.Font("cjk"))
+        writer.write_text(japanese)
+        first = pdf[0]
+        first.insert_link({"kind": mu.LINK_GOTO, "from": first.search_for("first")[0],
+                           "page": 1, "to": mu.Point(60, 0)})
         pdf.save(path)
 
 
@@ -78,6 +89,134 @@ def test_resize(pane, page):
     assert doc.get_note(new)["comment"] == f"Existing comment {page}"
     assert doc.get_note(new)["color"] == "#3399cc"
     assert abs(doc.get_note(new)["opacity"] - .37) < .001
+
+    doc.move_history()
+    wait(lambda: doc.get_note(key) and not doc.get_note(new), "Undo did not restore the original range")
+    doc.move_history(redo=True)
+    wait(lambda: doc.get_note(new) and not doc.get_note(key), "Redo did not restore the new range")
+
+
+def test_click_selection(pane):
+    view, doc = pane.view, pane.document
+    button = Qt.MouseButton.LeftButton
+
+    def text_point(page, word):
+        view.go_to(page)
+        view.load_text(page, lambda _: None)
+        wait(lambda: page in view.text_cache, "Click-selection text did not load")
+        line = next(line for line in view.text_cache[page] if word in line.text)
+        box = line.glyphs[line.text.index(word)].box
+        return view._project(page, ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)).toPoint(), line.text.strip()
+
+    def click(point, count):
+        view.clear_selection()
+        QTest.mouseClick(view.viewport(), button, pos=point)
+        QTest.mouseDClick(view.viewport(), button, pos=point)
+        QTest.mouseRelease(view.viewport(), button, pos=point)
+        if count == 3:
+            QTest.mouseClick(view.viewport(), button, pos=point)
+
+    def selected():
+        choices = []
+        wait(lambda: view.selection_range, "Click selection did not set a range")
+        view.resolve_selection(choices.extend)
+        wait(lambda: choices, "Click selection did not return text")
+        return choices[1].source
+
+    point, line = text_point(0, "first")
+    click(point, 2)
+    assert selected() == "first"
+    QTest.qWait(QApplication.doubleClickInterval() + 25)
+    assert view.current_page() == 0, "A double click opened a link"
+    click(point, 3)
+    assert selected() == line
+
+    choices = []
+
+    def choose_color():
+        menu = QApplication.activePopupWidget()
+        colors = next(item.menu() for item in menu.actions() if item.text() == pane.t("ハイライトを作成", "Create highlight"))
+        choices.extend(action.text() for action in colors.actions())
+        action = next(action for action in colors.actions() if action.text() == pane.t("青", "Blue"))
+        menu.close()
+        action.trigger()
+
+    QTimer.singleShot(0, choose_color)
+    pane.context_menu(view.viewport().mapToGlobal(point))
+    wait(lambda: any(note["color"] == "#2ea8e5" for note in doc.annotations[0].values()), "Blue highlight was not created")
+    assert len(choices) == 8 and pane.last_color == "#2ea8e5"
+    doc.move_history()
+    wait(lambda: len(doc.annotations[0]) == 1, "The created highlight was not undone")
+
+    point, _ = text_point(4, "カタカナ")
+    click(point, 2)
+    assert selected() == "カタカナ"
+    point, line = text_point(2, "Right column")
+    click(point, 3)
+    assert selected() == line
+    view.go_to(3)
+    click(view._project(3, (100, 100)).toPoint(), 3)
+    wait(lambda: 3 in view.text_cache, "Image-only page was not processed")
+    assert view.selection_range is None
+
+    point, _ = text_point(0, "first")
+    view.clear_selection()
+    QTest.mouseClick(view.viewport(), button, pos=point)
+    wait(lambda: view.current_page() == 1, "A single click did not follow the link")
+
+
+def test_shared_history(window):
+    pane = window.pane
+    doc = pane.document
+    keys = []
+    quads = {page: [pane.view.text_cache[page][0].glyphs[0].quad] for page in (0, 1)}
+    doc.add_highlight(quads, "#2ea8e5", "Grouped note", on_success=keys.extend)
+    wait(lambda: len(keys) == 2 and all(doc.get_note(key) for key in keys), "The grouped note did not load")
+    window.duplicate(False)
+    wait(lambda: window.pane is not pane, "The duplicate tab did not open")
+    sibling = window.pane
+    assert sibling.document is doc
+    doc.modify(keys, delete=True)
+    wait(lambda: not any(doc.get_note(key) for key in keys), "The grouped note was not deleted")
+    saved = []
+    doc.save(callback=saved.append)
+    wait(lambda: saved, "Deleting annotations could not be saved")
+    assert saved == [True] and not doc.dirty
+
+    window.activateWindow()
+    sibling.view.setFocus()
+    wait(window.isActiveWindow, "The reader window did not become active")
+    assert window.actions["undo"][0].isEnabled() and sibling.view.hasFocus()
+    QTest.keyClick(sibling.view, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+    wait(lambda: all(doc.get_note(key) for key in keys), "Ctrl+Z did not restore the group in both tabs")
+    assert doc.dirty and doc.targets(keys[0]) == tuple(keys) and doc.targets(keys[1]) == tuple(keys)
+    assert all(window.tabs.tabText(index).endswith("*") for index in range(window.tabs.count()))
+    assert all(pane.view.notes[key[0]][key]["comment"] == "Grouped note" for key in keys)
+
+    sibling.open_find("")
+    QTest.keyClicks(sibling.query, "abc")
+    revision = doc.revision
+    QTest.keyClick(sibling.query, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+    assert not sibling.query.text() and doc.revision == revision
+    QTest.keyClick(sibling.query, Qt.Key.Key_Y, Qt.KeyboardModifier.ControlModifier)
+    assert sibling.query.text() == "abc" and doc.revision == revision
+    sibling.close_search()
+    sibling.view.setFocus()
+    QTest.keyClick(sibling.view, Qt.Key.Key_Z,
+                   Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+    wait(lambda: not any(doc.get_note(key) for key in keys), "Ctrl+Shift+Z did not delete the group again")
+    assert not doc.dirty and all(not window.tabs.tabText(index).endswith("*") for index in range(window.tabs.count()))
+
+    doc.store.preferences.data["autoSave"] = True
+    window.actions["undo"][0].trigger()
+    wait(lambda: all(doc.get_note(key) for key in keys) and not doc.dirty and not doc.busy,
+         "Undo was not automatically saved")
+    with mu.open(doc.path) as pdf:
+        for page in pdf.pages(0, 2):
+            assert any(annot.info["content"] == "Grouped note" for annot in page.annots())
+    doc.load(reload=True)
+    wait(lambda: not doc.loading, "Reload did not finish")
+    assert not doc.can_undo and not doc.can_redo
 
 
 def main():
@@ -134,6 +273,7 @@ def main():
             sources = [choice.source for choice in choices]
             assert sources == ["The paper reports international results for this study."] * 2, sources
             view.clear_selection()
+            test_click_selection(pane)
             test_resize(pane, 0)
             test_resize(pane, 1)
             window.rotate(90)
@@ -143,10 +283,11 @@ def main():
             wait(lambda: result, "The resized PDF was not saved")
             assert result == [True]
             with mu.open(path) as pdf:
-                for number, page in enumerate(pdf):
+                for number, page in enumerate(pdf.pages(0, 3)):
                     note = page.first_annot
                     assert note.info["content"] == f"Existing comment {number}"
                     assert abs(note.opacity - .37) < .001
+            test_shared_history(window)
         finally:
             control.shutdown()
     print("PASS cross-page text, range editing, cancellation, translation lock, rotation and saved notes")

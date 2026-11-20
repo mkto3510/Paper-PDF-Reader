@@ -81,6 +81,7 @@ class DocumentPane(QWidget):
         document.loaded.connect(self.on_loaded)
         document.changed.connect(self.on_document_changed)
         document.note_changed.connect(self.on_notes)
+        document.history_changed.connect(self.on_annotation_history)
         document.note_jobs_changed.connect(self.on_note_jobs)
         document.input_error.connect(self.message)
         self.relabel()
@@ -150,6 +151,8 @@ class DocumentPane(QWidget):
 
     def on_document_changed(self):
         self.notes.setEnabled(not self.document.loading)
+        if self.document.loading:
+            self.view.cancel_click_series()
         if self.rules_generation != self.document.rules_generation:
             self.rules_generation = self.document.rules_generation
             # Callbacks already in flight belonged to the previous rules.
@@ -201,6 +204,14 @@ class DocumentPane(QWidget):
             self.view.viewport().update()
             if self.isVisible():
                 self.location_changed.emit()
+
+    def on_annotation_history(self, keys):
+        for key in keys:
+            self.notes.pending_comments.pop(key, None)
+        if self.pending_note and self.pending_note[0] in keys:
+            self.pending_note = None
+        if self.view.highlight_drag and self.view.highlight_drag.key in keys:
+            self.view.clear_selection()
 
     def navigate(self, page, x=None, y=0):
         if not self.document.info or not 0 <= page < len(self.view.pages):
@@ -391,12 +402,12 @@ class DocumentPane(QWidget):
             menu = QMenu(self)
             if self.view.selection_range:
                 menu.addAction(t("選択範囲をコピー", "Copy selection"), self.copy_selection)
-                menu.addAction(icon(self, "highlight"), t("ハイライトを作成", "Create highlight"), self.highlight_selection)
-                for label, callback in (
-                    (t("翻訳…", "Translate…"), lambda color: self.translate_selection(point, color)),
-                    (t("翻訳して注釈を追加", "Translate and add annotation"), self.translate_to_note),
+                for symbol, label, callback in (
+                    ("highlight", t("ハイライトを作成", "Create highlight"), self.highlight_selection),
+                    ("translate", t("翻訳…", "Translate…"), lambda color: self.translate_selection(point, color)),
+                    ("translate", t("翻訳して注釈を追加", "Translate and add annotation"), self.translate_to_note),
                 ):
-                    colors = menu.addMenu(icon(self, "translate"), label)
+                    colors = menu.addMenu(icon(self, symbol), label)
                     for shade, names in COLORS.items():
                         action = colors.addAction(swatch(QColor(shade)), t(*names))
                         action.setIconVisibleInMenu(True)
@@ -447,11 +458,18 @@ class DocumentPane(QWidget):
         chosen = color or self.last_color
         self.with_selection(lambda choices: self.open_translation(choices=choices, point=point, color=chosen))
 
-    def highlight_selection(self):
+    def highlight_selection(self, color=None):
+        chosen = color or self.last_color
+
+        def created(keys):
+            if self in self.window.controller.panes():
+                self.last_color = chosen
+                self.new_comment(keys)
+
         def create(choices):
             selection = choices[1]
             if selection.quads:
-                self.document.add_highlight(selection.quads, self.last_color, on_success=self.new_comment)
+                self.document.add_highlight(selection.quads, chosen, on_success=created)
         self.with_selection(create)
 
     def translate_to_note(self, color=None):
