@@ -21,7 +21,7 @@ try {
         [Environment]::SetEnvironmentVariable($key, $null, 'Process')
     }
     $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
-    $exe = Join-Path $extract 'PaperPdfReader\PaperPdfReader.exe'
+    $exe = Join-Path $extract 'PaperPdfViewer\PaperPdfViewer.exe'
     $launchArgs = @('--smoke-test', ('"{0}"' -f $report))
     $process = Start-Process -FilePath $exe -ArgumentList $launchArgs -WorkingDirectory $extract -WindowStyle Hidden -PassThru
     if (-not $process.WaitForExit(45000)) {
@@ -30,7 +30,7 @@ try {
         throw 'Portable application did not exit within 45 seconds.'
     }
     $result = if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report -Encoding UTF8 -Raw }
-    if ($process.ExitCode -ne 0 -or $result -notmatch '^PASS Paper PDF Reader') {
+    if ($process.ExitCode -ne 0 -or $result -notmatch '^PASS Paper PDF Viewer') {
         throw "Portable smoke test failed (exit $($process.ExitCode)): $result"
     }
     Write-Host $result.Trim()

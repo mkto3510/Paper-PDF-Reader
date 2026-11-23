@@ -250,6 +250,8 @@ def exercise(app, folder, count):
         assert first in panel.keys and second not in panel.keys
         panel.reset_filter()
         assert len(panel.keys) == count
+        window.activateWindow()
+        assert QTest.qWaitForWindowActive(window), "The annotation window is not active"
         pane.pick_note(first, focus_card=True)
         QTest.keyClick(panel.cards[first], Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
         assert len(panel.multiple) == count and len(panel.cards) < 60
@@ -280,7 +282,7 @@ def exercise(app, folder, count):
 
 def main():
     app = QApplication([])
-    app.setApplicationName("Paper PDF Reader")
+    app.setApplicationName("Paper PDF Viewer")
     if "--light" in sys.argv:
         app.styleHints().setColorScheme(Qt.ColorScheme.Light)
     for count in (200, 500):

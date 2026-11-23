@@ -15,7 +15,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from . import VERSION
+from . import APP_NAME, EXECUTABLE_NAME, VERSION
 from .documents import Documents
 from .icons import ICON_DIR
 from .paths import data_dir
@@ -135,7 +135,7 @@ def smoke_test(app, report):
                     report.write_text(str(failure), encoding="utf-8")
                     app.exit(1)
                 else:
-                    report.write_text(f"PASS Paper PDF Reader {VERSION}\n", encoding="utf-8")
+                    report.write_text(f"PASS {APP_NAME} {VERSION}\n", encoding="utf-8")
                     app.exit(0)
 
             QTimer.singleShot(0, lambda: controller.documents.session.request("smoke", (temporary,), finish))
@@ -146,12 +146,12 @@ def smoke_test(app, report):
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="PaperPdfReader")
+    parser = argparse.ArgumentParser(prog=EXECUTABLE_NAME)
     parser.add_argument("pdf", nargs="*")
     parser.add_argument("--smoke-test", type=Path)
     args = parser.parse_args()
     app = QApplication([sys.argv[0]])
-    app.setApplicationName("Paper PDF Reader")
+    app.setApplicationName(APP_NAME)
     app.setApplicationVersion(VERSION)
     app.setWindowIcon(QIcon(str(ICON_DIR / "app.ico")))
     if args.smoke_test is not None:
@@ -164,14 +164,14 @@ def main():
         for _ in range(8):
             if forward_to_other(instance, filenames):
                 return 0
-        QMessageBox.warning(None, "Paper PDF Reader", "Could not contact the running instance.")
+        QMessageBox.warning(None, APP_NAME, "Could not contact the running instance.")
         return 1
     controller = Application(app, folder)
     try:
         controller.listen(instance, lock)
     except OSError as error:
         controller.shutdown()
-        QMessageBox.warning(None, "Paper PDF Reader", str(error))
+        QMessageBox.warning(None, APP_NAME, str(error))
         return 1
     window = controller.new_window()
     if filenames:

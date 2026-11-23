@@ -160,14 +160,16 @@ class Header(QWidget):
         self.more.setMenu(self.overflow)
         self.tools.addWidget(self.more)
         self.external = QLabel()
-        self.save_state = QLabel()
-        self.notice = QLabel()
-        for message in (self.external, self.save_state, self.notice):
+        self.notice = QLabel(window)
+        self.notice.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.notice.setStyleSheet("background: palette(window); color: palette(window-text); "
+                                  "border-bottom: 1px solid palette(mid);")
+        for message in (self.external, self.notice):
             message.setContentsMargins(8, 3, 8, 3)
             message.setTextFormat(Qt.TextFormat.PlainText)
             message.setWordWrap(True)
             message.hide()
-            layout.addWidget(message)
+        layout.addWidget(self.external)
         self.notice_timeout = QTimer(self, singleShot=True, interval=6500)
         self.notice_timeout.timeout.connect(self.clear_notice)
         self.timer = QTimer(self, singleShot=True, interval=0)
@@ -176,20 +178,25 @@ class Header(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.timer.start()
+        self.place_notice()
 
     def set_external(self, message):
         if self.external.text() != message:
             self.external.setText(message)
             self.external.setVisible(bool(message))
 
-    def set_save_state(self, message):
-        if self.save_state.text() != message:
-            self.save_state.setText(message)
-            self.save_state.setVisible(bool(message))
+    def place_notice(self):
+        if self.notice.isHidden():
+            return
+        width = self.width()
+        top = self.mapTo(self.window, self.rect().bottomLeft()).y() + 1
+        self.notice.setGeometry(0, top, width, self.notice.heightForWidth(width))
+        self.notice.raise_()
 
     def show_notice(self, message):
         self.notice.setText(message)
         self.notice.setVisible(bool(message))
+        self.place_notice()
         self.notice_timeout.start()
 
     def clear_notice(self):
