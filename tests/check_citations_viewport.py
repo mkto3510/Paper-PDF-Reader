@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pymupdf as mu
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMenu
 
 from check_chrome_notes import wait
 from paper_reader import APP_NAME
@@ -240,6 +240,60 @@ def check_window(app, root, path):
         QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=view._project(0, prose).toPoint())
         wait(lambda: view.selected_note == prose_key, "Plain highlight could not be selected")
         assert missing_key and prose_key and missing_key != prose_key
+
+        # A context menu or hover that waited for the page links must not outlive the input that asked for it.
+        page_links = []
+
+        def delay_links(method, args, callback, **kwargs):
+            if method == "page_links":
+                page_links.append(callback)
+            else:
+                request(method, args, callback, **kwargs)
+
+        menus = []
+
+        class RecordingMenu(QMenu):
+            def exec(self, *args):
+                menus.append(args)
+
+        prose_point = view._project(0, prose).toPoint()
+        with patch.object(doc, "request", side_effect=delay_links), \
+                patch("paper_reader.pane.QMenu", RecordingMenu):
+            pane.links.pop(0, None)
+            pane.context_menu(view.viewport().mapToGlobal(prose_point), (0, *prose))
+            assert len(page_links) == 1 and not menus
+            view.input_revision += 1
+            page_links.pop()([], None)
+            assert not menus, "A stale link lookup still opened the context menu"
+            pane.links.pop(0, None)
+            pane.context_menu(view.viewport().mapToGlobal(prose_point), (0, *prose))
+            assert len(page_links) == 1
+            page_links.pop()([], None)
+            assert len(menus) == 1, "The current link lookup did not open the context menu"
+
+            # Scrolling alone must not discard a right-click that is waiting for the links.
+            pane.links.pop(0, None)
+            pane.context_menu(view.viewport().mapToGlobal(prose_point), (0, *prose))
+            scrollbar = view.verticalScrollBar()
+            scrollbar.setValue(scrollbar.value() + 20)
+            scrollbar.setValue(scrollbar.value() - 20)
+            page_links.pop()([], None)
+            assert len(menus) == 2, "Scrolling discarded a pending context menu"
+
+            # A stale hover and a current right-click share one link read: the hover is cancelled, the menu is not.
+            pane.links.pop(0, None)
+            QTest.mouseMove(view.viewport(), prose_point)
+            wait(lambda: page_links, "Hover did not request the page links")
+            assert pane.hover_request is not None
+            pane.context_menu(view.viewport().mapToGlobal(prose_point), (0, *prose))
+            assert len(page_links) == 1, "A second subscriber started another link read"
+            app.sendEvent(view.viewport(), QEvent(QEvent.Type.Leave))
+            with patch.object(pane, "link_at", wraps=pane.link_at) as link_at:
+                page_links.pop()([], None)
+                assert pane.hover_request is None, "A cancelled link lookup left the hover request pending"
+                assert len(menus) == 3, "A stale sibling blocked the current context menu"
+                assert link_at.call_count == 1, "A stale hover still received the link result"
+        pane.links.pop(0, None)
 
         delayed_hover = []
 

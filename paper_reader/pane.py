@@ -417,11 +417,16 @@ class DocumentPane(QWidget):
                      and (not navigable or "page" in link or QUrl(link["uri"]).scheme() in ("http", "https"))),
                     None)
 
-    def with_link(self, position, callback, *, needed=None, failed=None, navigable=False, priority=-1):
+    def with_link(self, position, callback, *, needed=None, failed=None, cancelled=None,
+                  navigable=False, priority=-1):
         page = position[0]
 
         def deliver(error=None):
-            if error and failed is not None and (needed is None or needed()):
+            if needed is not None and not needed():
+                if cancelled is not None:
+                    cancelled()
+                return
+            if error and failed is not None:
                 failed(error)
                 return
             callback(self.link_at(position, navigable))
@@ -499,7 +504,7 @@ class DocumentPane(QWidget):
                                       lambda citation, error: finish(citation.box if citation else None),
                                       priority=HOVER_PRIORITY, needed=current)
 
-        self.with_link(position, link_ready, needed=current, failed=lambda error: finish(),
+        self.with_link(position, link_ready, needed=current, failed=lambda error: finish(), cancelled=finish,
                        navigable=True, priority=HOVER_PRIORITY)
 
     def hideEvent(self, event):
@@ -646,8 +651,16 @@ class DocumentPane(QWidget):
         menu.popup(self.view.viewport().mapToGlobal(self.view._project(page, (x, y)).toPoint()))
 
     def context_menu(self, point, position=None):
+        # The menu depends on page coordinates and the selection, not on scrolling, so only input and
+        # document changes make a pending lookup stale.
+        revision = self.view.input_revision, self.document.generation
+
+        def current():
+            return (isValid(self) and self.isVisible() and not self.document.loading and not self.document.disposed
+                    and revision == (self.view.input_revision, self.document.generation))
+
         def show(link):
-            if not self.isVisible() or self.document.loading:
+            if not current():
                 return
             t = self.t
             menu = QMenu(self)
@@ -678,7 +691,7 @@ class DocumentPane(QWidget):
             menu.deleteLater()
 
         if position and self.document.info:
-            self.with_link(position, show)
+            self.with_link(position, show, needed=current)
         else:
             show(None)
 
