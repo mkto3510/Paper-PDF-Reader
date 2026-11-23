@@ -47,7 +47,7 @@ def make_pdf(path):
         ):
             reference.insert_text((60, y), text)
         for y, text in (
-            (105, "Smith, J. (2024b). The fifth paper."),
+            (105, "Smith, J., and Lee, K. (2024b). The fifth paper."),
             (125, "Jones, T. (2021). Same name and year."),
             (145, "Kim, H. (2025). The sixth paper."),
         ):
@@ -164,6 +164,13 @@ def check_window(app, root, path):
         with patch.object(doc, "request", side_effect=intercept):
             QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=cite_point)
             wait(lambda: delayed, "Citation did not begin scanning")
+            active = delayed[-1][3]["needed"]
+            scrollbar = view.verticalScrollBar()
+            original_value = scrollbar.value()
+            assert active() and scrollbar.maximum() > original_value
+            scrollbar.setValue(original_value + 20)
+            scrollbar.setValue(original_value)
+            assert not active(), "Scrolling away and back revived a pending citation"
             view.go_to(1)
         method, args, callback, kwargs = delayed.pop()
         request(method, args, callback, **kwargs)

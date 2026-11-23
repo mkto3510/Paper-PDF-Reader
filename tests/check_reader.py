@@ -105,7 +105,7 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", 0), LocalTranslation)
     Thread(target=server.serve_forever, daemon=True).start()
     with TemporaryDirectory() as folder:
-        root = Path(folder)
+        root = Path(folder).resolve()
         path = root / "試験用.pdf"
         make_pdf(path)
         engine = PdfEngine()

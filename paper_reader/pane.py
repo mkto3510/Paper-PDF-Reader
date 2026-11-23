@@ -456,6 +456,7 @@ class DocumentPane(QWidget):
         self.notes.set_selection(None)
 
         revision = self.view.input_revision
+        viewport_revision = self.view.viewport_revision
         generation = self.document.generation
         location = self.view.location()
 
@@ -463,7 +464,7 @@ class DocumentPane(QWidget):
             return (isValid(self) and self.lookup is still_current and self.isVisible()
                     and not self.document.loading and not self.document.disposed
                     and self.document.generation == generation and self.view.input_revision == revision
-                    and self.view.location() == location)
+                    and self.view.viewport_revision == viewport_revision and self.view.location() == location)
 
         def started():
             self.lookup_clock.start()

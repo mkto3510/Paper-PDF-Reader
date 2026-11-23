@@ -8,7 +8,8 @@ from unicodedata import normalize
 from .selection import Box, bounds
 
 
-NUMBER = r"(?:[sS]?\d{1,5}(?:[.-]\d{1,5})*(?:\([a-zA-Z]\)|[a-zA-Z](?![a-zA-Z]))?|[IVXLCDM]{1,8}(?![a-zA-Z]))"
+NUMBER = (r"(?:(?:[sS]|[a-zA-Z]\.)?\d{1,5}(?:[.-]\d{1,5})*"
+          r"(?:\([a-zA-Z]\)|[a-zA-Z](?![a-zA-Z]))?|[IVXLCDM]{1,8}(?![a-zA-Z]))")
 LABEL = re.compile(
     rf"(?:(?<!\w)(?P<english>fig(?:ure)?s?\.?|tables?)\s*(?P<eng_number>{NUMBER})"
     rf"|第?\s*(?P<japanese>[図表])\s*(?:[-−]\s*)?(?P<jp_number>{NUMBER})"
@@ -19,7 +20,8 @@ CAPTION_END = re.compile(r"^\s*[.:：|]\s*(?=\S)")
 BODY_LEAD = re.compile(
     r"^(?:(?:\w+ly|also|further)\s+)*(?:is|are|was|were|has|have|can|could|will|would|should|"
     r"shows?|illustrates?|presents?|gives?|lists?|provides?|summari[sz]es?|reveals?|indicates?|"
-    r"reports?|compares?|describes?|depicts?|demonstrates?|contains?|includes?|agrees?|appears?)\b"
+    r"reports?|compares?|describes?|depicts?|demonstrates?|contains?|includes?|agrees?|appears?|"
+    r"plots?|tracks?|represents?|identifies?|summarizes?|corresponds?|mirrors?)\b"
     r"|^(?:で|に|は|が|を|の|と|から|より)", re.I,
 )
 CONTINUED = re.compile(r"^\s*(?:(?:[.:|]\s*)?[\[(]?\s*(?:continued\b|cont[.'’]|続き|つづき))", re.I)
@@ -48,21 +50,35 @@ def figure_label(match):
             label_key(match["eng_number"] or match["jp_number"] or match["ordinal"]))
 
 
+def _label_interval(first, last):
+    a = re.fullmatch(r"(.*?)(\d+)", first)
+    b = re.fullmatch(r"(.*?)(\d+)", last)
+    if a and b and a[1] == b[1] and 0 < int(b[2]) - int(a[2]) < 50:
+        return [a[1] + str(number) for number in range(int(a[2]), int(b[2]) + 1)]
+    return []
+
+
 def figure_mentions(text):
     for match in LABEL.finditer(text):
         start, end = match.span()
         kind, label = figure_label(match)
-        keys = [(kind, label)]
+        if match["english"] and match["english"].casefold().rstrip(".").endswith("s") and re.fullmatch(r"\d+-\d+", label):
+            labels = _label_interval(*label.split("-"))
+        else:
+            labels = [label]
+        keys = [(kind, value) for value in labels]
+        if not keys:
+            continue
         while extra := FOLLOWING_NUMBER.match(text, end):
             following = label_key(extra["number"])
             if extra["sep"].strip() in ("–", "—", "〜", "～", "~", "-"):
                 previous = keys[-1][1]
-                if not (previous.isdecimal() and following.isdecimal()
-                        and 0 < int(following) - int(previous) < 50):
+                numbers = _label_interval(previous, following)
+                if not numbers:
                     end = extra.end()
                     keys.clear()
                     break
-                keys.extend((kind, str(number)) for number in range(int(previous) + 1, int(following) + 1))
+                keys.extend((kind, number) for number in numbers[1:])
             else:
                 keys.append((kind, following))
             end = extra.end()
@@ -78,7 +94,7 @@ def caption_heading(text):
     return LABEL.match(text) or LEGACY_LABEL.match(text)
 
 
-def _nearby_object(line, regions, page_lines):
+def _nearby_object(line, regions, page_lines, kind):
     left, top, right, bottom = line.box
     candidates = []
     for box in regions:
@@ -103,6 +119,13 @@ def _nearby_object(line, regions, page_lines):
                and abs(a[1] - b[1]) <= line.size and abs(a[3] - b[3]) <= line.size
                for a, b in zip(ordered, ordered[1:])):
             return bounds(ordered)
+        # The conventional side helps when a caption lies between two objects.
+        # Require a particularly close object before using that tie-break.
+        preferred = [box for box in candidates if
+                     (0 <= top - box[3] <= line.size * 1.4 if kind == "figure"
+                      else 0 <= box[1] - bottom <= line.size * 1.4)]
+        if len(preferred) == 1:
+            return preferred[0]
     return None
 
 
@@ -110,7 +133,7 @@ def _ruled_table(line, rules, lines):
     # Open-sided tables often have horizontal rules but no vertical border.
     left, top, right, bottom = line.box
     nearby = sorted({rule for rule in rules if rule[2] - rule[0] >= line.size * 6
-                     and min(right, rule[2]) - max(left, rule[0]) >= line.size * 3
+                     and min(right, rule[2]) - max(left, rule[0]) >= min(line.size * 3, (right - left) * .8)
                      and bottom - line.size * 10 <= rule[1] <= top + line.size * 10},
                     key=lambda rule: rule[1])
     for first, second in zip(nearby, nearby[1:]):
@@ -145,9 +168,10 @@ def classify_captions(lines, regions, evidence, width, height):
     # Use page prose as a fallback when geometry split a caption into its own region.
     marked_blocks = {line.paragraph for line in lines if caption_heading(line.text)}
     sizes = Counter()
-    for line in lines:
-        if line.paragraph not in marked_blocks and line.box[2] - line.box[0] > width * .26:
-            sizes[round(line.size, 1)] += len(line.text)
+    prose_rows = [line for line in lines
+                  if line.paragraph not in marked_blocks and line.box[2] - line.box[0] > width * .26]
+    for line in prose_rows:
+        sizes[round(line.size, 1)] += len(line.text)
     body_size = sizes.most_common(1)[0][0] if sizes else None
     for region in regions or (lines,):
         ordered = sorted((line for line in region if line.horizontal),
@@ -157,7 +181,10 @@ def classify_captions(lines, regions, evidence, width, height):
         for index, line in enumerate(ordered):
             text = normalize("NFKC", line.text.strip())
             heading = caption_heading(text)
-            if active and not heading and _continues(active[-1], line):
+            adjacent_label = (len(active) == 1 and active[0].leading_bold
+                              and abs(active[0].box[1] - line.box[1]) < line.size * .4
+                              and 0 <= line.box[0] - active[0].box[2] < line.size * 1.8)
+            if active and not heading and (_continues(active[-1], line) or adjacent_label):
                 active.append(line)
                 caption_ids.add(id(line))
                 continue
@@ -170,8 +197,10 @@ def classify_captions(lines, regions, evidence, width, height):
             previous = ordered[index - 1] if index else None
             tail = text[heading.end():]
             continued = bool(CONTINUED.match(tail))
+            english_body = (heading.re is LABEL and heading["english"]
+                            and tail.lstrip()[:1].islower())
             # A real sentence can begin with a label, including within a paragraph.
-            if not continued and (BODY_LEAD.match(tail.lstrip()) or (
+            if not continued and (english_body or BODY_LEAD.match(tail.lstrip()) or (
                     previous is not None and not caption_heading(previous.text)
                     and _continues(previous, line) and not re.search(r"[.!?。][”’\"]?$", previous.text.rstrip()))):
                 body_ids.add(id(line))
@@ -183,12 +212,14 @@ def classify_captions(lines, regions, evidence, width, height):
                     following = other
                 continue
             kind, label = figure_label(heading) if heading.re is LABEL else ("other", "")
-            object_box = _nearby_object(line, figures if kind == "figure" else tables, ordered)
+            object_box = _nearby_object(line, figures if kind == "figure" else tables, ordered, kind)
             if object_box is None and kind == "table":
                 object_box = _ruled_table(line, rules, lines)
             isolated = previous is None or line.box[1] - previous.box[3] > line.size * .6
-            distinct = body_size is not None and abs(line.size - body_size) > body_size * .075
-            if object_box is None and not (continued or distinct or (isolated and CAPTION_END.match(tail))):
+            distinct = (body_size is not None and abs(line.size - body_size) > body_size * .075
+                        and not any(abs(row.box[0] - line.box[0]) <= line.size * .6 for row in prose_rows))
+            styled_label = line.leading_bold and (isolated or not tail.strip())
+            if object_box is None and not (continued or distinct or styled_label or (isolated and CAPTION_END.match(tail))):
                 continue
             active = [line]
             metadata = kind, label, object_box, continued

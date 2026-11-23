@@ -29,6 +29,7 @@ class Line:
     horizontal: bool
     paragraph: int
     kind: str = ""
+    leading_bold: bool = False
 
     @property
     def text(self) -> str:

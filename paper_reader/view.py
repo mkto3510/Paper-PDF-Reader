@@ -132,6 +132,7 @@ class PaperView(QAbstractScrollArea):
         self.press_clicks = 1
         self.click_series = None
         self.input_revision = 0
+        self.viewport_revision = 0
         self.unit_anchor = None
         self.drag_point = None
         self.drag_scroll = QTimer(self, interval=35)
@@ -227,6 +228,7 @@ class PaperView(QAbstractScrollArea):
 
     def scrollContentsBy(self, dx, dy):
         if dx or dy:
+            self.viewport_revision += 1
             self.cancel_click_series()
         if dy:
             self.direction = (0, 1 if dy < 0 else -1)

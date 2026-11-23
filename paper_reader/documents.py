@@ -231,7 +231,10 @@ class Document(QObject):
                          priority=2, needed=needed)
 
         def found(citation, error):
-            if citation is None or not needed():
+            if not needed():
+                return
+            if citation is None:
+                callback(None, ())
                 return
             if started is not None:
                 started()

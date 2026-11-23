@@ -66,6 +66,7 @@ class PdfEngine:
         self.references = None
         self.figure_page = 0
         self.figure_pages = {}
+        self.named_figure_pages = {}
         self.in_bibliography = False
         self.chapter_pages = set()
 
@@ -110,6 +111,7 @@ class PdfEngine:
         self.references = None
         self.figure_page = 0
         self.figure_pages.clear()
+        self.named_figure_pages.clear()
         self.in_bibliography = False
         self.chapter_pages = set()
         self.display_lists.clear()
@@ -182,20 +184,41 @@ class PdfEngine:
                     continue
                 if isinstance(point, (mu.Point, tuple, list)):
                     entry = {"box": tuple(link["from"]), "page": page, "point": tuple(point)}
-                    if link["kind"] == mu.LINK_NAMED:
-                        if not any(point):
-                            entry["page_only"] = True
-                        else:
-                            target = self.doc[page]
-                            # Named destinations are in PDF coordinates; the
-                            # page transform includes both crop offset and rotation.
-                            matrix = mu.mupdf.FzMatrix()
-                            mu.mupdf.pdf_page_transform(target._pdf_page(), mu.mupdf.FzRect(), matrix)
-                            entry["point"] = tuple(mu.Point(point) * mu.JM_py_from_matrix(matrix))
+                    if not any(point) and self._page_only_link(link.get("xref")):
+                        entry["page_only"] = True
+                    elif link["kind"] == mu.LINK_NAMED:
+                        target = self.doc[page]
+                        # The page transform includes both crop offset and rotation.
+                        matrix = mu.mupdf.FzMatrix()
+                        mu.mupdf.pdf_page_transform(target._pdf_page(), mu.mupdf.FzRect(), matrix)
+                        entry["point"] = tuple(mu.Point(point) * mu.JM_py_from_matrix(matrix))
                     result.append(entry)
             elif link["kind"] == mu.LINK_URI:
                 result.append({"box": tuple(link["from"]), "uri": link.get("uri", "")})
         return result
+
+    def _page_only_link(self, xref):
+        if not isinstance(xref, int) or xref < 1:
+            return False
+        pdf = self._pdf()
+        low = mu.mupdf
+        annot = low.pdf_load_object(pdf, xref)
+        destination = low.pdf_dict_gets(annot, "Dest")
+        if low.pdf_is_null(destination):
+            action = low.pdf_dict_gets(annot, "A")
+            destination = low.pdf_dict_gets(action, "D")
+        if low.pdf_is_name(destination) or low.pdf_is_string(destination):
+            destination = low.pdf_lookup_dest(pdf, destination)
+        if low.pdf_is_dict(destination):
+            destination = low.pdf_dict_gets(destination, "D")
+        if not low.pdf_is_array(destination) or low.pdf_array_len(destination) < 2:
+            return False
+        style = low.pdf_to_name(low.pdf_array_get(destination, 1))
+        if style in ("Fit", "FitB"):
+            return True
+        if style == "XYZ":
+            return all(low.pdf_is_null(low.pdf_array_get(destination, i)) for i in (2, 3))
+        return style in ("FitH", "FitBH", "FitV", "FitBV") and low.pdf_is_null(low.pdf_array_get(destination, 2))
 
     def citation_at(self, page, x, y):
         return citation_at(self.text(page), x, y)
@@ -212,8 +235,10 @@ class PdfEngine:
                     box = tuple(line["bbox"])
                     count = sum(len(span["text"]) for span in spans)
                     size = sum(len(span["text"]) * span["size"] for span in spans) / count
+                    leading_bold = bool(spans[0]["flags"] & mu.TEXT_FONT_BOLD)
                     lines.append(Line((Glyph(text, box, ()),), box, size,
-                                      line["wmode"] == 0 and abs(line["dir"][1]) < .15, block_index))
+                                      line["wmode"] == 0 and abs(line["dir"][1]) < .15, block_index,
+                                      leading_bold=leading_bold))
         width, height = page.rect.width, page.rect.height
         if page.rotation in (90, 270):
             width, height = height, width
@@ -306,9 +331,10 @@ class PdfEngine:
         marker = self.citation_at(*position)
         if marker is None or marker.kind != "figure" or len(marker.keys) != 1:
             return None
-        entries = self.figure_pages.get(page)
+        entries = self.named_figure_pages.get(page)
         if entries is None:
             entries, _ = self._caption_rows(page)
+            self.named_figure_pages[page] = entries
         target, = self._figure_targets(marker.keys, entries)
         return target
 
@@ -361,8 +387,10 @@ class PdfEngine:
                 if glyphs and any(glyph.text.strip() for glyph in glyphs):
                     horizontal = raw["wmode"] == 0 and abs(raw["dir"][1]) < 0.15
                     composed = _compose_accents(glyphs) if horizontal else tuple(glyphs)
+                    leading_bold = bool(raw["spans"][0]["flags"] & mu.TEXT_FONT_BOLD)
                     lines.append(Line(composed, bounds(g.box for g in composed),
-                                      sum(sizes) / len(sizes), horizontal, block_index))
+                                      sum(sizes) / len(sizes), horizontal, block_index,
+                                      leading_bold=leading_bold))
         return lines
 
     def _edge_keys(self, index):
