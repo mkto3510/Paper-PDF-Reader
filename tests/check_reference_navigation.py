@@ -198,7 +198,7 @@ def check_two_column_table():
     lines = [
         row("Other prose", 60, 115, 190, 0),
         row("Table A.2 Measurements by instrument and reference", 60, 164, 240, 1),
-        row("observation interval", 87, 177, 100, 1),
+        row("observation interval", 87, 177, 100, 7),
         row("Instrument", 67, 193, 61, 2),
         row("Interval", 175, 193, 43, 3),
         row("Instrument B", 67, 221, 60, 4),

@@ -123,10 +123,13 @@ def exercise(app, root, endpoint):
             QTest.keyClick(panel.cards[c], Qt.Key.Key_Delete)
         wait(lambda: not any(doc.get_note(key) for key in (a, c, e)), "Bulk Delete did not remove the selected groups")
         assert not panel.multiple and not doc.jobs
+        wait(lambda: not doc.busy, "The delete operation did not finish")
+        errors = []
+        doc.input_error.connect(errors.append)
         saved = []
         doc.save(callback=saved.append)
         wait(lambda: saved, "The edited PDF was not saved")
-        assert saved == [True]
+        assert saved == [True], (errors, doc.external, doc.stamp)
         with mu.open(path) as result:
             assert [annot.info["content"] for annot in result[0].annots()] == ["Original 1", "Original 3"]
     finally:
@@ -140,7 +143,7 @@ if __name__ == "__main__":
     Thread(target=server.serve_forever, daemon=True).start()
     try:
         with TemporaryDirectory() as folder:
-            exercise(app, Path(folder), f"http://127.0.0.1:{server.server_port}")
+            exercise(app, Path(folder).resolve(), f"http://127.0.0.1:{server.server_port}")
     finally:
         server.shutdown()
         server.server_close()

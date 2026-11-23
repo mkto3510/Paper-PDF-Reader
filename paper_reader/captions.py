@@ -160,9 +160,11 @@ def _ruled_table(line, rules, lines):
     return None
 
 
-def _continues(above, below):
+def _continues(above, below, *, split=False):
     size = above.size
-    return (above.paragraph == below.paragraph and above.horizontal == below.horizontal
+    indent = below.box[0] - above.box[0]
+    same_block = above.paragraph == below.paragraph
+    return ((same_block or (split and size * 1.35 <= indent)) and above.horizontal == below.horizontal
             and abs(above.box[0] - below.box[0]) < size * 3.5
             and abs(above.size - below.size) <= size * .10
             and below.box[1] - above.box[1] > size * .35
@@ -187,6 +189,7 @@ def classify_captions(lines, regions, evidence, width, height):
         ordered = sorted((line for line in region if line.horizontal),
                          key=lambda line: (line.box[1], line.box[0]))
         active = []
+        split_tail = set()
         metadata = None
         for index, line in enumerate(ordered):
             text = normalize("NFKC", line.text.strip())
@@ -194,7 +197,7 @@ def classify_captions(lines, regions, evidence, width, height):
             adjacent_label = (len(active) == 1 and active[0].leading_bold
                               and abs(active[0].box[1] - line.box[1]) < line.size * .4
                               and 0 <= line.box[0] - active[0].box[2] < line.size * 1.8)
-            if active and not heading and (_continues(active[-1], line) or adjacent_label):
+            if active and not heading and (_continues(active[-1], line) or adjacent_label or id(line) in split_tail):
                 active.append(line)
                 caption_ids.add(id(line))
                 continue
@@ -202,6 +205,7 @@ def classify_captions(lines, regions, evidence, width, height):
                 groups.append(Caption(*metadata[:2], " ".join(item.text.strip() for item in active),
                                       bounds(item.box for item in active), *metadata[2:]))
                 active = []
+                split_tail.clear()
             if not heading or LIST_ROW.search(text) or line.box[1] < 10 or line.box[3] > height - 10:
                 continue
             previous = ordered[index - 1] if index else None
@@ -226,18 +230,22 @@ def classify_captions(lines, regions, evidence, width, height):
             if object_box is None and kind == "table":
                 # Test from the edge of a wrapped title, as its first line can
                 # be farther from the first table rule than a standalone label.
-                tail_line = line
+                candidate_lines = [line]
                 for following in ordered[index + 1:index + 4]:
-                    if caption_heading(following.text) or not _continues(tail_line, following):
+                    if caption_heading(following.text) or not _continues(candidate_lines[-1], following, split=True):
                         break
-                    tail_line = following
-                title = replace(line, box=bounds((line.box, tail_line.box)))
+                    candidate_lines.append(following)
+                title = replace(line, box=bounds(part.box for part in candidate_lines))
                 object_box = _ruled_table(title, rules, lines)
+                if object_box:
+                    split_tail.update(id(part) for part in candidate_lines[1:])
             isolated = previous is None or line.box[1] - previous.box[3] > line.size * .6
             distinct = (body_size is not None and abs(line.size - body_size) > body_size * .075
                         and not any(abs(row.box[0] - line.box[0]) <= line.size * .6 for row in prose_rows))
             styled_label = line.leading_bold and (isolated or not tail.strip())
-            if object_box is None and not (continued or distinct or styled_label or (isolated and CAPTION_END.match(tail))):
+            after_cells = bool(kind == "table" and previous and re.fullmatch(r"[+\-\d.,% ]+", previous.text.strip()))
+            separated = (isolated or after_cells) and CAPTION_END.match(tail)
+            if object_box is None and not (continued or distinct or styled_label or separated):
                 continue
             active = [line]
             metadata = kind, label, object_box, continued
