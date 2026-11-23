@@ -57,6 +57,7 @@ class PdfEngine:
         self.signature = None
         self.backed_up = False
         self.text_cache: OrderedDict = OrderedDict()
+        self.layout_cache: OrderedDict = OrderedDict()
         self.edge_cache = {}
         self.display_lists = OrderedDict()
         self.options = DEFAULT_RULES.copy()
@@ -114,6 +115,7 @@ class PdfEngine:
         self.named_figure_pages.clear()
         self.in_bibliography = False
         self.chapter_pages = set()
+        self.layout_cache.clear()
         self.display_lists.clear()
         if self.analysis_doc is not None:
             self.analysis_doc.close()
@@ -283,7 +285,7 @@ class PdfEngine:
             eligible = {id(line) for line in lines}
         if not any(id(line) in eligible and caption_heading(line.text) for line in lines):
             return (), in_bibliography
-        groups, _, _ = classify_captions(lines, regions, page_evidence(page), width, height)
+        groups, _, _ = classify_captions(lines, regions, self._page_evidence(index, page), width, height)
         if skip_bibliography:
             starts = {line.box for line in lines if id(line) in eligible}
             groups = [group for group in groups if any(
@@ -416,6 +418,15 @@ class PdfEngine:
                              glyphs=tuple(replace(g, box=tuple(mu.Rect(g.box) * matrix)) for g in line.glyphs))
                      for line in lines)
 
+    def _page_evidence(self, index, page):
+        if index not in self.layout_cache:
+            self.layout_cache[index] = page_evidence(page)
+            if len(self.layout_cache) > 24:
+                self.layout_cache.popitem(last=False)
+        else:
+            self.layout_cache.move_to_end(index)
+        return self.layout_cache[index]
+
     def text(self, index):
         if index in self.text_cache:
             self.text_cache.move_to_end(index)
@@ -432,7 +443,7 @@ class PdfEngine:
                 if near != index:
                     neighbours.update(self._edge_keys(near))
         regions = reading_regions(lines, width)
-        evidence = page_evidence(page)
+        evidence = self._page_evidence(index, page)
         classified = classify(lines, width, height, neighbours, evidence, self.options, regions)
         leading, content, trailing = [], [], []
         horizontal_body = sum(len(line.glyphs) for line in classified if line.horizontal) > sum(

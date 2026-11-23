@@ -132,10 +132,17 @@ def _nearby_object(line, regions, page_lines, kind):
 def _ruled_table(line, rules, lines):
     # Open-sided tables often have horizontal rules but no vertical border.
     left, top, right, bottom = line.box
-    nearby = sorted({rule for rule in rules if rule[2] - rule[0] >= line.size * 6
-                     and min(right, rule[2]) - max(left, rule[0]) >= min(line.size * 3, (right - left) * .8)
-                     and bottom - line.size * 10 <= rule[1] <= top + line.size * 10},
-                    key=lambda rule: rule[1])
+    fragments = sorted({rule for rule in rules if bottom - line.size * 10 <= rule[1] <= top + line.size * 10},
+                       key=lambda rule: (round(rule[1]), rule[0]))
+    rails = []
+    for fragment in fragments:
+        if (rails and abs(fragment[1] - rails[-1][1]) < 1
+                and rails[-1][0] - 2 <= fragment[0] <= rails[-1][2] + 2):
+            rails[-1] = bounds((rails[-1], fragment))
+        else:
+            rails.append(fragment)
+    nearby = [rule for rule in rails if rule[2] - rule[0] >= line.size * 6
+              and min(right, rule[2]) - max(left, rule[0]) >= min(line.size * 3, (right - left) * .8)]
     for first, second in zip(nearby, nearby[1:]):
         if abs(first[0] - second[0]) > line.size or abs(first[2] - second[2]) > line.size:
             continue

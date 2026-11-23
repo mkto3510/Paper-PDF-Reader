@@ -113,11 +113,11 @@ def citation_spans(text):
 
 
 def _clickable(line):
-    return line.horizontal and line.kind not in ("furniture", "artifact", "equation", "table", "figure", "caption", "code")
+    return line.horizontal and line.kind not in ("furniture", "artifact", "equation", "figure", "code")
 
 
 def _wrapped(a, b):
-    if a.paragraph != b.paragraph or not (_clickable(a) and _clickable(b)):
+    if a.paragraph != b.paragraph or a.kind != b.kind or not (_clickable(a) and _clickable(b)):
         return False
     # Boxes may already be rotated with the PDF page. Test both progression axes.
     size = max(a.size, b.size)
@@ -173,12 +173,17 @@ def citation_at(lines, x, y):
 
         normalized = "".join(text)
         figures = [(span, Citation(label, keys, "figure")) for span, label, keys in figure_mentions(normalized)]
-        for (start, end), citation in figures:
-            if hit(start, end):
-                return citation
+        within_object = line.kind in ("table", "caption")
+        if not within_object:
+            for (start, end), citation in figures:
+                if hit(start, end):
+                    return citation
         for (start, end), citation in citation_spans(normalized.translate(DASHES)):
             if hit(start, end) and not any(a < end and start < b for (a, b), _ in figures):
-                return citation
+                # A reference with surrounding text is meaningful in a
+                # caption or table cell. A naked number in a cell is not.
+                if not within_object or re.search(r"[^\W\d_]", normalized[:start] + normalized[end:]):
+                    return citation
     return None
 
 

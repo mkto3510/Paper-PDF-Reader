@@ -38,7 +38,7 @@ def fixture(folder):
         page.insert_text((55, 295), "The equation Eq. [1] is unrelated.")
         page.insert_text((55, 315), "See [1-3] for citations.")
         page.insert_text((55, 365), "Figure 1: The portable radio.")
-        page.insert_text((55, 430), "Figure 2: Another independent example.")
+        page.insert_text((55, 430), "Figure 2: Another independent example [1].")
         page.insert_text((55, 480), "Figure 2.6: A radar drawing.")
         page.insert_text((55, 512), "Figure 2.6 plots temperature across each experimental run.", fontsize=10)
         page.insert_text((55, 550), "A later line of ordinary body text.")
@@ -92,6 +92,7 @@ def check_engine(path):
             assert figure.keys == (("figure", "1"),)
             assert marker("[1]")[1].keys == (1,)
             assert marker("[1]", 1)[1] is None
+            assert marker("[1]", 2)[1].keys == (1,)
             assert marker("García-López")[1].keys == (("garcía-lópez", "2022"),)
             assert marker("Smith and Jones, 2024a")[1].keys == (("smith", "2024a", "jones"),)
             links = engine.page_links(0)

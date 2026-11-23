@@ -142,14 +142,14 @@ def check_window(app, root, path):
         QTest.qWait(35)
         assert view.zoom == 1.3 and view.location()[0] == before[0]
         assert all(abs(a - b) <= 2 for a, b in zip(view.location()[1:], before[1:]))
-        view.set_zoom("fit")
+        view.set_zoom("custom", 1.3)
         view.go_to(0)
         QTest.qWait(30)
 
         with mu.open(path) as fixture:
-            cite_point = view._project(0, tuple(point(fixture, "[12]"))).toPoint()
-            link_point = view._project(0, tuple(point(fixture, "[12]", 1))).toPoint()
-            group_point = view._project(0, tuple(point(fixture, "[3-5]"))).toPoint()
+            positions = [tuple(point(fixture, "[12]")), tuple(point(fixture, "[12]", 1)),
+                         tuple(point(fixture, "[3-5]"))]
+        cite_point = view._project(0, positions[0]).toPoint()
 
         request = doc.request
         delayed = []
@@ -177,7 +177,9 @@ def check_window(app, root, path):
         wait(lambda: doc.reference_scan is None, "Old citation scan did not settle")
         assert view.current_page() == 1, "A delayed lookup changed the page"
 
+        view.set_zoom("fit")
         view.go_to(0)
+        cite_point, link_point, group_point = [view._project(0, item).toPoint() for item in positions]
         QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=cite_point)
         wait(lambda: view.current_page() == 2, "Citation did not reach the bibliography")
         pane.back_forward(-1)
