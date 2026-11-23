@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QMenu, QMessageBox, QTabWidget, QTextEdit, QToolButton, QVBoxLayout,
 )
 
+from . import APP_NAME
 from .chrome import DocumentTabs, Header, TabList
 from .dialogs import AboutDialog, SettingsDialog
 from .icons import icon
@@ -26,7 +27,7 @@ class Reader(QMainWindow):
         self.preferences = controller.preferences
         self.setMinimumWidth(MINIMUM_WIDTH)
         self.resize(1180, 820)
-        self.setWindowTitle("Paper PDF Reader")
+        self.setWindowTitle(APP_NAME)
         self.setAcceptDrops(True)
         self.language = None
         self.actions = {}
@@ -139,7 +140,7 @@ class Reader(QMainWindow):
             self.language = self.preferences.data["language"]
             self.build_menu()
         self.tab_list_button.setArrowType(Qt.ArrowType.DownArrow)
-        self.tab_list_button.setToolTip(self.t("開いているPDF一覧", "Open PDFs"))
+        self.tab_list_button.setToolTip(self.t("開いている PDF の一覧", "Open PDFs"))
         self.tab_list_button.setAccessibleName(self.tab_list_button.toolTip())
         self.tab_list.relabel()
         for i in range(self.tabs.count()):
@@ -165,7 +166,7 @@ class Reader(QMainWindow):
             ("選択", "Selection"), ("ヘルプ", "Help"),
         )]
         self.view_menu = view
-        self.action(file, "new", ("新しいウインドウ", "New window"), self.controller.new_window, "Ctrl+N", False)
+        self.action(file, "new", ("新しいウィンドウ", "New window"), self.controller.new_window, "Ctrl+N", False)
         self.action(file, "open", ("開く…", "Open…"), self.browse, "Ctrl+O", False)
         self.action(file, "close", ("文書を閉じる", "Close document"), lambda: self.close_tabs([self.tabs.currentIndex()]), "Ctrl+W")
         self.action(file, "reload", ("再読み込み", "Reload"), self.reload, "Ctrl+R")
@@ -233,7 +234,7 @@ class Reader(QMainWindow):
         settings = self.action(None, "preferences", ("設定", "Settings"), self.open_settings, required=False)
         menu.insertAction(help_.menuAction(), settings)
         self.action(help_, "keys", ("ショートカット", "Keyboard shortcuts"), self.shortcuts, required=False)
-        self.action(help_, "about", ("Paper PDF Reader について", "About Paper PDF Reader"), self.about, required=False)
+        self.action(help_, "about", (f"{APP_NAME} について", f"About {APP_NAME}"), self.about, required=False)
         self.action(None, "next_tab", ("次のタブ", "Next tab"), lambda: self.cycle_tab(1), "Ctrl+Tab", False)
         self.action(None, "previous_tab", ("前のタブ", "Previous tab"), lambda: self.cycle_tab(-1), "Ctrl+Shift+Tab", False)
         self.chrome.bind(self.actions, zoom)
@@ -270,13 +271,13 @@ class Reader(QMainWindow):
         if not ready:
             self.actions["notes"][0].setText(self.t("注釈一覧", "Annotations"))
             self.chrome.set_external("")
-            self.chrome.set_save_state("")
+            self.set_document_title()
             return
         doc = pane.document
         unsaved = doc.dirty or doc.mutating or doc in drafts
         state = (self.t("保存中…", "Saving…") if doc.saving else
                  self.t("未保存の変更があります", "Unsaved changes") if unsaved else "")
-        self.chrome.set_save_state(state)
+        self.set_document_title(state)
         for key, active in ((pane.view.layout_mode, True), ("continuous", pane.view.continuous),
                             ("rtl", pane.view.rtl), ("outline", not pane.outline.isHidden()),
                             ("notes", not pane.notes.isHidden())):
@@ -290,8 +291,13 @@ class Reader(QMainWindow):
         current = pane.view.current_page()
         self.actions["page_previous"][0].setEnabled(current > 0)
         self.actions["page_next"][0].setEnabled(current + 1 < len(pane.view.pages))
-        self.chrome.set_external(self.t("元の PDF が変更されました。別名保存または再読み込みを選んでください。",
+        self.chrome.set_external(self.t("元の PDF が変更されました。別のファイルに保存するか、読み込み直してください。",
                                      "The PDF has changed on disk. Save a copy or reload.") if doc.external else "")
+
+    def set_document_title(self, state=""):
+        title = f"{APP_NAME} — {state}" if state else APP_NAME
+        if self.windowTitle() != title:
+            self.setWindowTitle(title)
 
     def browse(self):
         files, _ = QFileDialog.getOpenFileNames(self, self.t("PDF を開く", "Open PDFs"), "", "PDF (*.pdf)")
@@ -405,7 +411,7 @@ class Reader(QMainWindow):
         self.chrome.show_notice(self.error_text(message))
 
     def show_error(self, message):
-        QMessageBox.warning(self, "Paper PDF Reader", self.error_text(message))
+        QMessageBox.warning(self, APP_NAME, self.error_text(message))
 
     def reload(self):
         doc = self.pane.document
@@ -506,7 +512,7 @@ class Reader(QMainWindow):
         if saved is None:
             answer = QMessageBox.question(
                 self, self.t("電子署名付き PDF", "Digitally signed PDF"),
-                self.t("別名保存すると電子署名の検証に影響する可能性があります．別名で保存しますか？",
+                self.t("別のファイルに保存すると、電子署名の検証に影響する可能性があります。保存しますか？",
                        "Saving this copy may affect validation of the digital signature. Save a copy?"),
                 QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,

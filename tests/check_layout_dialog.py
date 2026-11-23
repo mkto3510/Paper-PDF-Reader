@@ -134,7 +134,7 @@ def check_window(app, root):
         card.editor.selectAll()
         card.editor.insertPlainText("Draft preserved through switching")
         assert "*" in window.tabs.tabText(window.tabs.indexOf(a))
-        assert window.chrome.save_state.text() == "Unsaved changes"
+        assert window.windowTitle() == "Paper PDF Viewer — Unsaved changes"
         QTimer.singleShot(60, lambda: choose("Cancel"))
         window.tabs.setCurrentWidget(b)
         assert window.pane is a

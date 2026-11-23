@@ -30,7 +30,7 @@ try {
     $env:PYINSTALLER_CONFIG_DIR = Join-Path $PSScriptRoot 'build\pyinstaller-cache'
     Invoke-BuildStep $python @(
         '-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed',
-        '--name', 'PaperPdfReader', '--specpath', 'build',
+        '--name', 'PaperPdfViewer', '--specpath', 'build',
         '--icon', (Join-Path $PSScriptRoot 'paper_reader\icons\app.ico'),
         '--collect-binaries', 'pymupdf',
         '--add-data', ('{0}:paper_reader/icons' -f (Join-Path $PSScriptRoot 'paper_reader\icons')),
@@ -40,7 +40,7 @@ try {
     $env:PATH = $originalPath
     $env:PYINSTALLER_CONFIG_DIR = $originalCache
 }
-$appDirectory = Join-Path $PSScriptRoot 'dist\PaperPdfReader'
+$appDirectory = Join-Path $PSScriptRoot 'dist\PaperPdfViewer'
 $runtime = Join-Path $appDirectory '_internal'
 foreach ($dependency in @('python312.dll', 'PySide6\plugins\platforms\qwindows.dll')) {
     if (-not (Test-Path -LiteralPath (Join-Path $runtime $dependency))) {
@@ -52,7 +52,7 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'README.md') -Destination $appDi
 
 $release = Join-Path $PSScriptRoot 'release'
 New-Item -ItemType Directory -Path $release -Force | Out-Null
-$zip = Join-Path $release "PaperPdfReader-$version-portable.zip"
+$zip = Join-Path $release "PaperPdfViewer-$version-portable.zip"
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [System.IO.Compression.ZipFile]::CreateFromDirectory(
@@ -76,4 +76,4 @@ if (-not $PortableOnly) {
     if (-not $IsccPath) { throw 'Inno Setup 7 (ISCC.exe) was not found. Pass -IsccPath.' }
     Invoke-BuildStep $IsccPath @('-qp', "-dAppVersion=$version", 'installer\PaperPdfReader.iss')
 }
-Get-ChildItem -LiteralPath $release -Filter "PaperPdfReader-$version-*" | Select-Object Name, Length
+Get-ChildItem -LiteralPath $release -Filter "PaperPdfViewer-$version-*" | Select-Object Name, Length

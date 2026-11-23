@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QTabWidget, QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from . import VERSION
+from . import APP_NAME, VERSION
 from .analysis_rules import LABELS, RULES
 from .icons import swatch
 from .notes import COLORS
@@ -28,7 +28,7 @@ class AboutDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
         t = self.t = parent.t
-        self.setWindowTitle(t("Paper PDF Reader について", "About Paper PDF Reader"))
+        self.setWindowTitle(t(f"{APP_NAME} について", f"About {APP_NAME}"))
         self.resize(640, 490)
         layout = QVBoxLayout(self)
 
@@ -37,7 +37,7 @@ class AboutDialog(QDialog):
         image.setPixmap(self.windowIcon().pixmap(48))
         header.addWidget(image)
         identity = QVBoxLayout()
-        name = QLabel("Paper PDF Reader")
+        name = QLabel(APP_NAME)
         font = name.font()
         font.setPointSizeF(font.pointSizeF() * 1.5)
         font.setBold(True)
@@ -54,11 +54,11 @@ class AboutDialog(QDialog):
         overview = QTextBrowser()
         overview.setOpenExternalLinks(True)
         overview.setMarkdown("\n\n".join((
-            t("段組のある論文 PDF を読み，選んだ本文を翻訳し，訳文をハイライトのコメントとして "
-              "PDF に保存できる Windows 向けビューアです．",
+            t("段組のある論文 PDF を読み、選んだ箇所を翻訳できる Windows 向けビューアです。"
+              "訳文はハイライトのコメントとして PDF に保存できます。",
               "A Windows viewer for reading research PDFs with multiple columns. Translate a passage "
               "and save the translation as a highlight comment in the PDF."),
-            t("PDF の閲覧と注釈はオフラインで使えます．翻訳するときは，対象の本文を設定した翻訳サービスに送ります．",
+            t("PDF を読んだり注釈を付けたりする操作は、オフラインで使えます。翻訳時は、選んだ文章を設定先の翻訳サービスに送ります。",
               "Reading and annotating work offline. When you translate a passage, its text goes to "
               "the translation service you configured."),
             f'[{t("ソースコードを開く", "View source code")}](https://github.com/mkto3510/Paper-PDF-Reader)',
@@ -67,7 +67,7 @@ class AboutDialog(QDialog):
 
         licenses = QWidget()
         content = QVBoxLayout(licenses)
-        content.addWidget(QLabel(t("本体ライセンス  AGPL-3.0-or-later", "Application license  AGPL-3.0-or-later")))
+        content.addWidget(QLabel(t("アプリのライセンス  AGPL-3.0-or-later", "Application license  AGPL-3.0-or-later")))
         self.notice = QComboBox()
         self.notice.setAccessibleName(t("ライセンス文書", "License document"))
         content.addWidget(self.notice)
@@ -89,7 +89,7 @@ class AboutDialog(QDialog):
         folder = root / ("LICENSES" if packaged else "licenses")
         license_path = root / ("LICENSE.txt" if packaged else "LICENSE")
         sources_path = (folder if packaged else root) / "THIRD_PARTY.md"
-        self.notice.addItem(t("Paper PDF Reader のライセンス", "Paper PDF Reader license"), license_path)
+        self.notice.addItem(t(f"{APP_NAME} のライセンス", f"{APP_NAME} license"), license_path)
         self.notice.addItem(t("使用ソフトウェアとソースコード", "Third-party software and source code"), sources_path)
         for path in sorted(folder.rglob("*"), key=lambda file: file.as_posix().casefold()):
             if path != sources_path and path.is_file():
@@ -174,7 +174,7 @@ class SettingsDialog(QDialog):
         self.small_size = spin(2, 30, self.data["rules"]["small_text"])
         self.edge_range.setSuffix("%")
         self.small_size.setSuffix("%")
-        rules.addRow(t("ページ上下端の探索範囲", "Header/footer detection range"), self.edge_range)
+        rules.addRow(t("ヘッダー・フッターを探す範囲", "Header/footer detection range"), self.edge_range)
         rules.addRow(t("本文より小さい文字の差", "Small-text size difference"), self.small_size)
         scroller = QScrollArea()
         scroller.setWidgetResizable(True)
@@ -402,7 +402,7 @@ class TranslationDialog(QDialog):
             summary.setWordWrap(True)
             summary.setText(t("除外した箇所", "Excluded text") + "\n" + " / ".join(headings.values()))
             form.addRow(summary)
-            details = QPushButton(t("除外した原文を表示", "Show excluded text"))
+            details = QPushButton(t("除外した箇所を表示", "Show excluded text"))
             details.setCheckable(True)
             excerpt = QTextEdit()
             excerpt.setReadOnly(True)
@@ -413,11 +413,11 @@ class TranslationDialog(QDialog):
             details.toggled.connect(excerpt.setVisible)
             form.addRow(details)
             form.addRow(excerpt)
-            include = QCheckBox(t("除外した箇所を戻す", "Restore excluded text"))
+            include = QCheckBox(t("除外した箇所を翻訳に含める", "Restore excluded text"))
             include.toggled.connect(self.include)
             include.toggled.connect(lambda restored: include.setText(
-                t("除外を再適用するにはチェックを外す", "Uncheck to reapply exclusions") if restored
-                else t("除外した箇所を戻す", "Restore excluded text")))
+                t("除外した箇所も翻訳します", "Uncheck to reapply exclusions") if restored
+                else t("除外した箇所を翻訳に含める", "Restore excluded text")))
             form.addRow(include)
         controls.addLayout(form)
         self.status = QLabel()

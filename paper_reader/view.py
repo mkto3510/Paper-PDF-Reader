@@ -119,6 +119,7 @@ class PaperView(QAbstractScrollArea):
         self.current_match = None
         self.show_all_matches = False
         self.content_box = None
+        self.content_anchor = None
         self.anchor = self.pointer = None
         self.selection_range = None
         self.selection_origin = ""
@@ -126,7 +127,12 @@ class PaperView(QAbstractScrollArea):
         self.press = self.pan_start = None
         self.dragging_selection = False
         self.press_clicks = 1
-        self.click_series = self.click_selection = None
+        self.click_series = None
+        self.input_revision = 0
+        self.unit_anchor = None
+        self.drag_point = None
+        self.drag_scroll = QTimer(self, interval=35)
+        self.drag_scroll.timeout.connect(self.scroll_selection)
         self.click_timer = QTimer(self, singleShot=True, timerType=Qt.TimerType.PreciseTimer)
         self.click_timer.timeout.connect(self.finish_click_series)
         self.panning = False
@@ -206,8 +212,14 @@ class PaperView(QAbstractScrollArea):
             bar.setRange(0, max(0, extent - viewport) if shown else 0)
 
     def resizeEvent(self, event):
+        old = event.oldSize()
+        # The viewport already reports its new size during this event. Use
+        # the previous center to anchor each resize, including scrollbar changes.
+        center = QPointF((old.width() - 1) // 2, (old.height() - 1) // 2)
+        anchor = self.location(center) if old.isValid() and self.pages else None
         super().resizeEvent(event)
         self._layout()
+        self.restore(anchor)
 
     def scrollContentsBy(self, dx, dy):
         if dx or dy:
@@ -320,6 +332,8 @@ class PaperView(QAbstractScrollArea):
         location = self.location(point)
         self.page = location[0]
         self.zoom_mode = mode
+        self.input_revision += 1
+        self.content_anchor = None
         if scale is not None:
             self.zoom = max(MIN_SCALE, min(MAX_SCALE, scale))
         self.content_box = None
@@ -330,9 +344,14 @@ class PaperView(QAbstractScrollArea):
 
             def ready(box, error):
                 if not error and generation == self.generation and self.zoom_mode == mode and index == self.page:
+                    current = self.location()
                     self.content_box = box
                     self._layout()
-                    if box:
+                    if self.content_anchor is not None:
+                        revision, anchor = self.content_anchor
+                        self.content_anchor = None
+                        self.restore(anchor if revision == self.input_revision else current)
+                    elif box:
                         x0, y0, x1, y1 = box
                         self.restore((index, (x0 + x1) / 2, (y0 + y1) / 2))
                     else:
@@ -340,7 +359,12 @@ class PaperView(QAbstractScrollArea):
 
             self.session.request("content_bounds", (index,), ready, priority=4)
 
+    def preserve_content_anchor(self, location):
+        if self.zoom_mode == "content" and self.content_box is None:
+            self.content_anchor = self.input_revision, location
+
     def set_layout(self, mode=None, continuous=None, rtl=None, rotation=None):
+        self.input_revision += 1
         self.cancel_click_series()
         location = self.location()
         if location:
@@ -359,6 +383,8 @@ class PaperView(QAbstractScrollArea):
     def go_to(self, index, y=0, x=None):
         if not 0 <= index < len(self.pages):
             return
+        self.input_revision += 1
+        self.cancel_click_series()
         self.page = index
         if not self.continuous or index not in self.positions:
             self._layout()
@@ -638,15 +664,18 @@ class PaperView(QAbstractScrollArea):
                                      QColor(255, 143 if active else 220, 40, 145))
         painter.restore()
 
-    def load_text(self, index, callback=None):
+    def load_text(self, index, callback=None, *, interactive=False):
         if index in self.text_cache:
             self.text_cache.move_to_end(index)
             if callback:
                 callback(self.text_cache[index])
             return
+        key = id(self), "text", self.generation, index
         if index in self.text_pending:
             if callback:
                 self.text_pending[index].append(callback)
+            if interactive or callback:
+                self.session.promote(key, 5)
             return
         if self.session is None:
             return
@@ -668,15 +697,17 @@ class PaperView(QAbstractScrollArea):
             for ready in callbacks:
                 ready(lines)
 
-        self.session.request("text", (index,), received, priority=5 if callback else 7,
+        self.session.request("text", (index,), received, priority=5 if interactive or callback else 7, key=key,
                              needed=lambda: generation == self.generation and (
                                  index in self._visible_pages() or bool(callbacks) or
                                  index in tuple(p[0] for p in (self.anchor, self.pointer) if p)))
 
     def clear_selection(self):
+        self.input_revision += 1
         self.cancel_click_series()
         self.selection_revision += 1
-        self.anchor = self.pointer = self.selection_range = None
+        self.end_selection_gesture()
+        self.selection_range = None
         self.selection_origin = ""
         self.waiting = False
         self.highlight_drag = None
@@ -724,7 +755,9 @@ class PaperView(QAbstractScrollArea):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
+            self.input_revision += 1
             self.cancel_click_series()
+            self.end_selection_gesture()
             self.pan_start = event.position()
             self.panning = False
         elif event.button() == Qt.MouseButton.LeftButton:
@@ -742,24 +775,23 @@ class PaperView(QAbstractScrollArea):
             return
         position = self._position(point)
         clicks = 2 if double else 1
-        if self.click_series:
+        if self.click_series and self.click_timer.isActive() and position:
             previous, pixel, count = self.click_series
             distance = max(abs(pixel.x() - point.x()), abs(pixel.y() - point.y()))
-            if (self.click_timer.isActive() and position and position[0] == previous[0]
-                    and (double or distance <= QApplication.styleHints().mouseDoubleClickDistance())):
+            if position[0] == previous[0] and (double or distance <= QApplication.styleHints().mouseDoubleClickDistance()):
                 clicks = count + 1
-            else:
-                self.finish_click_series()
-                position = self._position(point)
         self.clear_selection()
         self.press, self.press_clicks, self.dragging_selection = point, clicks, False
         self.anchor = self.pointer = position
         if position:
-            self.load_text(position[0])
+            if clicks > 1:
+                self._select_endpoints()
+            else:
+                self.load_text(position[0], interactive=True)
 
     def cancel_click_series(self):
         self.click_timer.stop()
-        self.click_series = self.click_selection = None
+        self.click_series = None
 
     def finish_click_series(self):
         self.click_timer.stop()
@@ -767,38 +799,53 @@ class PaperView(QAbstractScrollArea):
         if series and series[2] == 1:
             self.clicked.emit(*series[0])
 
+    def end_selection_gesture(self):
+        self.anchor = self.pointer = self.unit_anchor = self.drag_point = None
+        self.waiting = False
+        self.drag_scroll.stop()
+
     def hideEvent(self, event):
+        self.input_revision += 1
         self.cancel_click_series()
+        self.end_selection_gesture()
         super().hideEvent(event)
 
-    def select_by_click(self, position, clicks):
-        token = self.click_selection = object()
+    def selection_span(self, position, *, exact=False):
         page, x, y = position
-
-        def ready(lines):
-            if self.click_selection is not token or not lines:
-                return
-            hit = nearest(lines, x, y)
-            if hit is None:
-                return
-            row, index = hit
-            line = lines[row]
-            glyph = line.glyphs[index]
+        lines = self.text_cache[page]
+        hit = nearest(lines, x, y)
+        if hit is None:
+            return None
+        row, index = hit
+        line = lines[row]
+        glyph = line.glyphs[index]
+        if exact:
             left, top, right, bottom = glyph.box
             if not (left <= x <= right and top <= y <= bottom):
-                return
-            if clicks == 2:
-                if not glyph.text.strip():
-                    return
-                first, last = word_range(line, index)
-            else:
-                first, last = 0, len(line.glyphs) - 1
-            self.selection_origin = line.kind
-            self.selection_range = (page, row, first), (page, row, last)
-            self.viewport().update()
-            self.location_changed.emit()
+                return None
+        if self.press_clicks == 1:
+            first = last = index
+        elif self.press_clicks == 2:
+            if not glyph.text.strip():
+                if exact:
+                    return None
+                index = min((i for i, item in enumerate(line.glyphs) if item.text.strip()),
+                            key=lambda i: abs(i - index), default=None)
+                if index is None:
+                    return None
+            first, last = word_range(line, index)
+        else:
+            first, last = 0, len(line.glyphs) - 1
+        return (page, row, first), (page, row, last), line.kind
 
-        self.load_text(page, ready)
+    def scroll_selection(self):
+        point = self.drag_point
+        if point is None or not self.anchor:
+            self.drag_scroll.stop()
+            return
+        self.scroll_by(-32 if point.y() < 0 else 32)
+        self.pointer = self._position(point, clamp=True)
+        self._select_endpoints()
 
     def mouseMoveEvent(self, event):
         if self.highlight_drag and event.buttons() & Qt.MouseButton.LeftButton:
@@ -817,11 +864,17 @@ class PaperView(QAbstractScrollArea):
             self.dragging_selection |= (event.position() - self.press).manhattanLength() >= DRAG_DISTANCE
             if not self.dragging_selection:
                 return
-            y = event.position().y()
-            if y < 0 or y >= self.viewport().height():
-                self.scroll_by(-32 if y < 0 else 32)
-            self.pointer = self._position(event.position(), clamp=True)
-            self._select_endpoints()
+            point = event.position()
+            if point.y() < 0 or point.y() >= self.viewport().height():
+                self.drag_point = point
+                if not self.drag_scroll.isActive():
+                    self.drag_scroll.start()
+                    self.scroll_selection()
+            else:
+                self.drag_point = None
+                self.drag_scroll.stop()
+                self.pointer = self._position(point, clamp=True)
+                self._select_endpoints()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
@@ -838,36 +891,52 @@ class PaperView(QAbstractScrollArea):
                 if self.highlight_drag is drag:
                     self._finish_highlight_drag()
             return
-        if self.anchor:
-            if not self.dragging_selection and (event.position() - self.press).manhattanLength() < DRAG_DISTANCE:
-                position, clicks = self.anchor, self.press_clicks
-                self.clear_selection()
-                if clicks < 3:
-                    self.click_series = position, self.press, clicks
-                    self.click_timer.start(QApplication.doubleClickInterval())
-                if clicks > 1:
-                    self.select_by_click(position, clicks)
-            else:
-                self.waiting = True
-                self.pointer = self._position(event.position(), clamp=True)
-                self._select_endpoints()
+        self.drag_scroll.stop()
+        self.drag_point = None
+        if not self.anchor:
+            return
+        point = event.position()
+        self.dragging_selection |= (point - self.press).manhattanLength() >= DRAG_DISTANCE
+        if not self.dragging_selection:
+            clicks = self.press_clicks
+            if clicks < 3:
+                self.click_series = self.anchor, self.press, clicks
+                self.click_timer.start(QApplication.doubleClickInterval())
+            if clicks == 1:
+                self.end_selection_gesture()
+                return
+        else:
+            self.pointer = self._position(point, clamp=True)
+        self.waiting = True
+        self._select_endpoints()
 
     def _select_endpoints(self):
-        if not self.anchor or not self.pointer:
+        if not self.anchor or not self.pointer or (self.press_clicks == 1 and not self.dragging_selection):
             return
-        ends = []
-        for page, x, y in (self.anchor, self.pointer):
+        if self.unit_anchor is None:
+            page = self.anchor[0]
             if page not in self.text_cache:
-                self.load_text(page)
+                self.load_text(page, interactive=True)
                 return
-            hit = nearest(self.text_cache[page], x, y)
-            if hit is None:
+            self.unit_anchor = self.selection_span(self.anchor, exact=self.press_clicks > 1)
+            if self.unit_anchor is None:
+                if self.waiting:
+                    self.end_selection_gesture()
                 return
-            ends.append((page, *hit))
-        page, line, _ = ends[0]
-        self.selection_origin = self.text_cache[page][line].kind
-        self.selection_range = tuple(sorted(ends))
+        first, last, origin = self.unit_anchor
+        if self.dragging_selection:
+            page = self.pointer[0]
+            if page not in self.text_cache:
+                self.load_text(page, interactive=True)
+                return
+            if target := self.selection_span(self.pointer):
+                first, last = min(first, target[0]), max(last, target[1])
+        selection = first, last
         if self.waiting:
-            self.waiting = False
-            self.anchor = self.pointer = None
-        self.viewport().update()
+            self.end_selection_gesture()
+        if self.selection_range != selection:
+            self.selection_revision += 1
+            self.selection_origin = origin
+            self.selection_range = selection
+            self.viewport().update()
+            self.location_changed.emit()

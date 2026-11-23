@@ -492,7 +492,7 @@ class Notes(QWidget):
 
     def remove_card(self, key):
         card = self.cards.pop(key)
-        if card.editing and card.editor.document().isModified():
+        if card.editing and card.editor.document().isModified() and self.pane.document.get_note(key):
             self.drafts[key] = card.editor.toPlainText()
         card.hide()
         card.deleteLater()
@@ -515,9 +515,10 @@ class Notes(QWidget):
             self.heights.clear()
             self.dirty.update(self.cards)
             self.rebuild_offsets()
+        forgotten_height = False
         for key in self.dirty - self.cards.keys():
-            self.heights.pop(key, None)
-        if self.dirty:
+            forgotten_height |= self.heights.pop(key, self.ESTIMATED_HEIGHT) != self.ESTIMATED_HEIGHT
+        if forgotten_height:
             self.rebuild_offsets()
         # First measure enough rows to cover the viewport and roughly one screen on either side.
         while True:
@@ -534,17 +535,29 @@ class Notes(QWidget):
                 if key in self.dirty or key not in self.heights:
                     card.update_card()
                     size = max(1, card.measure(width))
-                    measured |= size != self.heights.get(key)
+                    measured |= size != self.heights.get(key, self.ESTIMATED_HEIGHT)
                     self.heights[key] = size
                     self.dirty.discard(key)
             if not measured:
                 break
             self.rebuild_offsets()
         offset = self.scroll_offset(anchor, within, offset, reveal, height, at_end)
-        preserve = set(visible)
-        for key in self.cards.keys() - preserve:
-            self.remove_card(key)
-        self.dirty.clear()
+        # Keep a second buffer so small height changes while editing do
+        # not repeatedly destroy and recreate cards at the viewport edge.
+        keep_start = max(0, bisect_right(self.tops, max(0, offset - 2 * height)) - 1)
+        keep_stop = min(len(self.keys), bisect_left(self.tops, offset + 3 * height))
+        # Tall cards can consume several screen heights by themselves.
+        # Keep nearby rows by count as well as by pixel distance.
+        keep_start = max(0, min(keep_start, start - 4))
+        keep_stop = min(len(self.keys), max(keep_stop, stop + 4))
+        keep = set(self.keys[keep_start:keep_stop])
+        offscreen = self.cards.keys() - set(visible)
+        for key in offscreen:
+            if key in keep:
+                self.cards[key].hide()
+            else:
+                self.remove_card(key)
+        self.dirty.intersection_update(self.cards)
         self.contents.resize(width, max(height, self.tops[-1]))
         bar.setValue(offset)
         for key in visible:

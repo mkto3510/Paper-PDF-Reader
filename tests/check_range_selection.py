@@ -4,6 +4,7 @@ from multiprocessing import freeze_support
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import pymupdf as mu
 from PySide6.QtCore import Qt, QTimer
@@ -123,13 +124,29 @@ def test_click_selection(pane):
         wait(lambda: choices, "Click selection did not return text")
         return choices[1].source
 
+    before, _ = text_point(0, "The")
+    after, _ = text_point(0, "has")
     point, line = text_point(0, "first")
-    click(point, 2)
+    view.clear_selection()
+    QTest.mouseClick(view.viewport(), button, pos=point)
+    QTest.mouseDClick(view.viewport(), button, pos=point)
+    assert view.selection_range, "The word was not selected on the second press"
+    first_word = view.selection_range
+    QTest.mouseMove(view.viewport(), after)
+    wait(lambda: view.selection_range[1] > first_word[1], "Word drag did not extend")
+    QTest.mouseMove(view.viewport(), before)
+    wait(lambda: view.selection_range[0] < first_word[0] and view.selection_range[1] == first_word[1],
+         "Word drag did not reverse")
+    QTest.mouseRelease(view.viewport(), button, pos=point)
     assert selected() == "first"
     QTest.qWait(QApplication.doubleClickInterval() + 25)
     assert view.current_page() == 0, "A double click opened a link"
-    click(point, 3)
-    assert selected() == line
+    QTest.mouseClick(view.viewport(), button, pos=point)
+    QTest.mouseDClick(view.viewport(), button, pos=point)
+    QTest.mouseRelease(view.viewport(), button, pos=point)
+    QTest.mousePress(view.viewport(), button, pos=point)
+    assert selected() == line, "The line was not selected on the third press"
+    QTest.mouseRelease(view.viewport(), button, pos=point)
 
     choices = []
 
@@ -159,7 +176,52 @@ def test_click_selection(pane):
     wait(lambda: 3 in view.text_cache, "Image-only page was not processed")
     assert view.selection_range is None
 
+    view.set_layout(continuous=True)
+    old_mode, old_zoom = view.zoom_mode, view.zoom
+    view.set_zoom("custom", .8)
+    view.restore((0, 100, 685))
+    for page in (0, 1):
+        view.load_text(page, lambda _lines: None)
+    wait(lambda: all(page in view.text_cache for page in (0, 1)), "Cross-page selection text did not load")
+
+    def projected(page, word):
+        item = next(line for line in view.text_cache[page] if word in line.text)
+        box = item.glyphs[item.text.index(word)].box
+        return view._project(page, ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)).toPoint()
+
+    start, end = projected(0, "reports"), projected(1, "results")
+    assert view.viewport().rect().contains(start) and view.viewport().rect().contains(end)
+    view.clear_selection()
+    QTest.mouseClick(view.viewport(), button, pos=start)
+    QTest.mouseDClick(view.viewport(), button, pos=start)
+    QTest.mouseMove(view.viewport(), end)
+    wait(lambda: view.selection_range[1][0] == 1, "Word drag did not cross the page boundary")
+    QTest.mouseRelease(view.viewport(), button, pos=end)
+    assert selected().startswith("reports") and selected().endswith("results")
+
+    view.set_zoom(old_mode, old_zoom if old_mode == "custom" else None)
     point, _ = text_point(0, "first")
+    after, _ = text_point(0, "has")
+    request, delayed = doc.request, []
+
+    def intercept(name, args, callback, **options):
+        if name == "text" and args == (0,):
+            delayed.append((name, args, callback, options))
+        else:
+            request(name, args, callback, **options)
+
+    view.clear_selection()
+    view.text_cache.pop(0)
+    with patch.object(doc, "request", side_effect=intercept):
+        QTest.mouseClick(view.viewport(), button, pos=point)
+        QTest.mouseDClick(view.viewport(), button, pos=point)
+        QTest.mouseMove(view.viewport(), after)
+        QTest.mouseRelease(view.viewport(), button, pos=after)
+        assert view.selection_range is None and len(delayed) == 1
+    name, args, callback, options = delayed.pop()
+    request(name, args, callback, **options)
+    assert selected() == "first editable highlight has"
+
     view.clear_selection()
     QTest.mouseClick(view.viewport(), button, pos=point)
     wait(lambda: view.current_page() == 1, "A single click did not follow the link")

@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QSizePolicy, QSplitter,
     QToolButton, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
+from shiboken6 import isValid
 
 from .dialogs import TranslationDialog
 from .icons import icon, swatch
@@ -153,6 +154,7 @@ class DocumentPane(QWidget):
         self.notes.setEnabled(not self.document.loading)
         if self.document.loading:
             self.view.cancel_click_series()
+            self.view.end_selection_gesture()
         if self.rules_generation != self.document.rules_generation:
             self.rules_generation = self.document.rules_generation
             # Callbacks already in flight belonged to the previous rules.
@@ -231,6 +233,8 @@ class DocumentPane(QWidget):
     def back_forward(self, delta):
         index = self.history_index + delta
         if 0 <= index < len(self.history):
+            self.view.input_revision += 1
+            self.view.cancel_click_series()
             if delta < 0 and self.history_index == len(self.history) - 1:
                 self.history[self.history_index] = self.view.location()
             self.history_index = index
@@ -356,7 +360,7 @@ class DocumentPane(QWidget):
                     return key
         return None
 
-    def with_link(self, position, callback):
+    def with_link(self, position, callback, *, needed=None):
         page, x, y = position
         if page in self.links:
             callback(next((link for link in self.links[page] if self.check_hit(link["box"], x, y)), None))
@@ -365,11 +369,12 @@ class DocumentPane(QWidget):
         def loaded(value, error):
             if value is not None:
                 self.links[page] = value
-                self.with_link(position, callback)
-            else:
+                if needed is None or needed():
+                    self.with_link(position, callback)
+            elif needed is None or needed():
                 callback(None)
 
-        self.document.request("page_links", (page,), loaded, priority=-1)
+        self.document.request("page_links", (page,), loaded, priority=-1, needed=needed)
 
     def clicked(self, index, x, y):
         if self.document.loading:
@@ -384,15 +389,47 @@ class DocumentPane(QWidget):
         self.view.viewport().update()
         self.notes.set_selection(None)
 
+        revision = self.view.input_revision
+        generation = self.document.generation
+        location = self.view.location()
+
+        def still_current():
+            return (isValid(self) and self.isVisible() and not self.document.loading and not self.document.disposed
+                    and self.document.generation == generation and self.view.input_revision == revision
+                    and self.view.location() == location)
+
         def open_link(link):
-            if link and "page" in link:
+            if not still_current():
+                return
+            if link is None:
+                self.document.resolve_citation(
+                    position, lambda citation, targets: self.open_citation(position, citation, targets, still_current),
+                    still_current,
+                )
+            elif "page" in link:
                 self.navigate(link["page"], *link["point"])
-            elif link:
+            else:
                 url = QUrl(link["uri"])
                 if url.scheme() in ("http", "https") and not QDesktopServices.openUrl(url):
                     self.message.emit(self.t("ブラウザーを開けませんでした。", "Could not open the browser."))
 
-        self.with_link(position, open_link)
+        self.with_link(position, open_link, needed=still_current)
+
+    def open_citation(self, position, citation, targets, still_current):
+        def visit(entry):
+            if still_current():
+                self.navigate(entry.page, entry.box[0], entry.box[1] - 6)
+
+        if len(citation.keys) == len(targets) == 1:
+            visit(targets[0])
+            return
+        menu = QMenu(self)
+        menu.setAccessibleName(self.t("参考文献へ移動", "Go to reference"))
+        for entry in targets:
+            menu.addAction(entry.label.replace("&", "&&"), lambda target=entry: visit(target))
+        menu.aboutToHide.connect(menu.deleteLater)
+        page, x, y = position
+        menu.popup(self.view.viewport().mapToGlobal(self.view._project(page, (x, y)).toPoint()))
 
     def context_menu(self, point, position=None):
         def show(link):
@@ -483,7 +520,7 @@ class DocumentPane(QWidget):
         def translate(choices):
             selection = choices[0]
             if not selection.source.strip() or not selection.quads:
-                self.message.emit(self.t("除外後の原文が空です。「翻訳…」で範囲を確認してください。",
+                self.message.emit(self.t("翻訳する文章が残っていません。「翻訳…」で選択範囲と除外した箇所を確認してください。",
                                          "The filtered selection is empty. Review it with Translate…."))
                 return
             try:
@@ -520,8 +557,13 @@ class DocumentPane(QWidget):
             return
         if name == "notes" and not shown:
             self.notes.commit_selected()
+        previous = not self.sidebar.isHidden()
+        panel_visible = shown or not (self.outline if name == "notes" else self.notes).isHidden()
+        if previous != panel_visible and self.view.pages:
+            if location := self.view.location():
+                self.view.preserve_content_anchor(location)
         child.setVisible(shown)
-        self.sidebar.setVisible(not (self.outline.isHidden() and self.notes.isHidden()))
+        self.sidebar.setVisible(panel_visible)
         if shown and name == "notes":
             self.notes.layout_cards()
         self.location_changed.emit()
@@ -599,7 +641,7 @@ class DocumentPane(QWidget):
             self.message.emit(self.t("設定で翻訳モデルを選んでください。",
                                      "Choose a translation model in Preferences."))
             return
-        empty = self.t("一部の注釈から翻訳する文字を取得できませんでした。",
+        empty = self.t("選択した注釈の一部に、翻訳できるテキストがありません。",
                        "No translatable text was found in some selected annotations.")
         for targets in groups:
             self.document.translate_highlights(targets, profile, languages, empty)

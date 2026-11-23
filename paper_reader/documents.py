@@ -121,6 +121,9 @@ class Document(QObject):
         self.annotation_reads = {}
         self.resizing_notes = set()
         self.source_pending = {}
+        self.reference_waiters = []
+        self.reference_scan = None
+        self.references_ready = False
         self.streaming_keys = set()
         self.streaming_timer = QTimer(self, singleShot=True, interval=34)
         self.streaming_timer.timeout.connect(self.flush_job_updates)
@@ -160,6 +163,9 @@ class Document(QObject):
         if self.loading or self.disposed:
             return
         self.loading = True
+        self.reference_waiters.clear()
+        self.reference_scan = None
+        self.references_ready = False
         self.changed.emit()
         command = "reload" if reload else "open"
         args = (password,) if reload else (str(self.path), password or "")
@@ -213,6 +219,53 @@ class Document(QObject):
             self.rules_generation += 1
             self.request("update_rules", (self.rules,), lambda *_: None, priority=-9)
             self.changed.emit()
+
+    def resolve_citation(self, position, callback, needed):
+        def targets(citation):
+            self.request("reference_targets", (position, citation.keys),
+                         lambda result, error: callback(citation, result) if result and needed() else None,
+                         priority=2, needed=needed)
+
+        def found(citation, error):
+            if citation is None or not needed():
+                return
+            if self.references_ready:
+                targets(citation)
+                return
+            self.reference_waiters[:] = [waiter for waiter in self.reference_waiters if waiter[2]()]
+            self.reference_waiters.append((citation, targets, needed))
+            if self.reference_scan is None:
+                self.scan_references()
+
+        self.request("citation_at", position, found, priority=2, needed=needed)
+
+    def scan_references(self):
+        scan = self.reference_scan = object()
+
+        def advance():
+            if self.reference_scan is not scan or self.disposed or self.loading:
+                return
+            self.reference_waiters[:] = [waiter for waiter in self.reference_waiters if waiter[2]()]
+            if not self.reference_waiters:
+                self.reference_scan = None
+                return
+            self.request("reference_step", (), completed, priority=11)
+
+        def completed(done, error):
+            if self.reference_scan is not scan:
+                return
+            if done is False:
+                QTimer.singleShot(0, self, advance)
+                return
+            self.reference_scan = None
+            self.references_ready = done is True
+            waiters, self.reference_waiters = self.reference_waiters, []
+            if self.references_ready:
+                for citation, resolve, needed in waiters:
+                    if needed():
+                        resolve(citation)
+
+        advance()
 
     def load_notes(self, indices=None):
         pages = iter(range(len(self.info["pages"])) if indices is None else sorted(indices))
@@ -532,11 +585,11 @@ class Document(QObject):
                 self.input_error.emit(error)
             elif result and result.get("signature_blocked"):
                 self.input_error.emit(settings.tr_text(
-                    "元の PDF の電子署名を保護するため，上書きできません．名前を付けて保存してください．",
+                    "電子署名を保護するため、この PDF は上書きできません。別のファイルに保存してください。",
                     "To protect the PDF's digital signature, save the changes to a different file."))
             elif confirmation and not on_signature_loss:
                 self.input_error.emit(settings.tr_text(
-                    "別名保存すると電子署名の検証に影響する可能性があります．",
+                    "別のファイルに保存すると、電子署名の検証に影響する可能性があります。",
                     "Saving a copy may affect validation of the digital signature."))
             elif overwrite and okay:
                 self.stamp, self.saved_revision = result["stamp"], result["state"]
@@ -554,6 +607,8 @@ class Document(QObject):
                      saved, priority=-4)
 
     def dispose(self):
+        self.reference_waiters.clear()
+        self.reference_scan = None
         self.disposed = True
         self.auto_save.stop()
         self.translation_sources.clear()

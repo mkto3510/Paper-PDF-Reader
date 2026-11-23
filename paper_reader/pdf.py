@@ -16,8 +16,9 @@ import pymupdf as mu
 
 from .analysis_rules import DEFAULT_RULES, classify, page_evidence
 from .artifacts import artifact_glyphs
+from .citations import ReferenceIndex, citation_at
 from .search import find_page
-from .selection import Glyph, Line, bounds, correct_stream_order, edge_band, furniture_key, reading_regions, select
+from .selection import Glyph, Line, bounds, correct_stream_order, edge_band, furniture_key, reading_order, reading_regions, select
 
 
 _SPACING_ACCENTS = {"´": "\u0301", "ˆ": "\u0302", "˜": "\u0303",
@@ -61,6 +62,7 @@ class PdfEngine:
         self.history = []
         self.state_ids = count(1)
         self.saved_revision = 0
+        self.references = None
 
     def open(self, filename: str, password: str = ""):
         path = Path(filename).resolve(strict=True)
@@ -100,6 +102,7 @@ class PdfEngine:
                 snapshot.unlink(missing_ok=True)
 
     def close(self):
+        self.references = None
         self.display_lists.clear()
         if self.analysis_doc is not None:
             self.analysis_doc.close()
@@ -169,6 +172,36 @@ class PdfEngine:
             if link["kind"] == mu.LINK_URI:
                 result.append({"box": tuple(link["from"]), "uri": link.get("uri", "")})
         return result
+
+    def citation_at(self, page, x, y):
+        return citation_at(self.text(page), x, y)
+
+    def reference_step(self):
+        if self.references is None:
+            self.references = ReferenceIndex(self.doc.page_count)
+        if self.references.complete:
+            return True
+        index = self.references.next_page
+        page = self._analysis_page(index)
+        # The index is independent of translation exclusions. Read one page
+        # without computing glyph quads or probing headers on nearby pages.
+        blocks = page.get_text("dict", flags=mu.TEXTFLAGS_DICT & ~mu.TEXT_PRESERVE_IMAGES)["blocks"]
+        lines = []
+        for block_index, block in enumerate(blocks):
+            for line in block.get("lines", ()):
+                spans = line["spans"]
+                text = "".join(span["text"] for span in spans).strip()
+                if text:
+                    box = tuple(line["bbox"])
+                    lines.append(Line((Glyph(text, box, ()),), box, max(span["size"] for span in spans),
+                                      line["wmode"] == 0 and abs(line["dir"][1]) < .15, block_index))
+        width = page.rect.height if page.rotation in (90, 270) else page.rect.width
+        rows = [(line, tuple(mu.Rect(line.box) * page.rotation_matrix)) for line in reading_order(lines, width)]
+        self.references.add_page(index, rows)
+        return self.references.complete
+
+    def reference_targets(self, position, keys):
+        return self.references.targets(position, keys) if self.references and self.references.complete else ()
 
     def properties(self):
         return dict(self.doc.metadata or {}) | {"filename": str(self.path), "size": self.path.stat().st_size,
