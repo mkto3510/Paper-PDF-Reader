@@ -79,6 +79,19 @@ def make_pdf(path):
         doc.save(path)
 
 
+def replace_external_file(source, target, wait):
+    def attempt():
+        try:
+            os.replace(source, target)
+        except PermissionError as error:
+            if getattr(error, "winerror", None) not in (5, 32, 33):
+                raise
+            return False
+        return True
+
+    wait(attempt, f"The external file {target.name} remained locked")
+
+
 def main():
     import pymupdf as mu
     from PySide6.QtCore import QLockFile, QPoint, QPointF, QTimer, Qt
@@ -105,7 +118,7 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", 0), LocalTranslation)
     Thread(target=server.serve_forever, daemon=True).start()
     with TemporaryDirectory() as folder:
-        root = Path(folder)
+        root = Path(folder).resolve()
         path = root / "試験用.pdf"
         make_pdf(path)
         engine = PdfEngine()
@@ -231,7 +244,7 @@ def main():
             with mu.open(path) as external:
                 external.new_page()
                 external.save(replaced_path)
-            os.replace(replaced_path, path)
+            replace_external_file(replaced_path, path, wait)
             wait(lambda: doc.generation > generation, "External replacement did not reload")
             assert second.view.generation == view.generation and len(view.pages) == 7
             restored = second.view.location()
@@ -266,7 +279,7 @@ def main():
             with mu.open(path) as external:
                 external.set_metadata(external.metadata | {"title": "Externally updated PDF"})
                 external.save(replaced_path)
-            os.replace(replaced_path, path)
+            replace_external_file(replaced_path, path, wait)
             wait(lambda: doc.external, "Edited document did not report an external update")
             assert doc.generation == generation and doc.dirty
             copy = root / "external-update-copy.pdf"

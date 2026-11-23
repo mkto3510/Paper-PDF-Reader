@@ -265,9 +265,12 @@ def exercise(app, folder, count):
         wait(lambda: doc.get_note(second) is None, "Delete from the PDF view did not remove the highlight")
         assert clone.document.get_note(first) is None and clone.document.get_note(second) is None
         result = []
+        errors = []
+        doc.input_error.connect(errors.append)
+        wait(lambda: not doc.busy, "Delete operations did not finish before saving")
         doc.save(callback=result.append)
         wait(lambda: result, "The edited test PDF was not saved")
-        assert result == [True]
+        assert result == [True], (errors, doc.dirty, doc.external)
         pane.show_sidebar("notes", False)
         failed = Job(None, None)
         failed.set_state("failed", error="test failure")
@@ -287,7 +290,7 @@ def main():
         app.styleHints().setColorScheme(Qt.ColorScheme.Light)
     for count in (200, 500):
         with TemporaryDirectory() as folder:
-            exercise(app, Path(folder), count)
+            exercise(app, Path(folder).resolve(), count)
     print("PASS chrome and annotation regressions")
 
 

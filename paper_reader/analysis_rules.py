@@ -8,6 +8,7 @@ from difflib import SequenceMatcher
 import re
 from statistics import median
 
+from .captions import classify_captions
 from .selection import bounds, edge_band, furniture_key
 
 
@@ -25,18 +26,11 @@ LABELS = {
     "code": ("コード・アルゴリズム", "Code and algorithms"), "ruby": ("ルビ", "Ruby"),
     "line_number": ("査読用行番号", "Line numbers"), "artifact": ("装飾タグ", "PDF artifacts"),
 }
-CAPTION = re.compile(
-    r"^(?:(?:fig(?:ure)?|table|algorithm|abbildung|tabelle|tabla|figure|tableau)\.?\s*\d+"
-    r"(?:\s*[.：:．|]\s*|(?=\s+\w))|第?\s*[０-９\d]*\s*[図表]\s*[０-９\d]+\s*[.：:．]?)",
-    re.I,
-)
 NUMBER = re.compile(r"[-–—―\s]*([0-9０-９]+)[-–—―\s]*$")
 MATH = re.compile(r"[=∑∫√≤≥±∂∇]|(?<=\s)\(\d+[a-z]?\)\s*$")
 ENGLISH_WORD = re.compile(r"[A-Za-z]{3,}")
 CJK_WORD = re.compile(r"[぀-ヿ㐀-鿿]")
 EQUATION_NUMBER = re.compile(r"[(（]\d+(?:[.\-]\d+)*[a-z]?[)）][,.]?")
-CAPTION_REFERENCE = re.compile(r"^(?:shows?|illustrates?|presents?|gives?|lists?|provides?|summari[sz]es?|"
-                               r"indicates?|reports?|compares?)\b|^[a-z]\s*[\])]|^(?:で|に|は|を|の|から)", re.I)
 CODE = re.compile(r"^\s*(?:\d+[:.)]\s*)?(?:if|else|for|while|return|end|function|def|procedure)\b|[{};]|←|:=")
 MARGINAL = re.compile(r"^(?:section|exercise|example|remark|note|節|演習|例)\s*[\d.]+", re.I)
 
@@ -140,11 +134,12 @@ def classify(lines, width, height, neighbours, evidence, options, regions=()):
     size = sizes.most_common(1)[0][0] if sizes else median(line.size for line in lines)
     # A journal can use larger type for the abstract than for the entire main text.
     # Estimate the type size in each geometric region from nearby prose, not math or labels.
-    line_sizes, prose = {}, set()
+    _, caption_ids, body_ids = classify_captions(lines, regions, evidence, width, height)
+    line_sizes, prose = {}, set(body_ids)
     for region in regions:
         regular = [line for line in region if line.horizontal != vertical_body
                    and line.box[2] - line.box[0] >= width * .23
-                   and not edge_band(line, height, edge_fraction) and not CAPTION.match(line.text.strip())]
+                   and not edge_band(line, height, edge_fraction) and id(line) not in caption_ids]
         if not regular:
             continue
         for line in region:
@@ -241,7 +236,6 @@ def classify(lines, width, height, neighbours, evidence, options, regions=()):
         if len(enclosed) >= 2 and sum(bool(CODE.search(line.text)) for line in enclosed) >= 2:
             code.update(id(line) for line in enclosed)
     ordered = sorted(lines, key=lambda line: (line.box[1], line.box[0]))
-    captions = {}
     equation = None
     result = {}
     body_lines = []
@@ -250,25 +244,15 @@ def classify(lines, width, height, neighbours, evidence, options, regions=()):
         side = edge_band(line, height, edge_fraction)
         kind = ""
         local_size = line_sizes.get(id(line), size)
-        continuation_of_caption = next((caption for caption in captions.values()
-                                        if abs(line.box[0] - caption.box[0]) < 25
-                                        and abs(line.size - caption.size) <= size * .07
-                                        and (line.paragraph == caption.paragraph or caption.size < size * .94)
-                                        and line.box[1] - caption.box[1] > caption.size * .35
-                                        and (-max(2, caption.size * .7) if line.paragraph == caption.paragraph else -2)
-                                        <= line.box[1] - caption.box[3] < max(3, size * .55)), None)
         if side and (_similar_edge(line, side, furniture_key(text), neighbours, height)
                      or NUMBER.fullmatch(text) or re.match(r"^(?:https?://doi\.org/|doi\s*:)", text, re.I)):
             kind = "furniture"
         elif id(line) in numbers:
             kind = "line_number"
-        elif (caption_start := CAPTION.match(text)) and not CAPTION_REFERENCE.match(text[caption_start.end():].strip()):
+        elif id(line) in body_ids:
+            kind = ""
+        elif id(line) in caption_ids:
             kind = "caption"
-            captions[line.paragraph] = line
-        elif continuation_of_caption is not None:
-            kind = "caption"
-            captions.pop(continuation_of_caption.paragraph)
-            captions[line.paragraph] = line
         elif id(line) in code:
             kind = "code"
         elif id(line) in equations and not any(inside(line.box, region) for region in figures):

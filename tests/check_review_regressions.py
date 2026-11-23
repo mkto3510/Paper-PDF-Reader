@@ -6,7 +6,6 @@ from multiprocessing import freeze_support
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
-import os
 import sys
 
 import pymupdf as mu
@@ -15,6 +14,7 @@ from PySide6.QtWidgets import QApplication
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from check_chrome_notes import wait
+from check_reader import replace_external_file
 from paper_reader.application import Application
 from paper_reader.dialogs import TranslationDialog
 
@@ -96,7 +96,7 @@ def check_comments(control, root, profile):
     replacement = root / "replacement.pdf"
     make_pdf(replacement, "External change")
     generation = doc.generation
-    os.replace(replacement, source)
+    replace_external_file(replacement, source, wait)
     wait(lambda: doc.external, "External changes did not protect the editor draft")
     assert doc.generation == generation and not doc.loading
     assert editor.toPlainText() == "Uncommitted draft in another window"

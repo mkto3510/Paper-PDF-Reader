@@ -201,5 +201,5 @@ if __name__ == "__main__":
     assert dialog_corner(secondary, QSize(480, 360), QPoint(-1300, -260)) == secondary.topLeft()
     app = QApplication([])
     with TemporaryDirectory() as work:
-        check_window(app, Path(work))
+        check_window(app, Path(work).resolve())
     print("PASS stream order, geometry, translated sources, toolbar and guarded saving")

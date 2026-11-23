@@ -121,9 +121,9 @@ class Document(QObject):
         self.annotation_reads = {}
         self.resizing_notes = set()
         self.source_pending = {}
-        self.reference_waiters = []
-        self.reference_scan = None
-        self.references_ready = False
+        self.reference_waiters = {}
+        self.reference_scans = {}
+        self.references_ready = set()
         self.streaming_keys = set()
         self.streaming_timer = QTimer(self, singleShot=True, interval=34)
         self.streaming_timer.timeout.connect(self.flush_job_updates)
@@ -164,8 +164,8 @@ class Document(QObject):
             return
         self.loading = True
         self.reference_waiters.clear()
-        self.reference_scan = None
-        self.references_ready = False
+        self.reference_scans.clear()
+        self.references_ready.clear()
         self.changed.emit()
         command = "reload" if reload else "open"
         args = (password,) if reload else (str(self.path), password or "")
@@ -220,50 +220,67 @@ class Document(QObject):
             self.request("update_rules", (self.rules,), lambda *_: None, priority=-9)
             self.changed.emit()
 
-    def resolve_citation(self, position, callback, needed):
+    @property
+    def reference_scan(self):
+        return self.reference_scans.get("reference")
+
+    def resolve_citation(self, position, callback, needed, started=None):
         def targets(citation):
-            self.request("reference_targets", (position, citation.keys),
-                         lambda result, error: callback(citation, result) if result and needed() else None,
+            self.request(f"{citation.kind}_targets", (position, citation.keys, True),
+                         lambda result, error: callback(citation, result or ()) if needed() else None,
                          priority=2, needed=needed)
 
         def found(citation, error):
-            if citation is None or not needed():
+            if not needed():
                 return
-            if self.references_ready:
+            if citation is None:
+                callback(None, ())
+                return
+            if started is not None:
+                started()
+            kind = citation.kind
+            if kind in self.references_ready:
                 targets(citation)
                 return
-            self.reference_waiters[:] = [waiter for waiter in self.reference_waiters if waiter[2]()]
-            self.reference_waiters.append((citation, targets, needed))
-            if self.reference_scan is None:
-                self.scan_references()
+            waiters = self.reference_waiters.setdefault(kind, [])
+            waiters[:] = [waiter for waiter in waiters if waiter[2]()]
+            waiters.append((citation, targets, needed, callback))
+            if kind not in self.reference_scans:
+                self.scan_references(kind)
 
         self.request("citation_at", position, found, priority=2, needed=needed)
 
-    def scan_references(self):
-        scan = self.reference_scan = object()
+    def scan_references(self, kind):
+        scan = self.reference_scans[kind] = object()
+
+        def active():
+            return (self.reference_scans.get(kind) is scan and not self.disposed and not self.loading
+                    and any(needed() for _, _, needed, _ in self.reference_waiters.get(kind, ())))
 
         def advance():
-            if self.reference_scan is not scan or self.disposed or self.loading:
+            if self.reference_scans.get(kind) is not scan:
                 return
-            self.reference_waiters[:] = [waiter for waiter in self.reference_waiters if waiter[2]()]
-            if not self.reference_waiters:
-                self.reference_scan = None
+            if not active():
+                completed(None, None)
                 return
-            self.request("reference_step", (), completed, priority=11)
+            self.request(f"{kind}_step", (), completed, priority=8, needed=active)
 
         def completed(done, error):
-            if self.reference_scan is not scan:
+            if self.reference_scans.get(kind) is not scan:
                 return
             if done is False:
                 QTimer.singleShot(0, self, advance)
                 return
-            self.reference_scan = None
-            self.references_ready = done is True
-            waiters, self.reference_waiters = self.reference_waiters, []
-            if self.references_ready:
-                for citation, resolve, needed in waiters:
-                    if needed():
+            self.reference_scans.pop(kind)
+            waiters = self.reference_waiters.pop(kind, ())
+            if done is True:
+                self.references_ready.add(kind)
+            for citation, resolve, needed, callback in waiters:
+                if needed():
+                    if done is True:
                         resolve(citation)
+                    else:
+                        callback(citation, ())
 
         advance()
 
@@ -608,7 +625,7 @@ class Document(QObject):
 
     def dispose(self):
         self.reference_waiters.clear()
-        self.reference_scan = None
+        self.reference_scans.clear()
         self.disposed = True
         self.auto_save.stop()
         self.translation_sources.clear()

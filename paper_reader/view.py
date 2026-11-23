@@ -118,6 +118,9 @@ class PaperView(QAbstractScrollArea):
         self.search_results = {}
         self.current_match = None
         self.show_all_matches = False
+        self.navigation_target = None
+        self.navigation_timer = QTimer(self, singleShot=True, interval=3000)
+        self.navigation_timer.timeout.connect(lambda: self.show_navigation_target(None))
         self.content_box = None
         self.content_anchor = None
         self.anchor = self.pointer = None
@@ -129,6 +132,7 @@ class PaperView(QAbstractScrollArea):
         self.press_clicks = 1
         self.click_series = None
         self.input_revision = 0
+        self.viewport_revision = 0
         self.unit_anchor = None
         self.drag_point = None
         self.drag_scroll = QTimer(self, interval=35)
@@ -146,6 +150,7 @@ class PaperView(QAbstractScrollArea):
 
     def set_document(self, pages, generation=0, preserve=False):
         location = self.location() if preserve and self.pages else None
+        self.show_navigation_target(None)
         self.pages, self.generation = pages, generation
         self.page = min(self.page, len(pages) - 1) if pages and preserve else 0
         self.text_pending.clear()
@@ -223,6 +228,7 @@ class PaperView(QAbstractScrollArea):
 
     def scrollContentsBy(self, dx, dy):
         if dx or dy:
+            self.viewport_revision += 1
             self.cancel_click_series()
         if dy:
             self.direction = (0, 1 if dy < 0 else -1)
@@ -606,6 +612,13 @@ class PaperView(QAbstractScrollArea):
         if complete:
             self.location_changed.emit()
 
+    def show_navigation_target(self, target):
+        self.navigation_target = target
+        self.navigation_timer.stop()
+        if target:
+            self.navigation_timer.start()
+        self.viewport().update()
+
     def _paint_overlays(self, painter, page):
         painter.save()
         painter.setClipRect(self._page_rectangle(page))
@@ -662,6 +675,13 @@ class PaperView(QAbstractScrollArea):
                     rect = transform.mapRect(QRectF(*self._rect_args(box)))
                     painter.fillRect(QRectF(rect.topLeft() * self.zoom + origin, rect.size() * self.zoom),
                                      QColor(255, 143 if active else 220, 40, 145))
+        target = self.navigation_target
+        if target and target.page == page:
+            rect = transform.mapRect(QRectF(*self._rect_args(target.box)))
+            painter.setPen(QPen(QColor(40, 107, 202), 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(QRectF(rect.topLeft() * self.zoom + origin, rect.size() * self.zoom)
+                             .adjusted(-3, -2, 3, 2))
         painter.restore()
 
     def load_text(self, index, callback=None, *, interactive=False):

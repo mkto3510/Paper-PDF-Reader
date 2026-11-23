@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from urllib.parse import urlencode
 
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QElapsedTimer, QRectF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QSizePolicy, QSplitter,
@@ -15,7 +15,8 @@ from shiboken6 import isValid
 
 from .dialogs import TranslationDialog
 from .icons import icon, swatch
-from .notes import COLORS, Notes, color_menu
+from .notes import COLORS, Notes, add_color_actions, color_menu
+from .selection import bounds
 from .sidebar import WrappingOutline
 from .translation import chat_request
 from .view import PaperView
@@ -34,6 +35,12 @@ class DocumentPane(QWidget):
         self.preferences = window.preferences
         self.history = []
         self.history_index = -1
+        self.navigation_target = None
+        self.lookup = None
+        self.lookup_menu = None
+        self.lookup_clock = QElapsedTimer()
+        self.lookup_timer = QTimer(self, interval=30)
+        self.lookup_timer.timeout.connect(self.update_lookup)
         self.last_color = next(iter(COLORS))
         self.rules_generation = document.rules_generation
         self.links = {}
@@ -67,6 +74,11 @@ class DocumentPane(QWidget):
         self.splitter.setSizes([270, 850])
         self.view.location_changed.connect(self.location_changed)
         self.view.message.connect(self.message)
+        self.lookup_notice = QLabel(self.view.viewport())
+        self.lookup_notice.setStyleSheet("background: palette(window); color: palette(window-text); padding: 5px;")
+        self.lookup_notice.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.lookup_notice.move(8, 8)
+        self.lookup_notice.hide()
         self.view.clicked.connect(self.clicked)
         self.view.menu_requested.connect(self.context_menu)
         self.view.note_delete_requested.connect(self.delete_note)
@@ -153,6 +165,7 @@ class DocumentPane(QWidget):
     def on_document_changed(self):
         self.notes.setEnabled(not self.document.loading)
         if self.document.loading:
+            self.end_lookup()
             self.view.cancel_click_series()
             self.view.end_selection_gesture()
         if self.rules_generation != self.document.rules_generation:
@@ -164,6 +177,8 @@ class DocumentPane(QWidget):
         self.location_changed.emit()
 
     def on_loaded(self, preserve):
+        self.end_lookup()
+        self.navigation_target = None
         self.links.clear()
         self.history.clear()
         self.history_index = -1
@@ -215,12 +230,15 @@ class DocumentPane(QWidget):
         if self.view.highlight_drag and self.view.highlight_drag.key in keys:
             self.view.clear_selection()
 
-    def navigate(self, page, x=None, y=0):
+    def navigate(self, page, x=None, y=0, *, target=None):
         if not self.document.info or not 0 <= page < len(self.view.pages):
             return
-        before = self.view.location()
+        self.end_lookup()
+        before = self.view.location(), self.navigation_target
+        self.navigation_target = target
         self.view.go_to(page, y, x)
-        after = self.view.location()
+        self.view.show_navigation_target(target)
+        after = self.view.location(), target
         if before == after:
             return
         self.history = self.history[:self.history_index + 1]
@@ -233,12 +251,31 @@ class DocumentPane(QWidget):
     def back_forward(self, delta):
         index = self.history_index + delta
         if 0 <= index < len(self.history):
+            self.end_lookup()
             self.view.input_revision += 1
             self.view.cancel_click_series()
             if delta < 0 and self.history_index == len(self.history) - 1:
-                self.history[self.history_index] = self.view.location()
+                self.history[self.history_index] = self.view.location(), self.navigation_target
             self.history_index = index
-            self.view.restore(self.history[index])
+            position, self.navigation_target = self.history[index]
+            self.view.restore(position)
+            self.view.show_navigation_target(self.navigation_target)
+            self.location_changed.emit()
+
+    def visit_reference(self, entry):
+        box = entry.box
+        if entry.object_box:
+            combined = bounds((box, entry.object_box))
+            transform, _, _ = self.view._transform(entry.page)
+            projected = transform.mapRect(QRectF(*self.view._rect_args(combined)))
+            viewport = self.view.viewport()
+            if (projected.width() * self.view.zoom <= viewport.width() - 24
+                    and projected.height() * self.view.zoom <= viewport.height() - 24):
+                box = combined
+        transform, _, _ = self.view._transform(entry.page)
+        corner = transform.mapRect(QRectF(*self.view._rect_args(box))).topLeft()
+        first = transform.inverted()[0].map(corner)
+        self.navigate(entry.page, first.x(), first.y(), target=entry)
 
     def outline_clicked(self, item, column):
         index, point = item.data(0, ROLE)
@@ -376,7 +413,36 @@ class DocumentPane(QWidget):
 
         self.document.request("page_links", (page,), loaded, priority=-1, needed=needed)
 
+    def hideEvent(self, event):
+        self.end_lookup()
+        super().hideEvent(event)
+
+    def end_lookup(self):
+        self.lookup = None
+        self.lookup_timer.stop()
+        self.lookup_clock.invalidate()
+        self.lookup_notice.hide()
+        if self.lookup_menu is not None:
+            menu, self.lookup_menu = self.lookup_menu, None
+            menu.close()
+
+    def update_lookup(self):
+        if self.lookup is None or not self.lookup():
+            self.end_lookup()
+        elif self.lookup_clock.isValid():
+            elapsed = self.lookup_clock.elapsed()
+            if elapsed >= 10_000:
+                self.end_lookup()
+                self.message.emit(self.t("移動先の確認に時間がかかっています。もう一度クリックすると続きから確認します。",
+                                         "Looking up the destination timed out. Click again to resume."))
+            elif elapsed >= 150 and self.lookup_notice.isHidden():
+                self.lookup_notice.setText(self.t("移動先を確認しています…", "Looking up the destination…"))
+                self.lookup_notice.adjustSize()
+                self.lookup_notice.show()
+                self.lookup_notice.raise_()
+
     def clicked(self, index, x, y):
+        self.end_lookup()
         if self.document.loading:
             return
         position = index, x, y
@@ -390,13 +456,26 @@ class DocumentPane(QWidget):
         self.notes.set_selection(None)
 
         revision = self.view.input_revision
+        viewport_revision = self.view.viewport_revision
         generation = self.document.generation
         location = self.view.location()
 
         def still_current():
-            return (isValid(self) and self.isVisible() and not self.document.loading and not self.document.disposed
+            return (isValid(self) and self.lookup is still_current and self.isVisible()
+                    and not self.document.loading and not self.document.disposed
                     and self.document.generation == generation and self.view.input_revision == revision
-                    and self.view.location() == location)
+                    and self.view.viewport_revision == viewport_revision and self.view.location() == location)
+
+        def started():
+            self.lookup_clock.start()
+            self.lookup_timer.start()
+
+        def named_target(value, error, page, point):
+            if still_current():
+                if value:
+                    self.visit_reference(value)
+                else:
+                    self.navigate(page, *point)
 
         def open_link(link):
             if not still_current():
@@ -404,30 +483,58 @@ class DocumentPane(QWidget):
             if link is None:
                 self.document.resolve_citation(
                     position, lambda citation, targets: self.open_citation(position, citation, targets, still_current),
-                    still_current,
+                    still_current, started,
                 )
             elif "page" in link:
-                self.navigate(link["page"], *link["point"])
+                page, point = link["page"], link["point"]
+                if link.get("page_only"):
+                    started()
+                    self.document.request("named_figure_target", (position, page),
+                                          lambda value, error: named_target(value, error, page, point),
+                                          priority=2, needed=still_current)
+                else:
+                    self.navigate(page, *point)
             else:
+                self.end_lookup()
                 url = QUrl(link["uri"])
                 if url.scheme() in ("http", "https") and not QDesktopServices.openUrl(url):
                     self.message.emit(self.t("ブラウザーを開けませんでした。", "Could not open the browser."))
 
+        self.lookup = still_current
         self.with_link(position, open_link, needed=still_current)
 
     def open_citation(self, position, citation, targets, still_current):
+        if not any(targets):
+            self.end_lookup()
+            return
+        self.lookup_clock.invalidate()
+        self.lookup_notice.hide()
+
         def visit(entry):
             if still_current():
-                self.navigate(entry.page, entry.box[0], entry.box[1] - 6)
+                self.visit_reference(entry)
 
-        if len(citation.keys) == len(targets) == 1:
+        if len(citation.keys) == 1:
             visit(targets[0])
             return
-        menu = QMenu(self)
-        menu.setAccessibleName(self.t("参考文献へ移動", "Go to reference"))
-        for entry in targets:
-            menu.addAction(entry.label.replace("&", "&&"), lambda target=entry: visit(target))
-        menu.aboutToHide.connect(menu.deleteLater)
+        menu = self.lookup_menu = QMenu(self)
+        menu.setAccessibleName(self.t("移動先を選択", "Choose a destination"))
+        for key, entry in zip(citation.keys, targets):
+            if entry:
+                menu.addAction(entry.label.replace("&", "&&"), lambda target=entry: visit(target))
+            else:
+                label = str(key) if isinstance(key, int) else " ".join(key)
+                item = menu.addAction(self.t(f"{label} — 照合できません", f"{label} — No unique match"))
+                item.setEnabled(False)
+
+        def hidden():
+            if self.lookup_menu is menu:
+                self.lookup_menu = None
+                # Qt can hide a menu before delivering the selected action.
+                QTimer.singleShot(0, self, lambda: self.end_lookup() if self.lookup is still_current else None)
+            menu.deleteLater()
+
+        menu.aboutToHide.connect(hidden)
         page, x, y = position
         menu.popup(self.view.viewport().mapToGlobal(self.view._project(page, (x, y)).toPoint()))
 
@@ -445,12 +552,7 @@ class DocumentPane(QWidget):
                     ("translate", t("翻訳して注釈を追加", "Translate and add annotation"), self.translate_to_note),
                 ):
                     colors = menu.addMenu(icon(self, symbol), label)
-                    for shade, names in COLORS.items():
-                        action = colors.addAction(swatch(QColor(shade)), t(*names))
-                        action.setIconVisibleInMenu(True)
-                        action.setCheckable(True)
-                        action.setChecked(shade == self.last_color)
-                        action.triggered.connect(lambda _checked, color=shade, run=callback: run(color))
+                    add_color_actions(colors, t, callback)
                 menu.addAction(icon(self, "find"), t("文書内で検索", "Find in document"), self.find_selection)
                 menu.addAction(t("Google で検索", "Search Google"), self.google_selection)
                 menu.addSeparator()
