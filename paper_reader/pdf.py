@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 from tempfile import NamedTemporaryFile
+from time import sleep
 import unicodedata
 
 import pymupdf as mu
@@ -705,15 +706,28 @@ class PdfEngine:
             draft = Path(handle.name)
         try:
             self._write_draft(draft, incremental)
-            if overwrite:
-                self._check_original()
-            os.replace(draft, target)
+            self._replace_saved_file(draft, target, overwrite)
             if overwrite:
                 self.signature = _signature(self.path)
                 self.saved_revision = revision
             return {"stamp": self.signature, "state": revision}
         finally:
             draft.unlink(missing_ok=True)
+
+    def _replace_saved_file(self, draft, target, overwrite):
+        # A Windows file scanner can temporarily prevent atomic replacement.
+        # Check the source again after each wait so a concurrent edit is safe.
+        for delay in (0, .05, .1, .2, .4):
+            if delay:
+                sleep(delay)
+            if overwrite:
+                self._check_original()
+            try:
+                os.replace(draft, target)
+                return
+            except PermissionError as error:
+                if getattr(error, "winerror", None) not in (5, 32, 33) or delay == .4:
+                    raise
 
     def _write_draft(self, draft, incremental):
         # MuPDF may journal bookkeeping for xref streams during serialization.

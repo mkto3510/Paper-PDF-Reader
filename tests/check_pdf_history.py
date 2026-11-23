@@ -1,5 +1,6 @@
 """Exercise journal transactions and atomic PDF saves across history states."""
 
+import os
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -74,7 +75,18 @@ def check_history(root, *, object_streams):
                 raise AssertionError("Replacement failure was ignored")
         assert path.read_bytes() == saved_bytes
         assert engine.saved_revision == added["state"]
-        assert engine.save(str(backup), 1)["state"] == deleted["state"]
+        locked = PermissionError("File in use")
+        locked.winerror = 32
+        replace = os.replace
+
+        def release_lock(draft, target):
+            if replacement.call_count == 1:
+                raise locked
+            replace(draft, target)
+
+        with patch("paper_reader.pdf.os.replace", side_effect=release_lock) as replacement:
+            assert engine.save(str(backup), 1)["state"] == deleted["state"]
+            assert replacement.call_count == 2
         assert contents(path) == [[], []]
 
         restored = engine.move_history(False)
