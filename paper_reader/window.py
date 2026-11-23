@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import QEvent, QEventLoop, QSignalBlocker, QTimer, Qt
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
@@ -11,13 +13,26 @@ from PySide6.QtWidgets import (
 
 from . import APP_NAME
 from .chrome import MINIMUM_WIDTH, DocumentTabs, Header, TabList
-from .dialogs import AboutDialog, SettingsDialog
+from .dialogs import AboutDialog, SettingsDialog, ask
 from .icons import icon
 from .pane import DocumentPane
 from .view import ACTUAL_SIZE
 
 
+def tab_title(name):
+    """A file name as tab text; QTabBar would otherwise read a single "&" as a keyboard mnemonic."""
+    return name.replace("&", "&&")
+
+
 class Reader(QMainWindow):
+    def present(self):
+        """Bring the window to the front, un-minimizing it but keeping a maximized state."""
+        state = self.windowState()
+        if state & Qt.WindowState.WindowMinimized:
+            self.setWindowState(state & ~Qt.WindowState.WindowMinimized)
+        self.raise_()
+        self.activateWindow()
+
     def __init__(self, controller):
         super().__init__()
         self.controller = controller
@@ -168,7 +183,7 @@ class Reader(QMainWindow):
         self.action(file, "close", ("文書を閉じる", "Close document"), lambda: self.close_tabs([self.tabs.currentIndex()]), "Ctrl+W")
         self.action(file, "reload", ("再読み込み", "Reload"), self.reload, "Ctrl+R")
         self.action(file, "duplicate_tab", ("タブを複製", "Duplicate tab"), lambda: self.duplicate(False))
-        self.action(file, "duplicate_window", ("別ウインドウに複製", "Duplicate in new window"), lambda: self.duplicate(True))
+        self.action(file, "duplicate_window", ("別ウィンドウに複製", "Duplicate in new window"), lambda: self.duplicate(True))
         file.addSeparator()
         self.action(file, "save_as", ("名前を付けて保存…", "Save as…"), self.save_as, "Ctrl+Shift+S")
         self.action(file, "save", ("注釈を保存", "Save annotations"), self.save, "Ctrl+S")
@@ -245,7 +260,7 @@ class Reader(QMainWindow):
         for i in range(self.tabs.count()):
             doc = self.tabs.widget(i).document
             unsaved = doc.dirty or doc.mutating or doc in drafts
-            name = doc.path.name + (" *" if unsaved else "")
+            name = tab_title(doc.path.name) + (" *" if unsaved else "")
             if self.tabs.tabText(i) != name:
                 self.tabs.setTabText(i, name)
                 tabs_changed = True
@@ -273,7 +288,7 @@ class Reader(QMainWindow):
         unsaved = doc.dirty or doc.mutating or doc in drafts
         state = (self.t("保存中…", "Saving…") if doc.saving else
                  self.t("未保存の変更があります", "Unsaved changes") if unsaved else "")
-        self.set_document_title(state)
+        self.set_document_title(state, doc.path.name)
         for key, active in ((pane.view.layout_mode, True), ("continuous", pane.view.continuous),
                             ("rtl", pane.view.rtl), ("outline", not pane.outline.isHidden()),
                             ("notes", not pane.notes.isHidden())):
@@ -290,8 +305,8 @@ class Reader(QMainWindow):
         self.chrome.set_external(self.t("元の PDF が変更されました。別のファイルに保存するか、読み込み直してください。",
                                      "The PDF has changed on disk. Save a copy or reload.") if doc.external else "")
 
-    def set_document_title(self, state=""):
-        title = f"{APP_NAME} — {state}" if state else APP_NAME
+    def set_document_title(self, state="", name=""):
+        title = " — ".join(part for part in (name, APP_NAME, state) if part)
         if self.windowTitle() != title:
             self.setWindowTitle(title)
 
@@ -316,8 +331,7 @@ class Reader(QMainWindow):
             same = next((pane for pane in self.controller.panes() if pane.document is doc), None)
             if same:
                 same.window.tabs.setCurrentWidget(same)
-                same.window.raise_()
-                same.window.activateWindow()
+                same.window.present()
             elif doc not in self.opening and not doc.loading:
                 self.opening.add(doc)
                 self.load_document(doc)
@@ -330,8 +344,11 @@ class Reader(QMainWindow):
                 if doc.info is None:
                     self.controller.documents.remove(doc)
             elif info.get("password"):
-                value, ok = QInputDialog.getText(self, self.t("PDF のパスワード", "PDF password"),
-                                                 self.t("パスワード", "Password"), QLineEdit.EchoMode.Password)
+                box = self.input_box(self.t("PDF のパスワード", "PDF password"), self.t("パスワード", "Password"),
+                                     QInputDialog.InputMode.TextInput)
+                box.setTextEchoMode(QLineEdit.EchoMode.Password)
+                ok, value = box.exec(), box.textValue()
+                box.deleteLater()
                 if ok:
                     self.load_document(doc, reload, value)
                 else:
@@ -349,15 +366,17 @@ class Reader(QMainWindow):
         pane.message.connect(self.show_message)
         doc.drafts_changed.connect(pane.location_changed)
         self.chrome.search.addWidget(pane.search_panel)
-        index = self.tabs.addTab(pane, doc.path.name)
+        index = self.tabs.addTab(pane, tab_title(doc.path.name))
         self.tabs.setCurrentIndex(index)
         if self.pane is pane:
             pane.view.setFocus()
         self.update_status()
         return pane
 
-    def duplicate(self, new_window):
-        original = self.pane
+    def duplicate(self, new_window, index=None):
+        original = self.pane if index is None else self.tabs.widget(index)
+        if original is None or original.document.loading:
+            return
         window = self.controller.new_window() if new_window else self
         pane = window.add_tab(original.document)
         target, source = pane.view, original.view
@@ -375,12 +394,10 @@ class Reader(QMainWindow):
         index = bar.tabAt(point)
         if index < 0:
             return
-        self.tabs.setCurrentIndex(index)
-        if self.tabs.currentIndex() != index:
-            return
+        # The menu works on the tab that was clicked; it does not switch to it (and so never asks to save).
         menu = QMenu(self)
-        menu.addAction(self.t("タブを複製", "Duplicate tab"), lambda: self.duplicate(False))
-        menu.addAction(self.t("別ウインドウに複製", "Duplicate in new window"), lambda: self.duplicate(True))
+        menu.addAction(self.t("タブを複製", "Duplicate tab"), lambda: self.duplicate(False, index))
+        menu.addAction(self.t("別ウィンドウに複製", "Duplicate in new window"), lambda: self.duplicate(True, index))
         menu.addSeparator()
         count = self.tabs.count()
         for names, targets in (
@@ -394,14 +411,7 @@ class Reader(QMainWindow):
         menu.deleteLater()
 
     def error_text(self, message):
-        if self.language != "en":
-            return message
-        return {
-            "ページのある PDF を指定してください。": "Select a PDF containing pages.",
-            "注釈が見つかりません。": "Annotation not found.",
-            "別のアプリで PDF が変更されました。名前を付けて保存してください。":
-                "Another application changed the PDF. Save a copy.",
-        }.get(message, message)
+        return self.preferences.localize(message)
 
     def show_message(self, message):
         self.chrome.show_notice(self.error_text(message))
@@ -435,9 +445,11 @@ class Reader(QMainWindow):
         save.setEnabled((unsaved or bool(doc.saving)) and not doc.has_active_jobs)
         box.setDefaultButton(cancel)
         box.exec()
-        if box.clickedButton() is discard:
+        chosen = box.clickedButton()
+        box.deleteLater()
+        if chosen is discard:
             return True
-        if box.clickedButton() is not save:
+        if chosen is not save:
             return False
         return self.save_document(doc)
 
@@ -451,6 +463,7 @@ class Reader(QMainWindow):
         box.setDefaultButton(cancel)
         box.exec()
         chosen = box.clickedButton()
+        box.deleteLater()
         return chosen is keep or (chosen is save and self.save_document(doc))
 
     def save_document(self, doc, destination=None):
@@ -506,30 +519,42 @@ class Reader(QMainWindow):
 
         saved = write()
         if saved is None:
-            answer = QMessageBox.question(
+            confirmed = ask(
                 self, self.t("電子署名付き PDF", "Digitally signed PDF"),
                 self.t("別のファイルに保存すると、電子署名の検証に影響する可能性があります。保存しますか？",
                        "Saving this copy may affect validation of the digital signature. Save a copy?"),
-                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
+                self.t("保存", "Save"), self.t("キャンセル", "Cancel"),
             )
-            saved = answer == QMessageBox.StandardButton.Save and write(True)
+            saved = confirmed and write(True)
         if not saved:
             return False
+        if destination is not None and Path(destination).resolve() != Path(doc.path).resolve():
+            # A copy was written; the open document and its unsaved marker are unchanged.
+            self.show_message(self.t("コピーを保存しました。開いているのは元のファイルです。",
+                                     "Saved a copy. The open file is still the original."))
         return destination is not None or not self.controller.has_unsaved_changes(doc)
 
     def close_tabs(self, indices):
         panes = [pane for i in sorted(set(indices)) if (pane := self.tabs.widget(i))]
         surviving = set(self.controller.panes()) - set(panes)
         ending = {pane.document for pane in panes} - {pane.document for pane in surviving}
+        # Ask about every open translation first: "Keep editing" must cancel the whole close before
+        # "Save and continue" in the next prompt writes anything.
+        for pane in panes:
+            dialog = pane.annotation_dialog
+            if dialog and not dialog.confirm_close():
+                dialog.raise_()
+                dialog.activateWindow()
+                return False
         if any(not self.confirm_discard(doc) for doc in sorted(ending, key=lambda d: d.identifier)):
             return False
         with QSignalBlocker(self.tabs):
             for pane in panes:
                 if pane.document not in ending:
-                    pane.notes.commit_selected()
+                    # The document stays open elsewhere: keep every draft, not only the selected card's.
+                    pane.notes.commit_drafts()
                 if pane.annotation_dialog:
-                    pane.annotation_dialog.reject()
+                    pane.annotation_dialog.dismiss()
                 self.tabs.removeTab(self.tabs.indexOf(pane))
                 self.chrome.search.removeWidget(pane.search_panel)
                 pane.search_panel.deleteLater()
@@ -542,7 +567,10 @@ class Reader(QMainWindow):
         return True
 
     def closeEvent(self, event):
-        if self.opening or not self.close_tabs(range(self.tabs.count())):
+        if self.opening:
+            self.show_message(self.t("読み込み中です。", "A document is still loading."))
+            event.ignore()
+        elif not self.close_tabs(range(self.tabs.count())):
             event.ignore()
         else:
             self.controller.windows.remove(self)
@@ -585,10 +613,13 @@ class Reader(QMainWindow):
 
     def go_page(self):
         view = self.pane.view
-        page, ok = QInputDialog.getInt(self, self.t("ページへ移動", "Go to page"), self.t("ページ番号", "Page number"),
-                                       view.current_page() + 1, 1, len(view.pages))
-        if ok:
-            self.pane.navigate(page - 1)
+        box = self.input_box(self.t("ページへ移動", "Go to page"), self.t("ページ番号", "Page number"),
+                             QInputDialog.InputMode.IntInput)
+        box.setIntRange(1, len(view.pages))
+        box.setIntValue(view.current_page() + 1)
+        if box.exec():
+            self.pane.navigate(box.intValue() - 1)
+        box.deleteLater()
 
     def cycle_zoom(self):
         view = self.pane.view
@@ -596,9 +627,23 @@ class Reader(QMainWindow):
 
     def custom_zoom(self):
         view = self.pane.view
-        percent, ok = QInputDialog.getDouble(self, self.t("倍率", "Zoom"), "%", view.zoom / ACTUAL_SIZE * 100, 8.33, 6400, 2)
-        if ok:
-            view.set_zoom("custom", ACTUAL_SIZE * percent / 100)
+        box = self.input_box(self.t("倍率", "Zoom"), "%", QInputDialog.InputMode.DoubleInput)
+        box.setDoubleDecimals(2)
+        box.setDoubleRange(8.33, 6400)
+        box.setDoubleValue(view.zoom / ACTUAL_SIZE * 100)
+        if box.exec():
+            view.set_zoom("custom", ACTUAL_SIZE * box.doubleValue() / 100)
+        box.deleteLater()
+
+    def input_box(self, title, label, mode):
+        """An input dialog whose buttons follow the display language."""
+        box = QInputDialog(self)
+        box.setInputMode(mode)
+        box.setWindowTitle(title)
+        box.setLabelText(label)
+        box.setOkButtonText("OK")
+        box.setCancelButtonText(self.t("キャンセル", "Cancel"))
+        return box
 
     def properties(self):
         if not self.pane:
@@ -607,7 +652,7 @@ class Reader(QMainWindow):
 
         def ready(info, error):
             if error or not info:
-                self.show_error(error or "Could not read document properties.")
+                self.show_error(error or "文書のプロパティを読み取れませんでした。")
                 return
             dialog = QDialog(self)
             dialog.resize(560, 530)
@@ -662,7 +707,16 @@ class Reader(QMainWindow):
     def shortcuts(self):
         lines = [f"{action.text()}    {' / '.join(key.toString() for key in action.shortcuts())}"
                  for action, _ in self.actions.values() if action.shortcuts()]
-        lines.extend(("Ctrl+C", "Ctrl+A"))
+        lines.extend(f"{self.t(*names)}    {keys}" for names, keys in (
+            (("コピー（選択中の本文）", "Copy selected text"), "Ctrl+C"),
+            (("すべて選択（注釈一覧では注釈をすべて選択）", "Select all (all annotations in the list)"), "Ctrl+A"),
+            (("スクロール", "Scroll"), "↑ / ↓ / ← / →"),
+            (("ページ送り", "Page forward / back"), "PageDown / PageUp"),
+            (("選択の解除（注釈の編集中は、編集を保存済みの内容に戻す）",
+              "Clear the selection (while editing an annotation: revert to the saved comment)"), "Esc"),
+            (("コメントを保存（注釈の編集中・翻訳ウィンドウ）", "Save the comment (annotation editor and translation window)"),
+             "Ctrl+Enter"),
+        ))
         self.text_dialog(self.t("ショートカット", "Keyboard shortcuts"), "\n".join(lines))
 
     def about(self):

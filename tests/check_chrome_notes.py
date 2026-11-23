@@ -191,6 +191,58 @@ def check_chrome(window):
     assert not window.isMaximized()
 
 
+def check_card_editor(panel, key, doc):
+    """A selected card shows its whole comment, and Esc can be undone."""
+    card = panel.cards[key]
+    editor = card.editor
+    assert card.editing and editor.isVisible()
+    saved = doc.get_note(key)["comment"]
+    line_height = editor.fontMetrics().lineSpacing()
+
+    def lines():
+        return editor.document().documentLayout().documentSize().height()
+
+    short = editor.height()
+    assert short == card.editor_minimum
+    editor.setFocus()
+    editor.selectAll()
+    editor.insertPlainText("A medium comment that needs a few lines. " * 6)
+    wait(lambda: editor.height() > short, "The comment editor did not grow with a medium text")
+    assert editor.height() < max(card.editor_minimum, int(panel.viewport.height() * .7)), "The medium text hit the limit"
+    QTest.qWait(100)  # let the editor lay its text out at its final width
+    assert lines() * line_height <= editor.height(), (lines(), line_height, editor.height(), editor.width())
+    editor.selectAll()
+    editor.insertPlainText("A long translated comment that wraps in the narrow annotation list. " * 12)
+    limit = max(card.editor_minimum, int(panel.viewport.height() * .7))
+    wait(lambda: editor.height() > short, "The comment editor did not grow with its text")
+    assert editor.height() <= limit
+    QTest.qWait(100)
+    if editor.height() < limit:
+        assert lines() * line_height <= editor.height(), (lines(), line_height, editor.height())
+    wait(lambda: panel.heights[key] >= card.height() and card.geometry().height() == panel.heights[key],
+         "The card height did not follow the editor")
+    assert card.source.height() >= card.source.heightForWidth(card.source.width())
+    editor.selectAll()
+    editor.insertPlainText(saved)
+    wait(lambda: editor.height() == short, "The comment editor did not shrink back")
+    editor.document().setModified(False)
+
+    editor.selectAll()
+    editor.insertPlainText("Typed then reverted")
+    assert editor.document().isModified()
+    editor.window().activateWindow()
+    assert QTest.qWaitForWindowActive(editor.window()), "The annotation window is not active"
+    editor.setFocus()
+    QTest.keyClick(editor, Qt.Key.Key_Escape)  # the real shortcut, not a direct call
+    assert editor.toPlainText() == saved, editor.toPlainText()
+    assert not editor.document().isModified()
+    assert editor.hasFocus(), "Esc must leave the focus in the editor so Ctrl+Z works"
+    QTest.keyClick(editor, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+    assert editor.toPlainText() == "Typed then reverted" and editor.document().isModified()
+    card.cancel_edit()
+    assert editor.toPlainText() == saved and not editor.document().isModified()
+
+
 def exercise(app, folder, count):
     path = folder / f"{count}-annotations.pdf"
     make_annotated_pdf(path, count)
@@ -281,6 +333,7 @@ def exercise(app, folder, count):
         assert panel.cards[first].editor.toPlainText() == "Draft to preserve"
         panel.cards[first].commit_comment()
         wait(lambda: doc.get_note(first)["comment"] == "Draft to preserve", "The comment was not saved")
+        check_card_editor(panel, first, doc)
 
         active_filter = doc.get_note(first)["color"]
         panel.set_filter(active_filter, True)

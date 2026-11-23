@@ -125,7 +125,8 @@ def check_window(app, root, path):
                 wait(lambda: view.content_box, "Content bounds did not load")
             QTest.qWait(30)
             original = geometry()
-            assert window.windowTitle() == APP_NAME
+            title = f"{doc.path.name} — {APP_NAME}"
+            assert window.windowTitle() == title
             window.show_message("Translation failed. " * 20)
             app.processEvents()
             assert window.chrome.notice.isVisible() and window.chrome.notice.height() > 0
@@ -136,7 +137,7 @@ def check_window(app, root, path):
                 doc.changed.emit()
                 app.processEvents()
                 assert geometry() == original, mode
-                assert window.windowTitle() == (f"{APP_NAME} — {label}" if label else APP_NAME)
+                assert window.windowTitle() == (f"{title} — {label}" if label else title)
 
         view.restore((0, 300, 350))
         width = view.viewport().width()

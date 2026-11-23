@@ -55,8 +55,7 @@ class Application:
         active = self.app.activeWindow()
         window = active if isinstance(active, Reader) else (self.windows[-1] if self.windows else self.new_window())
         window.open_paths(paths)
-        window.raise_()
-        window.activateWindow()
+        window.present()
 
     def listen(self, name, lock):
         self.lock = lock
