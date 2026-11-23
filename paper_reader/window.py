@@ -10,14 +10,11 @@ from PySide6.QtWidgets import (
 )
 
 from . import APP_NAME
-from .chrome import DocumentTabs, Header, TabList
+from .chrome import MINIMUM_WIDTH, DocumentTabs, Header, TabList
 from .dialogs import AboutDialog, SettingsDialog
 from .icons import icon
 from .pane import DocumentPane
 from .view import ACTUAL_SIZE
-
-
-MINIMUM_WIDTH = 530
 
 
 class Reader(QMainWindow):
@@ -116,7 +113,7 @@ class Reader(QMainWindow):
 
     def action(self, menu, key, names, callback, shortcut="", required=True, check=False):
         action = QAction(self.t(*names), self)
-        symbols = {"open": "open", "page_previous": "page-up", "page_next": "page-down",
+        symbols = {"open": "open", "back": "back", "page_previous": "page-up", "page_next": "page-down",
                    "single": "single", "spread": "spread",
                    "width": "width", "fit": "fit", "left": "left", "right": "right",
                    "bigger": "zoom-in", "smaller": "zoom-out", "find": "find",
@@ -262,7 +259,6 @@ class Reader(QMainWindow):
         ready = bool(pane and pane.document.info and not pane.document.loading)
         failed = ready and any(job.state == "failed" for job in pane.document.jobs.values())
         self.view_menu.setTitle(self.t("表示", "View") + (" ●" if failed and pane.notes.isHidden() else ""))
-        self.setMinimumWidth(max(MINIMUM_WIDTH, self.chrome.menus.sizeHint().width()))
         for key, (action, required) in self.actions.items():
             action.setEnabled(not required or ready)
             if ready and key in ("copy", "translate", "find_selection", "google"):

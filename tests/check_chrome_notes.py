@@ -55,7 +55,8 @@ def check_menu(window, save_settings=False):
         menu = action.menu()
         QTest.mouseClick(menu_bar, Qt.MouseButton.LeftButton, pos=menu_bar.actionGeometry(action).center())
         assert menu.isVisible(), (key, item.text(), menu_bar.rect(), menu_bar.actionGeometry(action),
-                                  menu_bar.activeAction(), QApplication.activePopupWidget())
+                                  menu_bar.activeAction(), QApplication.activePopupWidget(), window.width(), window.minimumWidth(),
+                                  window.chrome.width(), menu_bar.sizeHint(), menu_bar.minimumSizeHint())
         QTest.keyClick(menu, Qt.Key.Key_Escape)
         assert not menu.isVisible()
     settings = window.actions["preferences"][0]
@@ -133,6 +134,9 @@ def check_chrome(window):
     check_menu(window)
     pane = window.pane
     pane.match_count.setText("10 / 148")
+    chrome = window.chrome
+    assert chrome.buttons["back"].defaultAction() is window.actions["back"][0]
+    assert not chrome.buttons["back"].icon().isNull() and not chrome.buttons["back"].isEnabled()
     for width in (530, 760, 1180, 1920):
         window.resize(width, 710)
         QTest.qWait(40)
@@ -142,11 +146,44 @@ def check_chrome(window):
         for left, right in zip(widgets, widgets[1:]):
             assert 0 <= right.x() - (left.x() + left.width()) <= 5
             assert right.isVisible()
-        assert window.chrome.page.isVisible() and window.chrome.zoom.isVisible()
+        visible = [chrome.controls[name] for group in chrome.GROUPS for name in group
+                   if chrome.controls[name].isVisible()]
+        if chrome.more.isVisible():
+            visible.append(chrome.more)
+        assert all(left.geometry().right() < right.geometry().left() for left, right in zip(visible, visible[1:]))
+        assert all(widget.parentWidget().rect().contains(widget.geometry()) for widget in visible)
+        assert chrome.page.isVisible() and chrome.zoom.isVisible() and chrome.buttons["back"].isVisible()
+        assert all(chrome.buttons[left].isVisible() == chrome.buttons[right].isVisible()
+                   for left, right in chrome.OVERFLOW_ORDER)
+        populated = sum(any(chrome.controls[name].isVisible() for name in group) for group in chrome.GROUPS)
+        assert sum(bar.isVisible() for bar in chrome.separators) == populated - 1
+        actions = chrome.overflow.actions()
+        assert [a for a in actions if not a.isSeparator()] == [
+            window.actions[name][0] for group in chrome.GROUPS for name in group if name in chrome.hidden_tools]
+        assert not any(a.isSeparator() and (i == 0 or i == len(actions) - 1 or actions[i - 1].isSeparator())
+                       for i, a in enumerate(actions))
     assert window.chrome.more.isHidden()
     window.resize(530, 710)
     QTest.qWait(40)
     assert window.chrome.more.isVisible()
+    window.resize(820, 710)
+    window.activateWindow()
+    pane.match_count.clear()
+    QTest.qWait(50)
+    original_hidden = len(chrome.hidden_tools)
+    pane.query.setFocus()
+    QTest.qWait(20)
+    assert pane.query.hasFocus()
+    measured_width = window.width()
+    pane.query.setText("preserved")
+    pane.search_timer.stop()
+    pane.match_count.setText("123456789 / 123456789")
+    QTest.qWait(60)
+    assert window.width() == measured_width and len(chrome.hidden_tools) > original_hidden and pane.query.hasFocus(), (
+        window.language, window.width(), window.minimumWidth(), original_hidden, chrome.hidden_tools,
+        pane.search_panel.minimumSizeHint(), pane.query.hasFocus())
+    assert pane.query.text() == "preserved"
+    pane.close_search()
     window.showMaximized()
     assert window.isMaximized()
     check_menu(window)

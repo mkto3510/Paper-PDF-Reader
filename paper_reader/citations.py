@@ -1,7 +1,7 @@
 """Find clickable references and index the bibliography with PDF coordinates."""
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 import unicodedata
 
@@ -62,6 +62,7 @@ class Citation:
     label: str
     keys: tuple[REFERENCE_KEY, ...]
     kind: str = "reference"
+    box: Box | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,10 +169,11 @@ def citation_at(lines, x, y):
 
         def hit(start, end):
             visible = [box for box in positions[start:end] if box is not None]
-            if not visible:
-                return False
-            x0, y0, x1, y1 = bounds(visible)
-            return x0 <= x <= x1 and y0 <= y <= y1
+            if visible:
+                box = bounds(visible)
+                if box[0] <= x <= box[2] and box[1] <= y <= box[3]:
+                    return box
+            return None
 
         normalized = "".join(text)
         figures = [(span, Citation(label, keys, "figure")) for span, label, keys in figure_mentions(normalized)]
@@ -180,14 +182,14 @@ def citation_at(lines, x, y):
             own_heading = caption_heading(line.text) if line.kind == "caption" else None
             own_label = figure_label(own_heading) if own_heading and own_heading.re is LABEL else None
             for (start, end), citation in figures:
-                if own_label not in citation.keys and hit(start, end):
-                    return citation
+                if own_label not in citation.keys and (box := hit(start, end)):
+                    return replace(citation, box=box)
         for (start, end), citation in citation_spans(normalized.translate(DASHES)):
-            if hit(start, end) and not any(a < end and start < b for (a, b), _ in figures):
+            if (box := hit(start, end)) and not any(a < end and start < b for (a, b), _ in figures):
                 # A reference with surrounding text is meaningful in a
                 # caption or table cell. A naked number in a cell is not.
                 if not within_object or re.search(r"[^\W\d_]", normalized[:start] + normalized[end:]):
-                    return citation
+                    return replace(citation, box=box)
     return None
 
 

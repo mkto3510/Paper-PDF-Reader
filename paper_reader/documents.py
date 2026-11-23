@@ -224,20 +224,18 @@ class Document(QObject):
     def reference_scan(self):
         return self.reference_scans.get("reference")
 
-    def resolve_citation(self, position, callback, needed, started=None):
+    def resolve_citation(self, position, callback, needed):
         def targets(citation):
             self.request(f"{citation.kind}_targets", (position, citation.keys, True),
-                         lambda result, error: callback(citation, result or ()) if needed() else None,
+                         lambda result, error: callback(citation, result or (), error) if needed() else None,
                          priority=2, needed=needed)
 
         def found(citation, error):
             if not needed():
                 return
             if citation is None:
-                callback(None, ())
+                callback(None, (), error)
                 return
-            if started is not None:
-                started()
             kind = citation.kind
             if kind in self.references_ready:
                 targets(citation)
@@ -280,7 +278,7 @@ class Document(QObject):
                     if done is True:
                         resolve(citation)
                     else:
-                        callback(citation, ())
+                        callback(citation, (), error)
 
         advance()
 

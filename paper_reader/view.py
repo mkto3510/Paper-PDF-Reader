@@ -80,6 +80,7 @@ class TileCache:
 
 class PaperView(QAbstractScrollArea):
     clicked = Signal(int, float, float)
+    hover_position = Signal(object)
     menu_requested = Signal(object, object)
     location_changed = Signal()
     message = Signal(str)
@@ -119,6 +120,7 @@ class PaperView(QAbstractScrollArea):
         self.current_match = None
         self.show_all_matches = False
         self.navigation_target = None
+        self.link_hover = None
         self.navigation_timer = QTimer(self, singleShot=True, interval=3000)
         self.navigation_timer.timeout.connect(lambda: self.show_navigation_target(None))
         self.content_box = None
@@ -146,6 +148,7 @@ class PaperView(QAbstractScrollArea):
         self.verticalScrollBar().setSingleStep(32)
         self.horizontalScrollBar().setSingleStep(32)
         self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
+        self.viewport().setMouseTracking(True)
         self.viewport().grabGesture(Qt.GestureType.PinchGesture)
 
     def set_document(self, pages, generation=0, preserve=False):
@@ -175,6 +178,7 @@ class PaperView(QAbstractScrollArea):
         return rotation, box.width(), box.height()
 
     def _layout(self):
+        self._invalidate_pointer_position()
         grouped = []
         index = 0
         while index < len(self.pages):
@@ -226,10 +230,14 @@ class PaperView(QAbstractScrollArea):
         self._layout()
         self.restore(anchor)
 
+    def _invalidate_pointer_position(self):
+        self.viewport_revision += 1
+        self.cancel_click_series()
+        self.hover_position.emit(None)
+
     def scrollContentsBy(self, dx, dy):
         if dx or dy:
-            self.viewport_revision += 1
-            self.cancel_click_series()
+            self._invalidate_pointer_position()
         if dy:
             self.direction = (0, 1 if dy < 0 else -1)
         elif dx:
@@ -259,6 +267,8 @@ class PaperView(QAbstractScrollArea):
         event.accept()
 
     def viewportEvent(self, event):
+        if event.type() == QEvent.Type.Leave:
+            self.hover_position.emit(None)
         if event.type() == QEvent.Type.Gesture:
             pinch = event.gesture(Qt.GestureType.PinchGesture)
             if pinch and pinch.lastScaleFactor():
@@ -517,17 +527,23 @@ class PaperView(QAbstractScrollArea):
         return tuple(tuple((a + b) / 2 for a, b in zip(top, bottom))
                      for top, bottom in ((first[0], first[2]), (last[1], last[3])))
 
+    def _highlight_handle_at(self, point):
+        if self.selected_note is not None:
+            page = self.selected_note[0]
+            if page in self.positions:
+                handles = self.highlight_handles(page)
+                if handles:
+                    distances = [(self._project(page, handle) - point).manhattanLength() for handle in handles]
+                    moving = min(range(len(handles)), key=distances.__getitem__)
+                    if distances[moving] <= 11:
+                        return page, handles, moving
+        return None
+
     def _start_highlight_drag(self, point):
-        if not self.selected_note:
+        hit = self._highlight_handle_at(point)
+        if hit is None:
             return False
-        page = self.selected_note[0]
-        handles = self.highlight_handles(page) if page in self.positions else ()
-        if not handles:
-            return False
-        distances = [(self._project(page, handle) - point).manhattanLength() for handle in handles]
-        moving = min(range(len(handles)), key=distances.__getitem__)
-        if distances[moving] > 11:
-            return False
+        page, handles, moving = hit
         self.clear_selection()
         drag = self.highlight_drag = HighlightDrag(self.selected_note, moving, point, point)
 
@@ -646,6 +662,18 @@ class PaperView(QAbstractScrollArea):
                     painter.drawPolygon(polygon)
         transform = self._transform(page)[0]
         origin = self._page_rectangle(page).topLeft()
+        if self.link_hover and self.link_hover[0] == page:
+            _, box, native = self.link_hover
+            rect = transform.mapRect(QRectF(*self._rect_args(box)))
+            projected = QRectF(rect.topLeft() * self.zoom + origin, rect.size() * self.zoom)
+            color = self.palette().link().color()
+            if native:
+                fill = QColor(color)
+                fill.setAlpha(38)
+                painter.fillRect(projected, fill)
+            painter.setPen(QPen(color, 1.25, Qt.PenStyle.SolidLine if native else Qt.PenStyle.DotLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(projected)
         if handles := self.highlight_handles(page):
             color = QColor(self.notes[page][self.selected_note]["color"])
             if drag and drag.key == self.selected_note and drag.preview:
@@ -773,8 +801,18 @@ class PaperView(QAbstractScrollArea):
 
         advance()
 
+    def show_link_hover(self, mark, tooltip=""):
+        if mark == self.link_hover and tooltip == self.viewport().toolTip():
+            return
+        self.link_hover = mark
+        self.viewport().setCursor(Qt.CursorShape.PointingHandCursor if mark and mark[2]
+                                  else Qt.CursorShape.IBeamCursor)
+        self.viewport().setToolTip(tooltip)
+        self.viewport().update()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
+            self.hover_position.emit(None)
             self.input_revision += 1
             self.cancel_click_series()
             self.end_selection_gesture()
@@ -790,6 +828,7 @@ class PaperView(QAbstractScrollArea):
             self.mousePressEvent(event)
 
     def start_left_press(self, point, double=False):
+        self.hover_position.emit(None)
         self.setFocus()
         if self._start_highlight_drag(point):
             return
@@ -826,7 +865,7 @@ class PaperView(QAbstractScrollArea):
 
     def hideEvent(self, event):
         self.input_revision += 1
-        self.cancel_click_series()
+        self._invalidate_pointer_position()
         self.end_selection_gesture()
         super().hideEvent(event)
 
@@ -868,7 +907,10 @@ class PaperView(QAbstractScrollArea):
         self._select_endpoints()
 
     def mouseMoveEvent(self, event):
-        if self.highlight_drag and event.buttons() & Qt.MouseButton.LeftButton:
+        if event.buttons() == Qt.MouseButton.NoButton:
+            point = event.position()
+            self.hover_position.emit(None if self._highlight_handle_at(point) else self._position(point))
+        elif self.highlight_drag and event.buttons() & Qt.MouseButton.LeftButton:
             drag = self.highlight_drag
             drag.point = event.position()
             if lines := self.text_cache.get(drag.key[0]):
