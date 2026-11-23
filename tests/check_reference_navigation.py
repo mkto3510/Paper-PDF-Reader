@@ -214,6 +214,126 @@ def check_two_column_table():
     assert {id(line) for line in lines[1:3]} == caption_rows and caption.object_box
 
 
+def scan_steps(engine, name="reference_step", budget_ms=None):
+    step, count = getattr(engine, name), 1
+    while not step(budget_ms):
+        count += 1
+    return count
+
+
+def check_scan_order(folder):
+    """The reference scan stops early, and figures near a mention resolve without the full scan."""
+    def build(name, pages, writer):
+        path = folder / name
+        with mu.open() as pdf:
+            for _ in range(pages):
+                pdf.new_page(width=612, height=780)
+            writer(pdf)
+            pdf.save(path)
+        return path
+
+    def bibliography(first, entries=4):
+        def write(pdf):
+            pdf[0].insert_text((55, 100), "A comparison [2] with the earlier results.")
+            for index in range(1, len(pdf) - 1):
+                pdf[index].insert_text((55, 100), "Ordinary body text without any structure.")
+            pdf[first].insert_text((55, 100), "References")
+            for number in range(1, entries + 1):
+                pdf[min(first + number // 3, len(pdf) - 1)].insert_text(
+                    (55, 130 + number * 25), f"[{number}] Author{number}, A. (2020). Title number {number}. Journal of Tests.")
+        return write
+
+    # A heading with entries ends the scan a page before the heading, long before page 0.
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(build("short.pdf", 12, bibliography(10))))
+        assert scan_steps(engine) <= 4 and engine.references.complete
+        point = (0, *click_point_in(engine, 0, "[2]"))
+        citation = engine.citation_at(*point)
+        assert engine.reference_targets(point, citation.keys)[0].label.startswith("[2]")
+        # A time budget reads several pages per call and reaches the same result.
+        engine.close()
+        engine.open(str(build("short.pdf", 12, bibliography(10))))
+        assert scan_steps(engine, budget_ms=500) == 1
+        assert engine.reference_targets(point, citation.keys)[0].label.startswith("[2]")
+
+        # A heading without entries behind it keeps the scan going to the first page.
+        engine.close()
+        engine.open(str(build("empty.pdf", 8, lambda pdf: pdf[7].insert_text((55, 100), "References"))))
+        assert scan_steps(engine) == 8
+
+        # A long document may hold a bibliography per chapter, so all its pages are read.
+        engine.close()
+        engine.open(str(build("long.pdf", 64, bibliography(62, 6))))
+        assert scan_steps(engine) == 64
+        assert len(engine.references.regions) == 1
+    finally:
+        engine.close()
+
+    # Japanese journals print the heading with a gap between its characters, each stored as a separate line.
+    def spaced(pdf):
+        pdf[0].insert_text((55, 100), "A comparison [2] with the earlier results.")
+        pdf[3].insert_text((300, 100), "文", fontname="japan")
+        pdf[3].insert_text((345, 100), "献", fontname="japan")
+        for number in range(1, 5):
+            pdf[3].insert_text((55, 130 + number * 25),
+                               f"[{number}] Author{number}, A. (2020). Title number {number}. Journal of Tests.")
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(build("spaced.pdf", 4, spaced)))
+        assert scan_steps(engine) <= 3
+        regions = engine.references.regions
+        assert len(regions) == 1 and regions[0][0][2] == "文 献" and len(regions[0][2]) == 4, regions
+    finally:
+        engine.close()
+
+    # Older journals number entries with a bare numeral. Ordinary lines starting with a number stay prose.
+    def bare(pdf):
+        pdf[0].insert_text((55, 100), "A comparison [3] with the earlier results.")
+        pdf[3].insert_text((55, 100), "References")
+        for number in range(1, 6):
+            pdf[3].insert_text((55, 110 + number * 25),
+                               f"{number} A. Author{number}, Title number {number}. Journal of Tests, 7 (1970) 12.")
+        pdf[3].insert_text((55, 300), "76 (1971) 7888 continues the previous entry.")
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(build("bare.pdf", 4, bare)))
+        scan_steps(engine)
+        point = (0, *click_point_in(engine, 0, "[3]"))
+        keys = engine.citation_at(*point).keys
+        target, = engine.reference_targets(point, keys)
+        assert keys == (3,) and target.label.startswith("3 A. Author3"), target
+    finally:
+        engine.close()
+
+    def figures(pdf):
+        pdf[1].insert_text((55, 100), "See Figure 7 for details.")
+        pdf[2].insert_text((55, 300), "Figure 7: A nearby example.")
+        pdf[4].insert_text((55, 100), "See Figure 8 for two cases.")
+        pdf[3].insert_text((55, 300), "Figure 8: The first case.")
+        pdf[5].insert_text((55, 300), "Figure 8: The second case.")
+        pdf[0].insert_text((55, 100), "See Figure 9 for a distant example.")
+        pdf[11].insert_text((55, 300), "Figure 9: A distant example.")
+
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(build("figures.pdf", 12, figures)))
+        for page, label, expected in ((1, "Figure 7", "Figure 7:"), (4, "Figure 8", None), (0, "Figure 9", None)):
+            point = (page, *click_point_in(engine, page, label))
+            citation = engine.citation_at(*point)
+            target, = engine.figure_nearby(point, citation.keys)
+            assert (target.label.startswith(expected) and target.page == 2) if expected else target is None, label
+        assert engine.figure_page == 0, "The nearby lookup read the whole document"
+    finally:
+        engine.close()
+
+
+def click_point_in(engine, page, text):
+    with mu.open(engine.temp) as pdf:
+        rect = pdf[page].search_for(text)[0]
+    return tuple(rect.tl + (rect.br - rect.tl) / 2)
+
+
 def check_window(app, folder, path):
     menu = QMenu()
     chosen = []
@@ -265,5 +385,6 @@ if __name__ == "__main__":
         check_named_coordinates(folder)
         check_unheaded_bibliography()
         check_two_column_table()
+        check_scan_order(folder)
         check_window(app, folder, path)
     print("PASS figure/table jumps, named links, captions, citation overlap, and color actions")

@@ -27,6 +27,9 @@ LEAD_IN = re.compile(r"^(?:see(?: also)?|e\.g\.,?|cf\.?)\s+", re.I)
 NUMBER_LABEL = rf"(?:\[({NUMBER})\]|({NUMBER})[.)])"
 NUMBER_ENTRY = re.compile(rf"^{NUMBER_LABEL}\s*(?=[^\W\d_])")
 SPLIT_NUMBER = re.compile(NUMBER_LABEL)
+# Some older journals number their entries with a bare numeral ("2 X. Le Pichon and ..."). That is only read as a
+# label inside a bibliography whose entries count upward, so ordinary lines that start with a number stay prose.
+BARE_ENTRY = re.compile(r"^(\d{1,3})\s+(?=[A-Z])")
 ENTRY_YEAR = re.compile(rf"(?<![\w/])({YEAR})(?![\w/])", re.I)
 END_YEAR = re.compile(rf"(?<![\w/-])({YEAR})[.,]?\s*$", re.I)
 AUTHOR_START = re.compile(rf"^{SURNAME}\s*,\s*(?:[^\W\d_]\.|[A-Z]{{2,3}}[,.\s])")
@@ -36,9 +39,16 @@ HEADING = re.compile(
 )
 END = re.compile(
     r"^(?:\d+(?:\.\d+)*[.)]?\s+)?(?:appendix(?:\s+(?:[a-z]|[ivx]+|\d+)(?:\s+\S.*)?)?"
-    r"|acknowledg[e]?ments?|supplementary (?:material|information)|付録(?:\s*(?:[a-z]|\d+)(?:\s+\S.*)?)?"
-    r"|謝辞)(?:\s*[:.].*)?$", re.I,
+    r"|acknowledg[e]?ments?|supplementary (?:material|information)|付\s*録(?:\s*(?:[a-z]|\d+)(?:\s+\S.*)?)?"
+    r"|謝\s*辞)(?:\s*[:.].*)?$", re.I,
 )
+# The reference scan starts at the last page. Once a bibliography heading has been read, it also reads this many
+# earlier pages (a heading can sit on a page that also holds the end of the text) and then stops.
+EARLY_STOP_MARGIN = 1
+# A longer document is treated as a book that may hold a bibliography per chapter, so every page is read.
+BOOK_PAGES = 60
+# Stopping early needs at least this many entries behind the heading.
+EARLY_STOP_ENTRIES = 3
 AUTHOR_END = re.compile(r"(?<=[^\W\d_]{2})\.\s+|\s*[「『“\"]")
 INITIAL = re.compile(r"(?:[^\W\d_]\.?|[A-Z]{2,3})")
 NAME_WORD = re.compile(r"[^\W\d_]+(?:[-'][^\W\d_]+)*")
@@ -237,10 +247,24 @@ def _entry_authors(text):
     return tuple(authors)
 
 
-def _entry_identity(text):
-    number_match = NUMBER_ENTRY.match(text)
-    number = int(number_match[1] or number_match[2]) if number_match else None
-    content = text[number_match.end():] if number_match else text
+def _entry_label(text, bare=False):
+    """Return (number, end) for an entry label at the start of text, or (None, 0)."""
+    match = NUMBER_ENTRY.match(text)
+    if match:
+        return int(match[1] or match[2]), match.end()
+    if bare and (match := BARE_ENTRY.match(text)):
+        return int(match[1]), match.end()
+    return None, 0
+
+
+def _bare_numbering(rows):
+    numbers = [int(match[1]) for row in rows if (match := BARE_ENTRY.match(row[2]))]
+    return sum(1 for a, b in zip(numbers, numbers[1:]) if b == a + 1) >= 3
+
+
+def _entry_identity(text, bare=False):
+    number, end = _entry_label(text, bare)
+    content = text[end:] if number is not None else text
     year = ENTRY_YEAR.search(content, 0, 210)
     lead, delimiter, remainder = content.partition(":")
     if delimiter and AUTHOR_START.match(lead):
@@ -284,6 +308,7 @@ class ReferenceIndex:
     def __init__(self, page_count, outline=()):
         self.next_page = page_count - 1
         self.page_count = page_count
+        self.head_page = None
         self.pages = {}
         self.regions = []
         self.chapters = sorted(page - 1 for depth, title, page, _ in outline
@@ -308,25 +333,47 @@ class ReferenceIndex:
                     continue
             positions.append((index, order, text, box, line.box, line.paragraph))
         self.pages[index] = positions
+        self.next_page = index - 1
         if index == 0:
             self._finish()
+        elif self._can_stop(index, positions):
+            # Everything after the heading has been read, and no earlier page is expected to add a bibliography.
             self.next_page = -1
-        else:
-            self.next_page = index - 1
 
-    def _finish(self):
+    def _can_stop(self, index, positions):
+        """Stop before page 0 once a headed bibliography is complete.
+
+        Scanning runs from the last page, so a heading found at page H closes the region that follows it.
+        Long documents may hold one bibliography per chapter and need every page. A heading alone does not
+        prove that a region has entries, so a failed build keeps scanning.
+        """
+        if any(HEADING.fullmatch(row[2]) and not self._contents_row(row) for row in positions):
+            self.head_page = index
+        if self.head_page is None or index > self.head_page - EARLY_STOP_MARGIN:
+            return False
+        if self.page_count > BOOK_PAGES:
+            return False
+        return self._finish(final=False)
+
+    def _finish(self, final=True):
         rows = [row for index in sorted(self.pages) for row in self.pages[index]]
         heads = [index for index, row in enumerate(rows)
                  if HEADING.fullmatch(row[2]) and not self._contents_row(row)]
+        before = len(self.regions)
         for index, head in enumerate(heads):
             stop = heads[index + 1] if index + 1 < len(heads) else len(rows)
             stop = next((end for end in range(head + 1, stop) if END.fullmatch(rows[end][2])), stop)
             section = rows[head + 1:stop]
             if section:
                 self._add_region(rows[head], section, self._entries(section))
-        if not heads:
+        if not heads and final:
             self._unheaded(rows)
+        if not final and sum(len(region[2]) for region in self.regions[before:]) < EARLY_STOP_ENTRIES:
+            # A heading without entries (a contents line, a sentence) is not a bibliography yet.
+            del self.regions[before:]
+            return False
         self.pages.clear()
+        return True
 
     def _contents_row(self, heading):
         # Books sometimes store each dotted contents row as two separate spans.
@@ -388,6 +435,7 @@ class ReferenceIndex:
     @staticmethod
     def _entries(rows):
         entries = []
+        bare = _bare_numbering(rows)
         for i, row in enumerate(rows):
             page, _, label, box, raw, _ = row
             if not label or END.fullmatch(label):
@@ -395,12 +443,14 @@ class ReferenceIndex:
             previous = rows[i - 1] if i else None
             hanging = previous and previous[0] == page and 3 < raw[0] - previous[4][0] < 30
             explicit_author_year = re.match(rf"^.{{1,120}}\({YEAR}\)\s*[:.]", label)
-            if hanging and not NUMBER_ENTRY.match(label) and not re.match(rf"^{SURNAME},", label) and not explicit_author_year:
+            if (hanging and _entry_label(label, bare)[0] is None and not re.match(rf"^{SURNAME},", label)
+                    and not explicit_author_year):
                 continue
             text = label
             last = row
             for subsequent in rows[i + 1:i + 13]:
-                if NUMBER_ENTRY.match(subsequent[2]) or HEADING.fullmatch(subsequent[2]) or END.fullmatch(subsequent[2]):
+                if (_entry_label(subsequent[2], bare)[0] is not None or HEADING.fullmatch(subsequent[2])
+                        or END.fullmatch(subsequent[2])):
                     break
                 indent = subsequent[4][0] - raw[0]
                 if abs(indent) < 3 and AUTHOR_START.match(subsequent[2]):
@@ -416,7 +466,7 @@ class ReferenceIndex:
                         break
                 text += " " + subsequent[2]
                 last = subsequent
-            number, authors, year, evidence = _entry_identity(text)
+            number, authors, year, evidence = _entry_identity(text, bare)
             if number is not None or (authors and year):
                 entries.append((number, authors, year, Reference(page, box, label[:110]), evidence))
         return entries

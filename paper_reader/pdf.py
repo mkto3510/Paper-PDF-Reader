@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import shutil
 from tempfile import NamedTemporaryFile
-from time import sleep
+from time import perf_counter, sleep
 import unicodedata
 
 import pymupdf as mu
@@ -22,6 +22,9 @@ from .citations import END, HEADING, Reference, ReferenceIndex, citation_at
 from .search import find_page
 from .selection import Glyph, Line, bounds, correct_stream_order, edge_band, furniture_key, reading_order, reading_regions, select
 
+
+# Pages on each side of a figure mention that figure_nearby reads before the full scan is needed.
+FIGURE_WINDOW = 6
 
 _SPACING_ACCENTS = {"´": "\u0301", "ˆ": "\u0302", "˜": "\u0303",
                     "¨": "\u0308", "¸": "\u0327", "ˇ": "\u030c", "˚": "\u030a"}
@@ -40,6 +43,46 @@ def _compose_accents(glyphs):
                 continue
         result.append(glyph)
     return tuple(result)
+
+
+def _join_spaced_headings(lines):
+    """Join letter-spaced headings that PDFs store as one line per character.
+
+    Japanese journals often print 文献 or 謝辞 with a wide gap between the characters, and MuPDF returns each
+    character as its own line. Only fragments whose joined text is a bibliography heading or an end heading are
+    merged, so table cells and other short lines are left alone.
+    """
+    short = [line for line in lines if line.horizontal and 0 < len(line.text.strip()) <= 3]
+    if len(short) < 2:
+        return lines
+    short.sort(key=lambda line: (round((line.box[1] + line.box[3]) / 2 / max(line.size, 1)), line.box[0]))
+    merged, absorbed = [], set()
+    chain = []
+
+    def close():
+        if len(chain) >= 2:
+            text = " ".join(item.text.strip() for item in chain)
+            if HEADING.fullmatch(text) or END.fullmatch(text):
+                box = bounds(item.box for item in chain)
+                first = chain[0]
+                merged.append(replace(first, glyphs=(Glyph(text, box, ()),), box=box))
+                absorbed.update(id(item) for item in chain)
+        chain.clear()
+
+    for line in short:
+        if chain:
+            previous = chain[-1]
+            same_row = abs((line.box[1] + line.box[3]) / 2 - (previous.box[1] + previous.box[3]) / 2) < previous.size * .4
+            near = 0 <= line.box[0] - previous.box[2] <= previous.size * 6
+            if same_row and near and abs(line.size - previous.size) <= previous.size * .15:
+                chain.append(line)
+                continue
+            close()
+        chain.append(line)
+    close()
+    if not absorbed:
+        return lines
+    return [line for line in lines if id(line) not in absorbed] + merged
 
 
 def _signature(path: Path):
@@ -245,6 +288,7 @@ class PdfEngine:
                     lines.append(Line((Glyph(text, box, ()),), box, size,
                                       line["wmode"] == 0 and abs(line["dir"][1]) < .15, block_index,
                                       leading_bold=leading_bold))
+        lines = _join_spaced_headings(lines)
         width, height = page.rect.width, page.rect.height
         if page.rotation in (90, 270):
             width, height = height, width
@@ -256,18 +300,22 @@ class PdfEngine:
             }
         return lines, width, height
 
-    def reference_step(self):
+    def reference_step(self, budget_ms=None):
+        """Read pages for the reference index. With a budget, keep reading until that many milliseconds pass,
+        so a long scan does not pay a worker round trip per page."""
         if self.references is None:
             outline = [(depth, title, page, None) for depth, title, page in self.doc.get_toc()]
             self.references = ReferenceIndex(self.doc.page_count, outline)
-        if self.references.complete:
-            return True
-        index = self.references.next_page
-        page = self._analysis_page(index)
-        lines, width, _ = self._index_rows(page)
-        matrix = page.rotation_matrix
-        rows = [(line, tuple(mu.Rect(line.box) * matrix)) for line in reading_order(lines, width)]
-        self.references.add_page(index, rows)
+        deadline = perf_counter() + budget_ms / 1000 if budget_ms else 0
+        while not self.references.complete:
+            index = self.references.next_page
+            page = self._analysis_page(index)
+            lines, width, _ = self._index_rows(page)
+            matrix = page.rotation_matrix
+            rows = [(line, tuple(mu.Rect(line.box) * matrix)) for line in reading_order(lines, width)]
+            self.references.add_page(index, rows)
+            if perf_counter() >= deadline:
+                break
         return self.references.complete
 
     def reference_targets(self, position, keys, ordered=False):
@@ -278,9 +326,14 @@ class PdfEngine:
     def _caption_rows(self, index, skip_bibliography=False):
         page = self._analysis_page(index)
         lines, width, height = self._index_rows(page)
-        regions = reading_regions(lines, width)
         in_bibliography = self.in_bibliography and index not in self.chapter_pages
-        if skip_bibliography:
+        regions = None
+        if skip_bibliography and not any(HEADING.fullmatch(line.text.strip()) or END.fullmatch(line.text.strip())
+                                         for line in lines):
+            # No section heading here, so reading order cannot change which lines are eligible.
+            eligible = set() if in_bibliography else {id(line) for line in lines}
+        elif skip_bibliography:
+            regions = reading_regions(lines, width)
             eligible = set()
             for region in regions:
                 for line in region:
@@ -295,6 +348,8 @@ class PdfEngine:
             eligible = {id(line) for line in lines}
         if not any(id(line) in eligible and caption_heading(line.text) for line in lines):
             return (), in_bibliography
+        if regions is None:
+            regions = reading_regions(lines, width)
         groups, _, _ = classify_captions(lines, regions, self._page_evidence(index, page), width, height)
         if skip_bibliography:
             starts = {line.box for line in lines if id(line) in eligible}
@@ -308,17 +363,20 @@ class PdfEngine:
             for group in groups if group.kind != "other" and not group.continued
         ), in_bibliography
 
-    def figure_step(self):
-        if self.figure_page >= self.doc.page_count:
-            return True
-        index = self.figure_page
-        if index == 0:
-            self.chapter_pages = {page - 1 for depth, title, page in self.doc.get_toc()
-                                  if depth == 1 and not HEADING.fullmatch(title.strip())}
-        entries, bibliography = self._caption_rows(index, skip_bibliography=True)
-        self.figure_pages[index] = entries
-        self.in_bibliography = bibliography
-        self.figure_page += 1
+    def figure_step(self, budget_ms=None):
+        """Read pages for the figure index, like reference_step."""
+        deadline = perf_counter() + budget_ms / 1000 if budget_ms else 0
+        while self.figure_page < self.doc.page_count:
+            index = self.figure_page
+            if index == 0:
+                self.chapter_pages = {page - 1 for depth, title, page in self.doc.get_toc()
+                                      if depth == 1 and not HEADING.fullmatch(title.strip())}
+            entries, bibliography = self._caption_rows(index, skip_bibliography=True)
+            self.figure_pages[index] = entries
+            self.in_bibliography = bibliography
+            self.figure_page += 1
+            if perf_counter() >= deadline:
+                break
         return self.figure_page >= self.doc.page_count
 
     @staticmethod
@@ -340,6 +398,41 @@ class PdfEngine:
         page, x, y = position
         return tuple(None if target and target.page == page and mu.Point(x, y) in mu.Rect(target.box) else target
                      for target in self._figure_targets(keys, entries))
+
+    def figure_nearby(self, position, keys):
+        """Resolve figure mentions from the pages around the mention, without reading the whole document.
+
+        Pages are read in rings of growing distance. A key resolves when the first ring holding its label has
+        exactly one caption for it. Keys left as None (no caption nearby, or several in one ring) are for the
+        caller to resolve with the full scan.
+        """
+        page, x, y = position
+        found = [None] * len(keys)
+        pending = set(range(len(keys)))
+        for distance in range(FIGURE_WINDOW + 1):
+            ring = {index for index in (page - distance, page + distance) if 0 <= index < self.doc.page_count}
+            entries = []
+            for index in sorted(ring):
+                cached = self.named_figure_pages.get(index)
+                if cached is None:
+                    cached, _ = self._caption_rows(index)
+                    self.named_figure_pages[index] = cached
+                entries.extend(cached)
+            for number in sorted(pending):
+                key = keys[number]
+                matching = [target for group, target in entries if (group.kind, group.label) == tuple(key)]
+                if len(matching) > 1:
+                    pending.discard(number)
+                    continue
+                target, = self._figure_targets((key,), entries)
+                if target is None:
+                    continue
+                pending.discard(number)
+                if not (target.page == page and mu.Point(x, y) in mu.Rect(target.box)):
+                    found[number] = target
+            if not pending:
+                break
+        return tuple(found)
 
     def named_figure_target(self, position, page):
         marker = self.citation_at(*position)
