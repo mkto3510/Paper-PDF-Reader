@@ -9,6 +9,7 @@ from uuid import uuid4
 from PySide6.QtCore import QObject, Signal
 
 from .analysis_rules import DEFAULT_RULES
+from .messages import localize
 from .paths import write_json
 from .translation import DEFAULT_PROFILE
 
@@ -92,6 +93,10 @@ class Preferences(QObject):
 
     def tr_text(self, japanese, english):
         return english if self.data["language"] == "en" else japanese
+
+    def localize(self, message):
+        """A fixed error message (see messages.py) in the display language."""
+        return localize(self.data["language"], message)
 
     @staticmethod
     def profile_id():

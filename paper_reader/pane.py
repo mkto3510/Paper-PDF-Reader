@@ -749,11 +749,11 @@ class DocumentPane(QWidget):
                 chat_request(profile, selection.source, settings["langFrom"], settings["langTo"])
             except (TypeError, ValueError):
                 self.message.emit(self.t("設定で翻訳サービスの接続先を確認してください。",
-                                         "Check the translation service URL in Preferences."))
+                                         "Check the translation service URL in Settings."))
                 return
             if not profile["model"].strip():
                 self.message.emit(self.t("設定で翻訳モデルを選んでください。",
-                                         "Choose a translation model in Preferences."))
+                                         "Choose a translation model in Settings."))
                 return
             manager = doc.store.translations
             job = manager.create(profile, selection.source, settings)
@@ -814,7 +814,12 @@ class DocumentPane(QWidget):
 
     def open_translation(self, **kwargs):
         if self.annotation_dialog is not None:
-            self.annotation_dialog.reject()
+            old = self.annotation_dialog
+            if not old.confirm_close():
+                old.raise_()
+                old.activateWindow()
+                return
+            old.dismiss()
         dialog = TranslationDialog(self, **kwargs)
         self.annotation_dialog = dialog
         dialog.finished.connect(lambda: setattr(self, "annotation_dialog", None))
@@ -857,11 +862,11 @@ class DocumentPane(QWidget):
             chat_request(profile, "", languages["langFrom"], languages["langTo"])
         except (TypeError, ValueError):
             self.message.emit(self.t("設定で翻訳サービスの接続先を確認してください。",
-                                     "Check the translation service URL in Preferences."))
+                                     "Check the translation service URL in Settings."))
             return
         if not profile["model"].strip():
             self.message.emit(self.t("設定で翻訳モデルを選んでください。",
-                                     "Choose a translation model in Preferences."))
+                                     "Choose a translation model in Settings."))
             return
         empty = self.t("選択した注釈の一部に、翻訳できるテキストがありません。",
                        "No translatable text was found in some selected annotations.")

@@ -102,7 +102,7 @@ class AboutDialog(QDialog):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            self.notice_body.setPlainText(self.t(f"{path.name} を読み込めませんでした．",
+            self.notice_body.setPlainText(self.t(f"{path.name} を読み込めませんでした。",
                                                   f"Could not read {path.name}."))
             return
         if path.name == "THIRD_PARTY.md":
@@ -116,6 +116,28 @@ def spin(low, high, value):
     box.setRange(low, high)
     box.setValue(value)
     return box
+
+
+def ask(parent, title, text, accept, reject, destructive=False, default_accept=False):
+    """Two-button question with caller-supplied labels. Returns True when the first button is chosen."""
+    box = QMessageBox(QMessageBox.Icon.Question, title, text, QMessageBox.StandardButton.NoButton, parent)
+    box.setTextFormat(Qt.TextFormat.PlainText)  # profile names and file names are shown as typed
+    yes = box.addButton(accept, QMessageBox.ButtonRole.DestructiveRole if destructive else QMessageBox.ButtonRole.AcceptRole)
+    no = box.addButton(reject, QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(yes if default_accept else no)
+    box.setEscapeButton(no)
+    box.exec()
+    chosen = box.clickedButton() is yes
+    box.deleteLater()
+    return chosen
+
+
+def warn(parent, title, text):
+    """A warning that shows its text as typed (a profile name such as "<b>x" is not rich text)."""
+    box = QMessageBox(QMessageBox.Icon.Warning, title, text, QMessageBox.StandardButton.Ok, parent)
+    box.setTextFormat(Qt.TextFormat.PlainText)
+    box.exec()
+    box.deleteLater()
 
 
 def dialog_corner(work_area, frame_size, preferred):
@@ -133,11 +155,15 @@ class SettingsDialog(QDialog):
         self.translations = window.controller.documents.translations
         self.data = deepcopy(self.preferences.data)
         self.profile_key = None
+        self.stop_test_handle = None
+        self.finished.connect(self.stop_test)
+        # The profile used for translation. Editing another profile never changes it.
+        self.active_profile = self.data["activeProfile"]
         t = self.translate
         self.resize(620, 650)
         self.setWindowTitle(t("設定", "Settings"))
         layout = QVBoxLayout(self)
-        tabs = QTabWidget()
+        self.tabs = tabs = QTabWidget()
         layout.addWidget(tabs)
         general = QWidget()
         form = QFormLayout(general)
@@ -147,6 +173,8 @@ class SettingsDialog(QDialog):
         self.language.setCurrentIndex(self.language.findData(self.data["language"]))
         form.addRow(t("表示言語", "Display language"), self.language)
         self.languages = {key: QLineEdit(self.data[key]) for key in ("langFrom", "langTo")}
+        self.languages["langFrom"].setPlaceholderText(t("例: en", "e.g. en"))
+        self.languages["langTo"].setPlaceholderText(t("例: ja", "e.g. ja"))
         form.addRow(t("原文の言語", "Source language"), self.languages["langFrom"])
         form.addRow(t("翻訳先の言語", "Target language"), self.languages["langTo"])
         self.concurrent = spin(1, 8, self.data["concurrency"])
@@ -201,7 +229,11 @@ class SettingsDialog(QDialog):
             button.clicked.connect(callback)
             top.addWidget(button)
         form.addRow(top)
+        self.use_profile = QCheckBox(t("このプロファイルを翻訳に使う", "Use this profile for translation"))
+        self.use_profile.toggled.connect(self.use_profile_toggled)
+        form.addRow(self.use_profile)
         self.fields = {key: QLineEdit() for key in ("name", "endpoint", "apiKey")}
+        self.fields["name"].textChanged.connect(self.name_edited)
         self.fields["apiKey"].setEchoMode(QLineEdit.EchoMode.Password)
         self.model = QComboBox()
         self.model.setEditable(True)
@@ -221,7 +253,7 @@ class SettingsDialog(QDialog):
         self.temperature.setRange(0, 2)
         self.temperature.setDecimals(2)
         self.temperature.setSingleStep(.1)
-        form.addRow("Temperature", self.temperature)
+        form.addRow(t("温度 (Temperature)", "Temperature"), self.temperature)
         self.streaming = QCheckBox(t("応答をストリーミング", "Stream the response"))
         form.addRow(self.streaming)
         self.prompts = {key: QTextEdit() for key in ("systemPrompt", "prompt", "extra")}
@@ -229,6 +261,10 @@ class SettingsDialog(QDialog):
                             ("prompt", "ユーザープロンプト", "User prompt"), ("extra", "追加 JSON", "Extra JSON")):
             self.prompts[key].setFixedHeight(64)
             form.addRow(t(ja, en), self.prompts[key])
+        variables = QLabel(t("プロンプトでは ${sourceText}（原文）・${langFrom}（原文の言語）・${langTo}（翻訳先の言語）を使えます。",
+                             "Prompts can use ${sourceText}, ${langFrom} (source language) and ${langTo} (target language)."))
+        variables.setWordWrap(True)
+        form.addRow(variables)
         self.profiles.currentIndexChanged.connect(self.profile_selected)
         self.reset_profiles(self.data["activeProfile"])
         return widget
@@ -258,15 +294,44 @@ class SettingsDialog(QDialog):
         extra = profile["extra"]
         self.prompts["extra"].setPlainText(extra if isinstance(extra, str) else json.dumps(extra, ensure_ascii=False, indent=2))
         self.service_status.clear()
+        active = key == self.active_profile
+        blocked = self.use_profile.blockSignals(True)
+        self.use_profile.setChecked(active)
+        self.use_profile.blockSignals(blocked)
+        # Exactly one profile is always in use, so the box can only be turned on.
+        self.use_profile.setEnabled(not active)
+
+    def profile_label(self, key, name):
+        mark = self.translate(" （使用中）", " (in use)") if key == self.active_profile else ""
+        return name + mark
+
+    def name_edited(self, text):
+        index = self.profiles.currentIndex()
+        if index >= 0 and self.profile_key is not None:
+            self.profiles.setItemText(index, self.profile_label(self.profile_key, text))
+
+    def use_profile_toggled(self, checked):
+        if checked and self.profile_key is not None:
+            self.active_profile = self.profile_key
+            self.use_profile.setEnabled(False)
+            for index in range(self.profiles.count()):
+                key = self.profiles.itemData(index)
+                name = self.fields["name"].text() if key == self.profile_key else self.data["profiles"][key]["name"]
+                self.profiles.setItemText(index, self.profile_label(key, name))
 
     def reset_profiles(self, current):
         self.profiles.blockSignals(True)
         self.profiles.clear()
         for key, profile in self.data["profiles"].items():
-            self.profiles.addItem(profile["name"], key)
+            self.profiles.addItem(self.profile_label(key, profile["name"]), key)
         self.profiles.setCurrentIndex(self.profiles.findData(current))
         self.profiles.blockSignals(False)
         self.show_profile(current)
+
+    def select_profile(self, key):
+        index = self.profiles.findData(key)
+        if index >= 0 and index != self.profiles.currentIndex():
+            self.profiles.setCurrentIndex(index)
 
     def profile_selected(self, index):
         if index >= 0:
@@ -282,9 +347,20 @@ class SettingsDialog(QDialog):
         self.reset_profiles(key)
 
     def remove_profile(self):
-        if len(self.data["profiles"]) > 1:
-            self.data["profiles"].pop(self.profile_key)
-            self.reset_profiles(next(iter(self.data["profiles"])))
+        t = self.translate
+        if len(self.data["profiles"]) <= 1:
+            self.service_status.setText(t("最後のプロファイルは削除できません。", "The last profile cannot be deleted."))
+            return
+        name = self.fields["name"].text()
+        if not ask(self, t("プロファイルの削除", "Delete profile"), t(f"「{name}」を削除しますか？", f'Delete "{name}"?'),
+                   t("削除", "Delete"), t("キャンセル", "Cancel"), destructive=True):
+            return
+        self.data["profiles"].pop(self.profile_key)
+        remaining = next(iter(self.data["profiles"]))
+        if self.profile_key == self.active_profile:
+            self.active_profile = remaining
+        self.profile_key = None
+        self.reset_profiles(remaining)
 
     def test_connection(self):
         t = self.translate
@@ -292,12 +368,14 @@ class SettingsDialog(QDialog):
         key = self.profile_key
         profile = self.data["profiles"][key]
         self.service_status.setText(t("接続を確認中…", "Checking connection…"))
+        self.stop_test()
 
         def received(models, error):
-            if self.profile_key != key or not self.isVisible():
+            self.stop_test_handle = None
+            if self.profile_key != key:
                 return
             if error:
-                self.service_status.setText(error)
+                self.service_status.setText(self.preferences.localize(error))
                 return
             model = self.model.currentText()
             self.model.clear()
@@ -305,13 +383,26 @@ class SettingsDialog(QDialog):
             self.model.setEditText(model or (models[0] if models else ""))
             self.service_status.setText(t(f"接続成功。モデル {len(models)} 件", f"Connected. {len(models)} models"))
 
-        self.translations.models(profile, received)
+        self.stop_test_handle = self.translations.models(profile, received)
+
+    def stop_test(self):
+        """Abandon a connection test that is still waiting, so nothing calls back into a closed dialog."""
+        handle, self.stop_test_handle = self.stop_test_handle, None
+        if handle:
+            handle()
 
     def commit(self):
         self.store_profile()
         t = self.translate
         data = deepcopy(self.data)
-        for profile in data["profiles"].values():
+        if not all(field.text().strip() for field in self.languages.values()):
+            self.tabs.setCurrentIndex(0)
+            empty = next(field for field in self.languages.values() if not field.text().strip())
+            empty.setFocus()
+            warn(self, t("翻訳設定", "Translation settings"),
+                 t("原文の言語と翻訳先の言語を入力してください。", "Enter the source and target languages."))
+            return
+        for key, profile in data["profiles"].items():
             try:
                 request_url(profile["endpoint"])
                 if not profile["name"].strip() or not profile["model"].strip():
@@ -325,9 +416,13 @@ class SettingsDialog(QDialog):
                     raise ValueError(t("追加 JSON はオブジェクトを指定してください。", "Extra JSON must be an object."))
                 json.dumps(profile["extra"], allow_nan=False)
             except (TypeError, ValueError) as error:
-                QMessageBox.warning(self, t("翻訳設定", "Translation settings"), str(error))
+                self.tabs.setCurrentIndex(1)
+                self.select_profile(key)
+                name = self.data["profiles"][key]["name"].strip() or t("（名前なし）", "(unnamed)")
+                reason = self.preferences.localize(str(error))
+                warn(self, t("翻訳設定", "Translation settings"), t(f"「{name}」: {reason}", f'"{name}": {reason}'))
                 return
-        data.update(activeProfile=self.profile_key, language=self.language.currentData(),
+        data.update(activeProfile=self.active_profile, language=self.language.currentData(),
                     concurrency=self.concurrent.value(), backupCount=self.backups.value(),
                     autoSave=self.auto_save.isChecked(), opacity=self.opacity.value())
         data.update({key: field.text().strip() for key, field in self.languages.items()})
@@ -375,6 +470,9 @@ class TranslationDialog(QDialog):
         self.source.setPlainText(self.selected.source if choices else source)
         self.output = QTextEdit()
         self.output.setPlainText(comment)
+        # Text the output box held when it was last in sync with the annotation; anything else is unsaved.
+        self.baseline = comment
+        self.dismissed = False
         form.addRow(t("原文", "Source"), self.source)
         form.addRow(t("訳文・コメント", "Translation or comment"), self.output)
         self.profile = QComboBox()
@@ -413,11 +511,8 @@ class TranslationDialog(QDialog):
             details.toggled.connect(excerpt.setVisible)
             form.addRow(details)
             form.addRow(excerpt)
-            include = QCheckBox(t("除外した箇所を翻訳に含める", "Restore excluded text"))
+            include = QCheckBox(t("除外した箇所も翻訳に含める", "Include excluded text in translation"))
             include.toggled.connect(self.include)
-            include.toggled.connect(lambda restored: include.setText(
-                t("除外した箇所も翻訳します", "Uncheck to reapply exclusions") if restored
-                else t("除外した箇所を翻訳に含める", "Restore excluded text")))
             form.addRow(include)
         controls.addLayout(form)
         self.status = QLabel()
@@ -508,7 +603,31 @@ class TranslationDialog(QDialog):
         self.selected = self.choices[int(enabled)]
         self.source.setPlainText(self.source_drafts.get(enabled, self.selected.source))
         self.output.clear()
+        self.baseline = ""
         self.status.clear()
+
+    def unsaved(self):
+        """True while the translation is in flight or the text differs from what the annotation holds."""
+        running = self.job and self.job.state in ("waiting", "running")
+        return bool(running) or self.output.toPlainText() != self.baseline
+
+    def confirm_close(self):
+        """Ask before throwing unsaved text away. Returns True when the dialog may close."""
+        if self.dismissed or not self.unsaved():
+            return True
+        t = self.pane.t
+        return ask(self, t("翻訳", "Translate"), t("未保存の訳文があります。破棄しますか？",
+                                                 "The translation has unsaved text. Discard it?"),
+                   t("破棄", "Discard"), t("続ける", "Keep editing"), destructive=True)
+
+    def dismiss(self):
+        """Close without asking; callers must have called confirm_close first."""
+        self.dismissed = True
+        super().reject()
+
+    def reject(self):
+        if self.confirm_close():
+            super().reject()
 
     def update_start(self):
         running = self.job and self.job.state in ("waiting", "running")
@@ -531,11 +650,12 @@ class TranslationDialog(QDialog):
     def update_job(self):
         t = self.pane.t
         labels = {"waiting": t("待機中", "Waiting"), "running": t("翻訳中…", "Translating…"),
-                  "failed": self.job.error, "finished": "", "canceled": t("取り消しました", "Canceled")}
+                  "failed": self.preferences.localize(self.job.error), "finished": "", "canceled": t("取り消しました", "Canceled")}
         self.status.setText(labels[self.job.state])
         if self.job.state in ("running", "finished"):
             self.output.setPlainText(self.job.output)
         running = self.job.state in ("running", "waiting")
+        self.output.setReadOnly(bool(running))
         self.start.setText(t("取り消す", "Cancel") if running else t("翻訳", "Translate"))
         self.update_start()
 

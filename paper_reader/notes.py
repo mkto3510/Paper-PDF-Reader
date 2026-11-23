@@ -3,14 +3,15 @@
 from bisect import bisect_left, bisect_right
 
 from PySide6.QtCore import QEvent, QTimer, Qt
-from PySide6.QtGui import QColor, QKeySequence, QPainter, QShortcut, QTextOption
+from shiboken6 import isValid
+from PySide6.QtGui import QColor, QKeySequence, QPainter, QShortcut, QTextCursor, QTextOption
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QMenu, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
     QToolButton, QVBoxLayout, QWidget,
 )
 
 from .icons import icon, swatch
-from .sidebar import ButtonGrid, WrappedLabel
+from .sidebar import ButtonGrid, WrappedLabel, wrapped_document
 
 
 COLORS = {
@@ -61,11 +62,13 @@ class Card(QFrame):
         self.comment = WrappedLabel()
         layout.addWidget(self.comment)
         self.editor = QPlainTextEdit()
-        self.editor.setFixedHeight(max(66, self.editor.fontMetrics().lineSpacing() * 4 + 10))
+        self.editor_minimum = max(66, self.editor.fontMetrics().lineSpacing() * 4 + 10)
+        self.editor.setFixedHeight(self.editor_minimum)
         self.editor.setMinimumWidth(0)
         self.editor.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.editor.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         self.editor.document().modificationChanged.connect(self.pane.document.drafts_changed)
+        self.editor.textChanged.connect(self.editor_changed)
         layout.addWidget(self.editor)
         self.commit, self.translate, self.delete = QPushButton(), QPushButton(), QPushButton()
         self.commit.clicked.connect(self.commit_comment)
@@ -100,7 +103,32 @@ class Card(QFrame):
             button.setAccessibleName(t(*labels))
         self.commit.setToolTip(t("コメントを保存 (Ctrl+Enter)", "Save comment (Ctrl+Enter)"))
 
+    def editor_changed(self):
+        # Remeasure on the next event-loop turn so typing and programmatic edits cannot re-enter the layout.
+        if not self.editor.isHidden() and self.key in self.panel.cards:
+            self.panel.dirty.add(self.key)
+            self.panel.layout_timer.start()
+
+    def fit_editor(self, width):
+        """Grow the comment editor to show its whole text, up to 70% of the list's visible height."""
+        editor = self.editor
+        margins = self.layout().contentsMargins()
+        inner = width - margins.left() - margins.right()
+        frame = editor.frameWidth() * 2 + round(editor.document().documentMargin()) * 2
+        text = wrapped_document(editor.toPlainText(), editor.font(), max(1, inner - frame))
+        needed = round(text.size().height()) + frame
+        limit = max(self.editor_minimum, int(self.panel.viewport.height() * .7))
+        height = min(max(needed, self.editor_minimum), limit)
+        scrolls = needed > limit
+        policy = Qt.ScrollBarPolicy.ScrollBarAsNeeded if scrolls else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        if editor.verticalScrollBarPolicy() != policy:
+            editor.setVerticalScrollBarPolicy(policy)
+        if editor.height() != height:
+            editor.setFixedHeight(height)
+
     def measure(self, width):
+        if not self.editor.isHidden():
+            self.fit_editor(width)
         self.actions.flow(width - 12)
         layout = self.layout()
         measured = layout.totalHeightForWidth(width)
@@ -179,7 +207,8 @@ class Card(QFrame):
         if job:
             label = {"waiting": t("待機中", "Waiting"), "running": t("翻訳中…", "Translating…"),
                      "failed": t("翻訳に失敗しました", "Translation failed")}.get(job.state, "")
-            self.state.setText("\n".join(part for part in (label, job.output, job.error) if part))
+            self.state.setText("\n".join(part for part in (label, job.output, self.pane.preferences.localize(job.error))
+                                         if part))
             self.job_action.setText(t("再試行", "Retry") if job.state == "failed" else t("取り消す", "Cancel"))
         self.update()
 
@@ -198,8 +227,17 @@ class Card(QFrame):
         note = self.pane.document.get_note(self.key)
         if note:
             self.panel.drafts.pop(self.key, None)
-            self.editor.setPlainText(self.panel.pending_comments.get(self.key, note["comment"]))
-        self.setFocus()
+            saved = self.panel.pending_comments.get(self.key, note["comment"])
+            if self.editor.toPlainText() != saved:
+                # Replace through the cursor, not setPlainText, so Ctrl+Z can bring the edit back.
+                cursor = self.editor.textCursor()
+                cursor.beginEditBlock()
+                cursor.select(QTextCursor.SelectionType.Document)
+                cursor.insertText(saved)
+                cursor.endEditBlock()
+                self.editor.setTextCursor(cursor)
+            self.editor.document().setModified(False)
+        self.editor.setFocus()
 
     def job_clicked(self):
         job = self.pane.document.jobs.get(self.pane.document.targets(self.key))
@@ -221,7 +259,7 @@ class Notes(QWidget):
         self.heights = {}
         self.dirty, self.membership = set(), set()
         self.reindex = True
-        self.width_used = 0
+        self.width_used = self.height_used = 0
         self.selected = None
         self.multiple = set()
         self.selection_anchor = None
@@ -384,6 +422,9 @@ class Notes(QWidget):
         generation = doc.generation
 
         def failed():
+            # The error was already reported through doc.input_error; the tab may be gone by now.
+            if not isValid(self):
+                return
             if doc.generation == generation and self.pending_comments.get(key) == value:
                 self.pending_comments.pop(key, None)
                 self.drafts.setdefault(key, value)
@@ -516,6 +557,10 @@ class Notes(QWidget):
             self.heights.clear()
             self.dirty.update(self.cards)
             self.rebuild_offsets()
+        elif self.height_used != height:
+            # The comment editor's height limit depends on the visible height.
+            self.dirty.update(key for key, card in self.cards.items() if card.editing)
+        self.height_used = height
         forgotten_height = False
         for key in self.dirty - self.cards.keys():
             forgotten_height |= self.heights.pop(key, self.ESTIMATED_HEIGHT) != self.ESTIMATED_HEIGHT

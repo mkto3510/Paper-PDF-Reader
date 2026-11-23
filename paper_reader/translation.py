@@ -35,10 +35,44 @@ def request_url(endpoint, models=False):
     return url
 
 
+def service_reason(body):
+    """The reason an OpenAI-compatible service gave for an HTTP error, or "" when the body has none."""
+    try:
+        data = json.loads(bytes(body))
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    error = data.get("error")
+    for candidate in (error.get("message") if isinstance(error, dict) else error, data.get("message"), data.get("detail")):
+        if isinstance(candidate, str) and candidate.strip():
+            return " ".join(candidate.split())[:300]
+    return ""
+
+
+REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+MAX_REDIRECTS = 3
+DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def same_origin(first, second):
+    def origin(url):
+        scheme = url.scheme().lower()
+        return scheme, url.host().lower(), url.port(DEFAULT_PORTS.get(scheme, -1))
+    return origin(first) == origin(second)
+
+
+def http_error(status, body):
+    reason = service_reason(body)
+    return f"HTTP {status}: {reason}" if reason else f"HTTP {status}"
+
+
 def api_request(profile, models=False):
     request = QNetworkRequest(request_url(profile["endpoint"], models))
     request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
     request.setTransferTimeout(15_000 if models else 120_000)
+    # Redirects are followed by Translations._start, not by Qt: Qt turns a POST into a body-less GET on
+    # 301/302/303, which a chat endpoint rejects. They are followed only within the same origin.
     request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
                          QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
     if key := profile["apiKey"].strip():
@@ -133,29 +167,43 @@ class Translations(QObject):
             self._start(job, request, payload)
 
     def models(self, profile, callback):
+        """List the service's models. Returns a function that abandons the request without calling back."""
         try:
             reply = self.network.get(api_request(profile, models=True))
         except ValueError as error:
             callback(None, str(error))
-            return
+            return lambda: None
+        abandoned = False
 
         def done():
+            reply.deleteLater()
+            if abandoned:
+                return
+            names = error = None
             try:
+                body = bytes(reply.readAll())
+                status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+                if status not in (None, 200):
+                    raise ValueError(http_error(status, body))
                 if reply.error() != QNetworkReply.NetworkError.NoError:
                     raise ValueError(reply.errorString())
-                if reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute) != 200:
+                if status != 200:
                     raise ValueError("The service could not list models.")
-                items = json.loads(bytes(reply.readAll()))["data"]
+                items = json.loads(body)["data"]
                 names = list(dict.fromkeys(item["id"] for item in items if isinstance(item.get("id"), str)))
-                callback(names, None)
-            except (AttributeError, KeyError, TypeError, ValueError) as error:
-                callback(None, str(error))
-            finally:
-                reply.deleteLater()
+            except (AttributeError, KeyError, TypeError, ValueError) as failure:
+                error = str(failure)
+            callback(names, error)
+
+        def abandon():
+            nonlocal abandoned
+            abandoned = True
+            reply.abort()
 
         reply.finished.connect(done)
+        return abandon
 
-    def _start(self, job, request, payload):
+    def _start(self, job, request, payload, redirects=0):
         reply = self.network.post(request, QByteArray(payload))
         self.active[job] = reply
         buffer = bytearray()
@@ -207,12 +255,23 @@ class Translations(QObject):
                 reply.deleteLater()
                 return
             self.active.pop(job)
+            status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+            if status in REDIRECT_STATUSES and redirects < MAX_REDIRECTS:
+                # (PySide6 returns None for the typed Location header, so read the raw one.)
+                location = bytes(reply.rawHeader("Location")).decode("latin-1").strip()
+                target = reply.url().resolved(QUrl(location)) if location else None
+                if target is not None and same_origin(target, reply.url()):
+                    # Send the same request again, body included, to the new address on the same server.
+                    reply.deleteLater()
+                    moved = QNetworkRequest(request)
+                    moved.setUrl(target)
+                    self._start(job, moved, payload, redirects + 1)
+                    return
             if streamed and buffer:
                 parse_data(buffer.strip())
-            status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
             error = service_error
             if reply.error() != QNetworkReply.NetworkError.NoError or status != 200:
-                error = error or (reply.errorString() if status is None else f"HTTP {status}")
+                error = error or (reply.errorString() if status is None else http_error(status, buffer))
             if not streamed and not error:
                 try:
                     item = json.loads(buffer)["choices"][0]

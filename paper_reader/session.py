@@ -5,7 +5,9 @@ from __future__ import annotations
 from heapq import heapify, heappop, heappush
 from itertools import count
 from multiprocessing import get_context
+import sys
 from tempfile import TemporaryDirectory
+import traceback
 from threading import Thread
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -40,16 +42,34 @@ class PdfSession(QObject):
 
     def request(self, name, args, callback, *, priority=0, key=None, needed=None):
         if self.closed:
-            callback(None, "PDF 処理を終了しました。")
+            self._call(callback, None, "PDF 処理を終了しました。")
             return
         heappush(self.queue, (priority, next(self.sequence), key, name, args, callback, needed))
         self._pump()
 
+    @staticmethod
+    def _call(callback, result, error):
+        """Run a caller's callback. One failing callback must never stall the requests behind it."""
+        try:
+            callback(result, error)
+        except Exception:
+            if sys.stderr is not None:  # a windowed build has no console
+                traceback.print_exc()
+
+    @staticmethod
+    def _wanted(needed):
+        try:
+            return needed is None or needed()
+        except Exception:
+            if sys.stderr is not None:
+                traceback.print_exc()
+            return False
+
     def _pump(self):
         while self.queue and self.current is None and not self.closed:
             _, _, key, name, args, callback, needed = heappop(self.queue)
-            if needed is not None and not needed():
-                callback(None, None)
+            if not self._wanted(needed):
+                self._call(callback, None, None)
                 continue
             self.current = callback, key
             try:
@@ -70,8 +90,10 @@ class PdfSession(QObject):
             return
         callback, _ = self.current
         self.current = None
-        callback(result, error)
-        QTimer.singleShot(0, self._pump)
+        try:
+            self._call(callback, result, error)
+        finally:
+            QTimer.singleShot(0, self._pump)
 
     def promote(self, key, priority):
         for index, request in enumerate(self.queue):
@@ -96,9 +118,9 @@ class PdfSession(QObject):
         if self.current is not None:
             callback, _ = self.current
             self.current = None
-            callback(None, message)
+            self._call(callback, None, message)
         while self.queue:
-            heappop(self.queue)[5](None, message)
+            self._call(heappop(self.queue)[5], None, message)
 
     def shutdown(self):
         if self.pipe.closed:
