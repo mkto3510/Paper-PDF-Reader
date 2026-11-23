@@ -20,15 +20,16 @@ COLORS = {
 }
 
 
-def color_menu(menu, pane, key=None):
-    keys = (key,) if key is not None else pane.notes.multiple
-    colors = {note["color"] for target in keys if (note := pane.document.get_note(target))}
+def add_color_actions(menu, translate, apply):
     for shade, labels in COLORS.items():
-        action = menu.addAction(swatch(QColor(shade)), pane.t(*labels))
+        action = menu.addAction(swatch(QColor(shade)), translate(*labels))
         action.setIconVisibleInMenu(True)
-        action.setCheckable(True)
-        action.setChecked(colors == {shade})
-        action.triggered.connect(lambda checked=False, color=shade: pane.recolor_notes(keys, color))
+        action.triggered.connect(lambda _checked=False, color=shade: apply(color))
+
+
+def color_menu(menu, pane, key=None):
+    keys = (key,) if key is not None else tuple(pane.notes.multiple)
+    add_color_actions(menu, pane.t, lambda color: pane.recolor_notes(keys, color))
 
 
 class Card(QFrame):

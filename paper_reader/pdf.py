@@ -16,7 +16,8 @@ import pymupdf as mu
 
 from .analysis_rules import DEFAULT_RULES, classify, page_evidence
 from .artifacts import artifact_glyphs
-from .citations import ReferenceIndex, citation_at
+from .captions import caption_heading, classify_captions
+from .citations import END, HEADING, Reference, ReferenceIndex, citation_at
 from .search import find_page
 from .selection import Glyph, Line, bounds, correct_stream_order, edge_band, furniture_key, reading_order, reading_regions, select
 
@@ -63,6 +64,10 @@ class PdfEngine:
         self.state_ids = count(1)
         self.saved_revision = 0
         self.references = None
+        self.figure_page = 0
+        self.figure_pages = {}
+        self.in_bibliography = False
+        self.chapter_pages = set()
 
     def open(self, filename: str, password: str = ""):
         path = Path(filename).resolve(strict=True)
@@ -103,6 +108,10 @@ class PdfEngine:
 
     def close(self):
         self.references = None
+        self.figure_page = 0
+        self.figure_pages.clear()
+        self.in_bibliography = False
+        self.chapter_pages = set()
         self.display_lists.clear()
         if self.analysis_doc is not None:
             self.analysis_doc.close()
@@ -167,24 +176,32 @@ class PdfEngine:
     def page_links(self, index):
         result = []
         for link in self.doc[index].get_links():
-            if link["kind"] == mu.LINK_GOTO and isinstance(link.get("to"), (mu.Point, tuple, list)):
-                result.append({"box": tuple(link["from"]), "page": link["page"], "point": tuple(link["to"])})
-            if link["kind"] == mu.LINK_URI:
+            if link["kind"] in (mu.LINK_GOTO, mu.LINK_NAMED):
+                page, point = link.get("page"), link.get("to")
+                if not isinstance(page, int) or not 0 <= page < self.doc.page_count:
+                    continue
+                if isinstance(point, (mu.Point, tuple, list)):
+                    entry = {"box": tuple(link["from"]), "page": page, "point": tuple(point)}
+                    if link["kind"] == mu.LINK_NAMED:
+                        if not any(point):
+                            entry["page_only"] = True
+                        else:
+                            target = self.doc[page]
+                            # Named destinations are in PDF coordinates; the
+                            # page transform includes both crop offset and rotation.
+                            matrix = mu.mupdf.FzMatrix()
+                            mu.mupdf.pdf_page_transform(target._pdf_page(), mu.mupdf.FzRect(), matrix)
+                            entry["point"] = tuple(mu.Point(point) * mu.JM_py_from_matrix(matrix))
+                    result.append(entry)
+            elif link["kind"] == mu.LINK_URI:
                 result.append({"box": tuple(link["from"]), "uri": link.get("uri", "")})
         return result
 
     def citation_at(self, page, x, y):
         return citation_at(self.text(page), x, y)
 
-    def reference_step(self):
-        if self.references is None:
-            self.references = ReferenceIndex(self.doc.page_count)
-        if self.references.complete:
-            return True
-        index = self.references.next_page
-        page = self._analysis_page(index)
-        # The index is independent of translation exclusions. Read one page
-        # without computing glyph quads or probing headers on nearby pages.
+    def _index_rows(self, page):
+        # Read a single page and avoid instantiating per-glyph quads for the index.
         blocks = page.get_text("dict", flags=mu.TEXTFLAGS_DICT & ~mu.TEXT_PRESERVE_IMAGES)["blocks"]
         lines = []
         for block_index, block in enumerate(blocks):
@@ -193,15 +210,107 @@ class PdfEngine:
                 text = "".join(span["text"] for span in spans).strip()
                 if text:
                     box = tuple(line["bbox"])
-                    lines.append(Line((Glyph(text, box, ()),), box, max(span["size"] for span in spans),
+                    count = sum(len(span["text"]) for span in spans)
+                    size = sum(len(span["text"]) * span["size"] for span in spans) / count
+                    lines.append(Line((Glyph(text, box, ()),), box, size,
                                       line["wmode"] == 0 and abs(line["dir"][1]) < .15, block_index))
-        width = page.rect.height if page.rotation in (90, 270) else page.rect.width
-        rows = [(line, tuple(mu.Rect(line.box) * page.rotation_matrix)) for line in reading_order(lines, width)]
+        width, height = page.rect.width, page.rect.height
+        if page.rotation in (90, 270):
+            width, height = height, width
+        return lines, width, height
+
+    def reference_step(self):
+        if self.references is None:
+            outline = [(depth, title, page, None) for depth, title, page in self.doc.get_toc()]
+            self.references = ReferenceIndex(self.doc.page_count, outline)
+        if self.references.complete:
+            return True
+        index = self.references.next_page
+        page = self._analysis_page(index)
+        lines, width, _ = self._index_rows(page)
+        matrix = page.rotation_matrix
+        rows = [(line, tuple(mu.Rect(line.box) * matrix)) for line in reading_order(lines, width)]
         self.references.add_page(index, rows)
         return self.references.complete
 
-    def reference_targets(self, position, keys):
-        return self.references.targets(position, keys) if self.references and self.references.complete else ()
+    def reference_targets(self, position, keys, ordered=False):
+        if self.references and self.references.complete:
+            return self.references.targets(position, keys, ordered=ordered)
+        return (None,) * len(keys) if ordered else ()
+
+    def _caption_rows(self, index, skip_bibliography=False):
+        page = self._analysis_page(index)
+        lines, width, height = self._index_rows(page)
+        regions = reading_regions(lines, width)
+        in_bibliography = self.in_bibliography and index not in self.chapter_pages
+        if skip_bibliography:
+            eligible = set()
+            for region in regions:
+                for line in region:
+                    text = line.text.strip()
+                    if HEADING.fullmatch(text):
+                        in_bibliography = True
+                    elif END.fullmatch(text):
+                        in_bibliography = False
+                    elif not in_bibliography:
+                        eligible.add(id(line))
+        else:
+            eligible = {id(line) for line in lines}
+        if not any(id(line) in eligible and caption_heading(line.text) for line in lines):
+            return (), in_bibliography
+        groups, _, _ = classify_captions(lines, regions, page_evidence(page), width, height)
+        if skip_bibliography:
+            starts = {line.box for line in lines if id(line) in eligible}
+            groups = [group for group in groups if any(
+                x0 >= group.box[0] - .1 and x1 <= group.box[2] + .1 and abs(y0 - group.box[1]) < .1
+                for x0, y0, x1, _ in starts)]
+        matrix = page.rotation_matrix
+        return tuple(
+            (group, Reference(index, tuple(mu.Rect(group.box) * matrix), group.text[:110],
+                              tuple(mu.Rect(group.object_box) * matrix) if group.object_box else None))
+            for group in groups if group.kind != "other" and not group.continued
+        ), in_bibliography
+
+    def figure_step(self):
+        if self.figure_page >= self.doc.page_count:
+            return True
+        index = self.figure_page
+        if index == 0:
+            self.chapter_pages = {page - 1 for depth, title, page in self.doc.get_toc()
+                                  if depth == 1 and not HEADING.fullmatch(title.strip())}
+        entries, bibliography = self._caption_rows(index, skip_bibliography=True)
+        self.figure_pages[index] = entries
+        self.in_bibliography = bibliography
+        self.figure_page += 1
+        return self.figure_page >= self.doc.page_count
+
+    @staticmethod
+    def _figure_targets(keys, entries):
+        targets = []
+        for kind, label in keys:
+            exact = [target for group, target in entries if (group.kind, group.label) == (kind, label)]
+            if not exact and len(label) > 1 and label[-2].isdigit() and label[-1].isalpha():
+                exact = [target for group, target in entries
+                         if (group.kind, group.label) == (kind, label[:-1])
+                         and f"({label[-1]})" in group.text.casefold()]
+            targets.append(exact[0] if len(exact) == 1 else None)
+        return tuple(targets)
+
+    def figure_targets(self, position, keys, ordered=True):
+        if self.figure_page < self.doc.page_count:
+            return (None,) * len(keys)
+        entries = tuple(entry for page_entries in self.figure_pages.values() for entry in page_entries)
+        return self._figure_targets(keys, entries)
+
+    def named_figure_target(self, position, page):
+        marker = self.citation_at(*position)
+        if marker is None or marker.kind != "figure" or len(marker.keys) != 1:
+            return None
+        entries = self.figure_pages.get(page)
+        if entries is None:
+            entries, _ = self._caption_rows(page)
+        target, = self._figure_targets(marker.keys, entries)
+        return target
 
     def properties(self):
         return dict(self.doc.metadata or {}) | {"filename": str(self.path), "size": self.path.stat().st_size,
@@ -583,8 +692,6 @@ class PdfEngine:
                     page.insert_text((340, 120 + line * 20), f"Right column {index + 1} line {line + 1}")
                 page.insert_text((285, 810), str(index + 1))
             sample.save(source)
-        from .selection import select
-
         self.open(str(source))
         pages = {index: self.text(index) for index in range(3)}
         assert all(page[0].kind for page in pages.values()), 'Running headers were not detected.'
@@ -597,7 +704,31 @@ class PdfEngine:
         self.open(str(source))
         assert [item["comment"] for item in self.annotation_list()] == [comment] * 3, "Annotations did not survive reopen."
         assert len(tuple((root / "backups").glob("*.pdf"))) == 1, "The original PDF was not backed up."
-        return self.render(0, 1.0, (0, 0, 500, 500))
+        raster = self.render(0, 1.0, (0, 0, 500, 500))
+        fixture = root / "文書内の参照.pdf"
+        with mu.open() as sample:
+            body = sample.new_page()
+            body.insert_text((55, 90), "Figure 2.6 shows one result [1].")
+            body.insert_text((55, 120), "The measurements are in Table I.")
+            body.insert_text((55, 260), "Figure 2.6: A radar drawing.")
+            refs = sample.new_page()
+            refs.insert_text((55, 120), "Table I: Measurements.")
+            refs.insert_text((55, 320), "References")
+            refs.insert_text((55, 370), "[1] Smith, A. (2024). Radar measurements.")
+            sample.save(fixture)
+        self.open(str(fixture))
+        for label, expected in (("Figure 2.6", "Figure 2.6:"), ("Table I", "Table I:"), ("[1]", "[1]")):
+            rect = self.doc[0].search_for(label)[0]
+            source = 0, (rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2
+            marker = self.citation_at(*source)
+            assert marker, f"The reference marker {label} was not detected."
+            step = self.figure_step if marker.kind == "figure" else self.reference_step
+            while not step():
+                pass
+            lookup = self.figure_targets if marker.kind == "figure" else self.reference_targets
+            targets = lookup(source, marker.keys)
+            assert (len(targets) == 1 and targets[0] and targets[0].label.startswith(expected)), label
+        return raster
 
 
 def worker(pipe, working_directory):
