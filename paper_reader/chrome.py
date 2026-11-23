@@ -5,11 +5,14 @@ from collections import Counter
 from PySide6.QtCore import QEvent, QPoint, QSize, QTimer, Qt
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMenuBar,
+    QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMenuBar,
     QSizePolicy, QStackedWidget, QTabBar, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .icons import icon
+
+
+MINIMUM_WIDTH = 530
 
 
 class DocumentTabs(QTabBar):
@@ -115,7 +118,10 @@ class TabList(QFrame):
 
 
 class Header(QWidget):
-    TOOLS = ("page_previous", "page_next", "single", "spread", "width", "fit", "left", "right", "smaller", "bigger")
+    GROUPS = (("open",), ("back", "page_previous", "page", "total", "page_next"),
+              ("single", "spread", "left", "right"), ("width", "fit", "smaller", "bigger", "zoom"), ("search",))
+    OVERFLOW_ORDER = (("left", "right"), ("smaller", "bigger"), ("width", "fit"),
+                      ("single", "spread"), ("page_previous", "page_next"))
 
     def __init__(self, window):
         super().__init__(window)
@@ -126,12 +132,13 @@ class Header(QWidget):
         self.menus = QMenuBar()
         self.menus.setNativeMenuBar(False)
         layout.addWidget(self.menus)
-        self.tools = QHBoxLayout()
+        row = QWidget(self)
+        row.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        row.installEventFilter(self)
+        layout.addWidget(row)
+        self.tools = QHBoxLayout(row)
         self.tools.setContentsMargins(6, 2, 6, 3)
         self.tools.setSpacing(3)
-        layout.addLayout(self.tools)
-        self.buttons = {key: QToolButton(self) for key in ("open", *self.TOOLS)}
-        self.tools.addWidget(self.buttons["open"])
         self.page = QLineEdit()
         self.page.setMaximumWidth(54)
         self.page.setMinimumWidth(42)
@@ -140,25 +147,36 @@ class Header(QWidget):
         self.page.setValidator(self.page_validator)
         self.page.returnPressed.connect(self.move_to_page)
         self.page.editingFinished.connect(window.update_status)
-        self.tools.addWidget(self.page)
         self.total = QLabel()
-        self.tools.addWidget(self.total)
-        for key in self.TOOLS:
-            self.tools.addWidget(self.buttons[key])
         self.zoom = QToolButton()
         self.zoom.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.tools.addWidget(self.zoom)
         self.search = QStackedWidget()
         self.empty_search = QWidget()
         self.search.addWidget(self.empty_search)
         self.search.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-        self.tools.addWidget(self.search)
+        self.search.hide()
+        self.buttons = {}
+        self.separators = []
+        fields = {"page": self.page, "total": self.total, "zoom": self.zoom, "search": self.search}
+        self.controls = dict(fields)
+        for index, group in enumerate(self.GROUPS):
+            if index:
+                divider = QFrame(row, frameShape=QFrame.Shape.VLine)
+                divider.setFixedSize(1, 17)
+                self.tools.addWidget(divider, alignment=Qt.AlignmentFlag.AlignVCenter)
+                self.separators.append(divider)
+            for name in group:
+                if name not in fields:
+                    button = QToolButton(row)
+                    self.controls[name] = self.buttons[name] = button
+                self.tools.addWidget(self.controls[name])
         self.tools.addStretch()
         self.more = QToolButton()
         self.more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.overflow = QMenu(self.more)
         self.more.setMenu(self.overflow)
         self.tools.addWidget(self.more)
+        self.hidden_tools = None
         self.external = QLabel()
         self.notice = QLabel(window)
         self.notice.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -179,6 +197,11 @@ class Header(QWidget):
         super().resizeEvent(event)
         self.timer.start()
         self.place_notice()
+
+    def eventFilter(self, target, event):
+        if event.type() == QEvent.Type.LayoutRequest and hasattr(self, "timer"):
+            self.timer.start()
+        return super().eventFilter(target, event)
 
     def set_external(self, message):
         if self.external.text() != message:
@@ -212,6 +235,7 @@ class Header(QWidget):
 
     def bind(self, actions, zoom_menu):
         self.zoom.setMenu(zoom_menu)
+        self.hidden_tools = None
         for name, button in self.buttons.items():
             button.setDefaultAction(actions[name][0])
             button.setAccessibleName(actions[name][0].text())
@@ -225,6 +249,7 @@ class Header(QWidget):
 
     def select_pane(self, pane):
         panel = pane.search_panel if pane else self.empty_search
+        panel.installEventFilter(self)
         self.search.setCurrentWidget(panel)
         self.search.setVisible(pane is not None)
         self.timer.start()
@@ -236,27 +261,53 @@ class Header(QWidget):
     def fit_tools(self):
         if not self.window.actions:
             return
-        # Keep the page, zoom and search reachable when extra buttons move into the menu.
-        fixed = sum(widget.sizeHint().width() for widget in
-                    (self.buttons["open"], self.page, self.total, self.zoom, self.more))
-        active_search = self.search.currentWidget()
-        if active_search and active_search is not self.empty_search:
-            fixed += active_search.minimumSizeHint().width()
-        remaining = max(0, self.width() - fixed - 40)
-        hidden = []
-        for name in self.TOOLS:
-            button = self.buttons[name]
-            cost = button.sizeHint().width() + self.tools.spacing()
-            if cost <= remaining:
-                remaining -= cost
-                button.show()
-            else:
-                button.hide()
-                hidden.append(name)
-        self.overflow.clear()
-        for name in hidden:
-            self.overflow.addAction(self.window.actions[name][0])
+        search_visible = not self.search.isHidden()
+        search_width = self.search.currentWidget().minimumSizeHint().width() if search_visible else 0
+        self.search.setMinimumWidth(max(0, search_width))
+        widths = {name: min(control.maximumWidth(), max(control.minimumWidth(), control.sizeHint().width()))
+                  for name, control in self.controls.items()}
+        widths["search"] = search_width
+        margins = self.tools.contentsMargins()
+        spacing = self.tools.spacing()
+        visible = [tuple(name for name in group if name != "search" or search_visible) for group in self.GROUPS]
+
+        def required(hidden):
+            groups = [tuple(name for name in group if name not in hidden) for group in visible]
+            groups = [group for group in groups if group]
+            separators = len(groups) - 1
+            count = sum(map(len, groups)) + separators + bool(hidden)
+            return (margins.left() + margins.right() + separators + spacing * (count - 1)
+                    + sum(widths[name] for group in groups for name in group)
+                    + (self.more.sizeHint().width() if hidden else 0))
+
+        maximum_hidden = frozenset(name for pair in self.OVERFLOW_ORDER for name in pair)
+        menu_width = max(self.menus.sizeHint().width(),
+                         max((self.menus.actionGeometry(action).right() + 1 for action in self.menus.actions()),
+                             default=0))
+        self.window.setMinimumWidth(max(MINIMUM_WIDTH, menu_width, required(maximum_hidden)))
+        hidden = set()
+        for pair in self.OVERFLOW_ORDER:
+            if required(hidden) <= self.width():
+                break
+            hidden.update(pair)
+        focus = QApplication.focusWidget()
+        for name, button in self.buttons.items():
+            button.setVisible(name not in hidden)
+        for divider, group in zip(self.separators, visible[1:]):
+            divider.setVisible(any(name not in hidden for name in group))
         self.more.setVisible(bool(hidden))
+        if focus is self.more and not hidden:
+            (self.buttons["back"] if self.buttons["back"].isEnabled() else self.buttons["open"]).setFocus()
+        elif focus in (self.buttons[name] for name in hidden):
+            self.more.setFocus()
+        if hidden != self.hidden_tools:
+            self.hidden_tools = hidden
+            self.overflow.clear()
+            for group in self.GROUPS:
+                actions = [self.window.actions[name][0] for name in group if name in hidden]
+                if actions and not self.overflow.isEmpty():
+                    self.overflow.addSeparator()
+                self.overflow.addActions(actions)
 
     def set_location(self, pane):
         ready = pane is not None and pane.document.info and not pane.document.loading

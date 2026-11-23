@@ -2,4 +2,4 @@
 
 APP_NAME = "Paper PDF Viewer"
 EXECUTABLE_NAME = "PaperPdfViewer"
-VERSION = "0.2.8"
+VERSION = "0.2.9"

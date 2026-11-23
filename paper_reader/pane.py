@@ -23,6 +23,7 @@ from .view import PaperView
 
 
 ROLE = Qt.ItemDataRole.UserRole
+HOVER_PRIORITY = 12
 
 
 class DocumentPane(QWidget):
@@ -44,6 +45,12 @@ class DocumentPane(QWidget):
         self.last_color = next(iter(COLORS))
         self.rules_generation = document.rules_generation
         self.links = {}
+        self.link_reads = {}
+        self.hover_point = None
+        self.hover_revision = 0
+        self.hover_request = None
+        self.hover_timer = QTimer(self, singleShot=True, interval=100)
+        self.hover_timer.timeout.connect(self.probe_hover)
         self.search_generation = 0
         self.search_pending = False
         self.annotation_dialog = None
@@ -80,6 +87,7 @@ class DocumentPane(QWidget):
         self.lookup_notice.move(8, 8)
         self.lookup_notice.hide()
         self.view.clicked.connect(self.clicked)
+        self.view.hover_position.connect(self.track_hover)
         self.view.menu_requested.connect(self.context_menu)
         self.view.note_delete_requested.connect(self.delete_note)
         self.view.note_resize_requested.connect(self.resize_note)
@@ -165,11 +173,14 @@ class DocumentPane(QWidget):
     def on_document_changed(self):
         self.notes.setEnabled(not self.document.loading)
         if self.document.loading:
+            self.track_hover(None)
             self.end_lookup()
             self.view.cancel_click_series()
             self.view.end_selection_gesture()
         if self.rules_generation != self.document.rules_generation:
             self.rules_generation = self.document.rules_generation
+            self.track_hover(None)
+            self.end_lookup()
             # Callbacks already in flight belonged to the previous rules.
             self.view.text_cache.clear()
             self.view.text_pending.clear()
@@ -180,6 +191,9 @@ class DocumentPane(QWidget):
         self.end_lookup()
         self.navigation_target = None
         self.links.clear()
+        self.link_reads.clear()
+        self.track_hover(None)
+        self.hover_request = None
         self.history.clear()
         self.history_index = -1
         self.pending_note = self.view.selected_note = None
@@ -397,23 +411,104 @@ class DocumentPane(QWidget):
                     return key
         return None
 
-    def with_link(self, position, callback, *, needed=None):
+    def link_at(self, position, navigable):
         page, x, y = position
+        return next((link for link in self.links.get(page, ()) if self.check_hit(link["box"], x, y)
+                     and (not navigable or "page" in link or QUrl(link["uri"]).scheme() in ("http", "https"))),
+                    None)
+
+    def with_link(self, position, callback, *, needed=None, failed=None, cancelled=None,
+                  navigable=False, priority=-1):
+        page = position[0]
+
+        def deliver(error=None):
+            if needed is not None and not needed():
+                if cancelled is not None:
+                    cancelled()
+                return
+            if error and failed is not None:
+                failed(error)
+                return
+            callback(self.link_at(position, navigable))
+
         if page in self.links:
-            callback(next((link for link in self.links[page] if self.check_hit(link["box"], x, y)), None))
+            deliver()
             return
+        request_key = self.document.identifier, "page_links", self, page
+        if page in self.link_reads:
+            self.link_reads[page].append((needed, deliver))
+            self.document.promote(request_key, priority)
+            return
+        subscribers = self.link_reads[page] = [(needed, deliver)]
 
         def loaded(value, error):
+            self.link_reads.pop(page, None)
             if value is not None:
                 self.links[page] = value
-                if needed is None or needed():
-                    self.with_link(position, callback)
-            elif needed is None or needed():
-                callback(None)
+            for _, ready in subscribers:
+                ready(error)
 
-        self.document.request("page_links", (page,), loaded, priority=-1, needed=needed)
+        self.document.request("page_links", (page,), loaded, priority=priority, key=request_key,
+                              needed=lambda: any(test is None or test() for test, _ in subscribers))
+
+    def track_hover(self, position):
+        if position is None and self.hover_point is None:
+            return
+        if position is not None:
+            if self.document.loading or not self.isVisible() or self.lookup is not None:
+                return
+            page, x, y = position
+            mark = self.view.link_hover
+            if mark and mark[0] == page and self.check_hit(mark[1], x, y):
+                native = self.link_at(position, True)
+                if (mark[2] and native and native["box"] == mark[1]) or (not mark[2] and not native):
+                    return
+            if position == self.hover_point:
+                return
+        self.hover_revision += 1
+        self.hover_point = position
+        self.view.show_link_hover(None)
+        self.hover_timer.stop()
+        if position is not None:
+            self.hover_timer.start()
+
+    def probe_hover(self):
+        position = self.hover_point
+        if self.hover_request is not None or position is None:
+            return
+        request = self.hover_request = object()
+        revision = self.hover_revision
+
+        def current():
+            return (isValid(self) and self.isVisible() and not self.document.loading
+                    and not self.document.disposed and self.lookup is None and revision == self.hover_revision)
+
+        def finish(box=None, native=False):
+            if not isValid(self) or self.hover_request is not request:
+                return
+            self.hover_request = None
+            if current():
+                if box is not None:
+                    tooltip = "" if native else self.t("クリックして移動先を確認", "Click to look up the destination")
+                    self.view.show_link_hover((position[0], box, native), tooltip)
+            elif self.hover_point is not None and not self.hover_timer.isActive():
+                self.hover_timer.start()
+
+        def link_ready(link):
+            if not current():
+                finish()
+            elif link:
+                finish(link["box"], native=True)
+            else:
+                self.document.request("citation_at", position,
+                                      lambda citation, error: finish(citation.box if citation else None),
+                                      priority=HOVER_PRIORITY, needed=current)
+
+        self.with_link(position, link_ready, needed=current, failed=lambda error: finish(), cancelled=finish,
+                       navigable=True, priority=HOVER_PRIORITY)
 
     def hideEvent(self, event):
+        self.track_hover(None)
         self.end_lookup()
         super().hideEvent(event)
 
@@ -443,75 +538,92 @@ class DocumentPane(QWidget):
 
     def clicked(self, index, x, y):
         self.end_lookup()
+        self.track_hover(None)
         if self.document.loading:
             return
         position = index, x, y
         key = self.hit_annotation(position)
-        if key:
-            self.pick_note(key)
-            return
-        self.notes.commit_selected()
-        self.view.selected_note = None
-        self.view.viewport().update()
-        self.notes.set_selection(None)
-
+        selected = self.view.selected_note
         revision = self.view.input_revision
         viewport_revision = self.view.viewport_revision
         generation = self.document.generation
+        rules_generation = self.document.rules_generation
         location = self.view.location()
 
         def still_current():
             return (isValid(self) and self.lookup is still_current and self.isVisible()
                     and not self.document.loading and not self.document.disposed
                     and self.document.generation == generation and self.view.input_revision == revision
+                    and self.document.rules_generation == rules_generation and self.view.selected_note == selected
                     and self.view.viewport_revision == viewport_revision and self.view.location() == location)
 
-        def started():
-            self.lookup_clock.start()
-            self.lookup_timer.start()
+        def clear_note():
+            self.notes.commit_selected()
+            self.view.selected_note = None
+            self.notes.set_selection(None)
+            self.view.viewport().update()
+
+        def failed(error):
+            if still_current():
+                self.end_lookup()
+                self.message.emit(error)
+
+        def no_target():
+            self.end_lookup()
+            if key is None:
+                clear_note()
+            elif self.document.get_note(key) and self.hit_annotation(position) == key:
+                self.pick_note(key)
 
         def named_target(value, error, page, point):
             if still_current():
+                clear_note()
                 if value:
                     self.visit_reference(value)
                 else:
                     self.navigate(page, *point)
 
+        def citation_ready(citation, targets, error):
+            if not still_current():
+                return
+            if error:
+                failed(error)
+            elif any(targets):
+                self.open_citation(position, citation, targets, still_current, clear_note)
+            else:
+                no_target()
+
         def open_link(link):
             if not still_current():
                 return
             if link is None:
-                self.document.resolve_citation(
-                    position, lambda citation, targets: self.open_citation(position, citation, targets, still_current),
-                    still_current, started,
-                )
+                self.document.resolve_citation(position, citation_ready, still_current)
             elif "page" in link:
                 page, point = link["page"], link["point"]
                 if link.get("page_only"):
-                    started()
                     self.document.request("named_figure_target", (position, page),
                                           lambda value, error: named_target(value, error, page, point),
                                           priority=2, needed=still_current)
                 else:
-                    self.navigate(page, *point)
+                    named_target(None, None, page, point)
             else:
                 self.end_lookup()
-                url = QUrl(link["uri"])
-                if url.scheme() in ("http", "https") and not QDesktopServices.openUrl(url):
+                clear_note()
+                if not QDesktopServices.openUrl(QUrl(link["uri"])):
                     self.message.emit(self.t("ブラウザーを開けませんでした。", "Could not open the browser."))
 
         self.lookup = still_current
-        self.with_link(position, open_link, needed=still_current)
+        self.lookup_clock.start()
+        self.lookup_timer.start()
+        self.with_link(position, open_link, needed=still_current, failed=failed, navigable=True)
 
-    def open_citation(self, position, citation, targets, still_current):
-        if not any(targets):
-            self.end_lookup()
-            return
+    def open_citation(self, position, citation, targets, still_current, clear_note):
         self.lookup_clock.invalidate()
         self.lookup_notice.hide()
 
         def visit(entry):
             if still_current():
+                clear_note()
                 self.visit_reference(entry)
 
         if len(citation.keys) == 1:
@@ -539,8 +651,16 @@ class DocumentPane(QWidget):
         menu.popup(self.view.viewport().mapToGlobal(self.view._project(page, (x, y)).toPoint()))
 
     def context_menu(self, point, position=None):
+        # The menu depends on page coordinates and the selection, not on scrolling, so only input and
+        # document changes make a pending lookup stale.
+        revision = self.view.input_revision, self.document.generation
+
+        def current():
+            return (isValid(self) and self.isVisible() and not self.document.loading and not self.document.disposed
+                    and revision == (self.view.input_revision, self.document.generation))
+
         def show(link):
-            if not self.isVisible() or self.document.loading:
+            if not current():
                 return
             t = self.t
             menu = QMenu(self)
@@ -571,7 +691,7 @@ class DocumentPane(QWidget):
             menu.deleteLater()
 
         if position and self.document.info:
-            self.with_link(position, show)
+            self.with_link(position, show, needed=current)
         else:
             show(None)
 

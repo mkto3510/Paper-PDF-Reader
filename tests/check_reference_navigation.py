@@ -32,6 +32,8 @@ def fixture(folder):
                             "Figure 2.6 shows the layout of the radar.\nIts next line remains part of the description.\nThe description then continues.",
                             fontsize=12)
         page.insert_text((55, 156), "Fig. 1 [1] and Table I give details.")
+        for phrase in ("Fig. 1", "Table I"):
+            page.add_highlight_annot(page.search_for(phrase)[0])
         page.insert_text((55, 185), "Figs. 1, 2 and 3 are described in detail.")
         page.insert_text((55, 210), "Counts are discussed (Smith and Jones, 2024a).")
         page.insert_textbox(mu.Rect(55, 220, 545, 280), "See (García-López,\n2022) for a comparison.", fontsize=11)
@@ -232,8 +234,10 @@ def check_window(app, folder, path):
         view.set_zoom("fit")
         view.set_layout(continuous=False)
         view.go_to(0)
+        wait(lambda: len(pane.document.annotations.get(0, {})) == 2, "Figure/table highlights did not load")
         with mu.open(path) as pdf:
             point = view._project(0, tuple(click_point(pdf, "Fig. 1"))).toPoint()
+            table = view._project(0, tuple(click_point(pdf, "Table I"))).toPoint()
         QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=point)
         wait(lambda: view.navigation_target is not None, "Figure was not outlined")
         assert view.navigation_target.label.startswith("Figure 1:")
@@ -242,6 +246,11 @@ def check_window(app, folder, path):
         assert not view.navigation_target and view.current_page() == 0
         pane.back_forward(1)
         assert view.navigation_target.label.startswith("Figure 1:")
+        pane.back_forward(-1)
+        QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=table)
+        wait(lambda: view.current_page() == 1 and view.navigation_target is not None,
+             "Highlighted table reference did not reach its caption")
+        assert view.navigation_target.label.startswith("Table I:") and view.selected_note is None
     finally:
         control.shutdown()
 
