@@ -132,7 +132,7 @@ def _nearby_object(line, regions, page_lines, kind):
 def _ruled_table(line, rules, lines):
     # Open-sided tables often have horizontal rules but no vertical border.
     left, top, right, bottom = line.box
-    fragments = sorted({rule for rule in rules if bottom - line.size * 10 <= rule[1] <= top + line.size * 10},
+    fragments = sorted({rule for rule in rules if top - line.size * 14 <= rule[1] <= bottom + line.size * 14},
                        key=lambda rule: (round(rule[1]), rule[0]))
     rails = []
     for fragment in fragments:
@@ -149,14 +149,15 @@ def _ruled_table(line, rules, lines):
         gap = max(top - second[3], first[1] - bottom)
         if not 0 <= gap < line.size * 2:
             continue
-        cells = [other for other in lines if first[1] <= other.box[1] <= second[1]
-                 and other.box[2] - other.box[0] <= (first[2] - first[0]) * .45
-                 and first[0] - line.size <= other.box[0] < first[2]]
-        columns = {round(cell.box[0] / line.size) for cell in cells}
+        cells = [other.box for other in lines if first[1] <= other.box[1] <= second[1]
+                 and first[0] - line.size <= other.box[0] and other.box[2] <= first[2] + line.size]
+        columns = {round(x0 / line.size) for x0, _, x1, _ in cells if x1 - x0 <= (first[2] - first[0]) * .45}
         aligned_rails = [rule for rule in nearby if abs(first[0] - rule[0]) <= line.size
                          and abs(first[2] - rule[2]) <= line.size]
-        if len(columns) >= 3 or (len(columns) == 2 and len(aligned_rails) >= 3):
-            return first[0], first[1], first[2], second[3]
+        if len(columns) >= 3 or (len(aligned_rails) >= 3 and any(
+                abs(a[1] - b[1]) <= line.size * .35 and b[0] - a[2] >= line.size * .5
+                for a in cells for b in cells)):
+            return bounds(aligned_rails)
     return None
 
 
@@ -227,25 +228,27 @@ def classify_captions(lines, regions, evidence, width, height):
                 continue
             kind, label = figure_label(heading) if heading.re is LABEL else ("other", "")
             object_box = _nearby_object(line, figures if kind == "figure" else tables, ordered, kind)
-            if object_box is None and kind == "table":
-                # Test from the edge of a wrapped title, as its first line can
-                # be farther from the first table rule than a standalone label.
+            if kind == "table":
+                object_box = object_box or _ruled_table(line, rules, lines)
                 candidate_lines = [line]
                 for following in ordered[index + 1:index + 4]:
-                    if caption_heading(following.text) or not _continues(candidate_lines[-1], following, split=True):
+                    if (caption_heading(following.text)
+                            or not _continues(candidate_lines[-1], following, split=True)
+                            or (object_box and line.box[3] <= object_box[1] < following.box[3])):
                         break
                     candidate_lines.append(following)
-                title = replace(line, box=bounds(part.box for part in candidate_lines))
-                object_box = _ruled_table(title, rules, lines)
-                if object_box:
-                    split_tail.update(id(part) for part in candidate_lines[1:])
+                if len(candidate_lines) > 1:
+                    if object_box is None:
+                        # A wrapped title may be closer to the rules at its last line.
+                        title = replace(line, box=bounds(part.box for part in candidate_lines))
+                        object_box = _ruled_table(title, rules, lines)
+                    if object_box:
+                        split_tail.update(id(part) for part in candidate_lines[1:])
             isolated = previous is None or line.box[1] - previous.box[3] > line.size * .6
             distinct = (body_size is not None and abs(line.size - body_size) > body_size * .075
                         and not any(abs(row.box[0] - line.box[0]) <= line.size * .6 for row in prose_rows))
             styled_label = line.leading_bold and (isolated or not tail.strip())
-            after_cells = bool(kind == "table" and previous and re.fullmatch(r"[+\-\d.,% ]+", previous.text.strip()))
-            separated = (isolated or after_cells) and CAPTION_END.match(tail)
-            if object_box is None and not (continued or distinct or styled_label or separated):
+            if object_box is None and not (continued or distinct or styled_label or (isolated and CAPTION_END.match(tail))):
                 continue
             active = [line]
             metadata = kind, label, object_box, continued
