@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import re
 import unicodedata
 
-from .captions import figure_mentions
+from .captions import LABEL, caption_heading, figure_label, figure_mentions
 from .selection import Box, bounds
 
 
@@ -28,6 +28,8 @@ NUMBER_LABEL = rf"(?:\[({NUMBER})\]|({NUMBER})[.)])"
 NUMBER_ENTRY = re.compile(rf"^{NUMBER_LABEL}\s*(?=[^\W\d_])")
 SPLIT_NUMBER = re.compile(NUMBER_LABEL)
 ENTRY_YEAR = re.compile(rf"(?<![\w/])({YEAR})(?![\w/])", re.I)
+END_YEAR = re.compile(rf"(?<![\w/-])({YEAR})[.,]?\s*$", re.I)
+AUTHOR_START = re.compile(rf"^{SURNAME}\s*,\s*(?:[^\W\d_]\.|[A-Z]{{2,3}}[,.\s])")
 HEADING = re.compile(
     r"^(?:\d+(?:\.\d+)*[.)]?\s+)?(?:references|bibliography|works cited|literature cited|(?:参\s*考|引\s*用)?\s*文\s*献)\s*[:.]?$",
     re.I,
@@ -174,9 +176,11 @@ def citation_at(lines, x, y):
         normalized = "".join(text)
         figures = [(span, Citation(label, keys, "figure")) for span, label, keys in figure_mentions(normalized)]
         within_object = line.kind in ("table", "caption")
-        if not within_object:
+        if line.kind != "table":
+            own_heading = caption_heading(line.text) if line.kind == "caption" else None
+            own_label = figure_label(own_heading) if own_heading and own_heading.re is LABEL else None
             for (start, end), citation in figures:
-                if hit(start, end):
+                if own_label not in citation.keys and hit(start, end):
                     return citation
         for (start, end), citation in citation_spans(normalized.translate(DASHES)):
             if hit(start, end) and not any(a < end and start < b for (a, b), _ in figures):
@@ -236,6 +240,14 @@ def _entry_identity(text):
     number = int(number_match[1] or number_match[2]) if number_match else None
     content = text[number_match.end():] if number_match else text
     year = ENTRY_YEAR.search(content, 0, 210)
+    lead, delimiter, remainder = content.partition(":")
+    if delimiter and AUTHOR_START.match(lead):
+        # Some styles place the year after the venue or DOI. In those styles
+        # the author field ends at the colon, before years in the title.
+        plain_remainder = re.sub(r"https?://[^\s,]+", "", remainder)
+        terminal = END_YEAR.search(plain_remainder)
+        if terminal and (terminal_authors := _entry_authors(lead)):
+            return number, terminal_authors, terminal[1].casefold(), True
     authors = _entry_authors(content[:year.start()]) if year else ()
     return number, authors, year[1].casefold() if year else "", bool(authors and year or BIBLIOGRAPHIC.search(content))
 
@@ -375,7 +387,7 @@ class ReferenceIndex:
     def _entries(rows):
         entries = []
         for i, row in enumerate(rows):
-            page, _, label, box, raw, paragraph = row
+            page, _, label, box, raw, _ = row
             if not label or END.fullmatch(label):
                 continue
             previous = rows[i - 1] if i else None
@@ -384,16 +396,24 @@ class ReferenceIndex:
             if hanging and not NUMBER_ENTRY.match(label) and not re.match(rf"^{SURNAME},", label) and not explicit_author_year:
                 continue
             text = label
-            for subsequent in rows[i + 1:i + 4]:
+            last = row
+            for subsequent in rows[i + 1:i + 13]:
                 if NUMBER_ENTRY.match(subsequent[2]) or HEADING.fullmatch(subsequent[2]) or END.fullmatch(subsequent[2]):
                     break
-                if subsequent[0] != page:
-                    if not (subsequent[0] == page + 1 and subsequent[1] < 2
-                            and 3 <= subsequent[4][0] - raw[0] <= 35):
-                        break
-                elif not (subsequent[5] == paragraph or 3 <= subsequent[4][0] - raw[0] <= 35):
+                indent = subsequent[4][0] - raw[0]
+                if abs(indent) < 3 and AUTHOR_START.match(subsequent[2]):
                     break
+                if subsequent[0] != last[0]:
+                    if not (subsequent[0] == last[0] + 1 and subsequent[1] < 2 and 3 <= indent <= 35):
+                        break
+                else:
+                    current_box = last[4]
+                    gap = subsequent[4][1] - current_box[1]
+                    height = current_box[3] - current_box[1]
+                    if not (0 < gap <= height * 2.35 and (subsequent[5] == last[5] or 3 <= indent <= 35)):
+                        break
                 text += " " + subsequent[2]
+                last = subsequent
             number, authors, year, evidence = _entry_identity(text)
             if number is not None or (authors and year):
                 entries.append((number, authors, year, Reference(page, box, label[:110]), evidence))

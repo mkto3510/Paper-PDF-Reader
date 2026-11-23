@@ -1,7 +1,7 @@
 """Figure/table labels and shared evidence for confirming their captions."""
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 from unicodedata import normalize
 
@@ -152,7 +152,10 @@ def _ruled_table(line, rules, lines):
         cells = [other for other in lines if first[1] <= other.box[1] <= second[1]
                  and other.box[2] - other.box[0] <= (first[2] - first[0]) * .45
                  and first[0] - line.size <= other.box[0] < first[2]]
-        if len({round(cell.box[0] / line.size) for cell in cells}) >= 3:
+        columns = {round(cell.box[0] / line.size) for cell in cells}
+        aligned_rails = [rule for rule in nearby if abs(first[0] - rule[0]) <= line.size
+                         and abs(first[2] - rule[2]) <= line.size]
+        if len(columns) >= 3 or (len(columns) == 2 and len(aligned_rails) >= 3):
             return first[0], first[1], first[2], second[3]
     return None
 
@@ -160,7 +163,7 @@ def _ruled_table(line, rules, lines):
 def _continues(above, below):
     size = above.size
     return (above.paragraph == below.paragraph and above.horizontal == below.horizontal
-            and abs(above.box[0] - below.box[0]) < size * 2
+            and abs(above.box[0] - below.box[0]) < size * 3.5
             and abs(above.size - below.size) <= size * .10
             and below.box[1] - above.box[1] > size * .35
             and -size * .75 <= below.box[1] - above.box[3] <= size * .6)
@@ -221,7 +224,15 @@ def classify_captions(lines, regions, evidence, width, height):
             kind, label = figure_label(heading) if heading.re is LABEL else ("other", "")
             object_box = _nearby_object(line, figures if kind == "figure" else tables, ordered, kind)
             if object_box is None and kind == "table":
-                object_box = _ruled_table(line, rules, lines)
+                # Test from the edge of a wrapped title, as its first line can
+                # be farther from the first table rule than a standalone label.
+                tail_line = line
+                for following in ordered[index + 1:index + 4]:
+                    if caption_heading(following.text) or not _continues(tail_line, following):
+                        break
+                    tail_line = following
+                title = replace(line, box=bounds((line.box, tail_line.box)))
+                object_box = _ruled_table(title, rules, lines)
             isolated = previous is None or line.box[1] - previous.box[3] > line.size * .6
             distinct = (body_size is not None and abs(line.size - body_size) > body_size * .075
                         and not any(abs(row.box[0] - line.box[0]) <= line.size * .6 for row in prose_rows))

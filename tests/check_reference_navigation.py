@@ -15,7 +15,7 @@ from pypdf.generic import (
 
 from check_chrome_notes import wait
 from paper_reader.application import Application
-from paper_reader.captions import figure_mentions
+from paper_reader.captions import classify_captions, figure_mentions
 from paper_reader.citations import ReferenceIndex
 from paper_reader.notes import COLORS, add_color_actions
 from paper_reader.pdf import PdfEngine
@@ -177,6 +177,40 @@ def check_unheaded_bibliography():
     assert not early.targets((1, 90, 90), (1,))
     assert len(tail.targets((1, 90, 90), (1, 2, 3))) == 3
 
+    venue_style = ReferenceIndex(1)
+    venue_style.add_page(0, [row("References", 60, 120, 0),
+                             row("de Vries, A., and Smith, B.: Events in 1950 and", 60, 140, 1),
+                             row("their impact on measurement, Proceedings of", 82, 152, 1),
+                             row("the International Conference on Research,", 82, 164, 1),
+                             row("third edition, 20–32, https://example.com/2023,", 82, 176, 1),
+                             row("2024.", 82, 188, 1),
+                             row("Jones, C. (2020). A separate reference.", 60, 210, 2)])
+    assert not venue_style.targets((0, 80, 80), (("de vries", "1950"),))
+    target, = venue_style.targets((0, 80, 80), (("de vries", "2024", "smith"),))
+    assert target.label.startswith("de Vries, A.")
+
+
+def check_two_column_table():
+    def row(text, x, y, width, paragraph):
+        box = (x, y, x + width, y + 10)
+        return Line((Glyph(text, box, ()),), box, 10, True, paragraph)
+
+    lines = [
+        row("Other prose", 60, 115, 190, 0),
+        row("Table A.2 Measurements by instrument and reference", 60, 164, 240, 1),
+        row("observation interval", 87, 177, 100, 1),
+        row("Instrument", 67, 193, 61, 2),
+        row("Interval", 175, 193, 43, 3),
+        row("Instrument B", 67, 221, 60, 4),
+        row("6 days", 175, 221, 31, 5),
+    ]
+    rules = [(start, y, stop, y) for y in (191, 214, 242)
+             for start, stop in ((62, 154), (154, 300))]
+    groups, caption_rows, _ = classify_captions(lines, (lines,), ([], rules, [], [], False), 600, 700)
+    caption, = groups
+    assert (caption.kind, caption.label) == ("table", "a.2")
+    assert {id(line) for line in lines[1:3]} == caption_rows and caption.object_box
+
 
 def check_window(app, folder, path):
     menu = QMenu()
@@ -221,5 +255,6 @@ if __name__ == "__main__":
         check_engine(path)
         check_named_coordinates(folder)
         check_unheaded_bibliography()
+        check_two_column_table()
         check_window(app, folder, path)
     print("PASS figure/table jumps, named links, captions, citation overlap, and color actions")

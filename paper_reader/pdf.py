@@ -57,6 +57,7 @@ class PdfEngine:
         self.signature = None
         self.backed_up = False
         self.text_cache: OrderedDict = OrderedDict()
+        self.citation_cache: OrderedDict = OrderedDict()
         self.layout_cache: OrderedDict = OrderedDict()
         self.edge_cache = {}
         self.display_lists = OrderedDict()
@@ -116,6 +117,7 @@ class PdfEngine:
         self.in_bibliography = False
         self.chapter_pages = set()
         self.layout_cache.clear()
+        self.citation_cache.clear()
         self.display_lists.clear()
         if self.analysis_doc is not None:
             self.analysis_doc.close()
@@ -168,6 +170,7 @@ class PdfEngine:
     def update_rules(self, settings):
         self.options = DEFAULT_RULES | settings
         self.text_cache.clear()
+        self.citation_cache.clear()
         self.edge_cache.clear()
 
     def content_bounds(self, index):
@@ -223,7 +226,7 @@ class PdfEngine:
         return style in ("FitH", "FitBH", "FitV", "FitBV") and low.pdf_is_null(low.pdf_array_get(destination, 2))
 
     def citation_at(self, page, x, y):
-        return citation_at(self.text(page), x, y)
+        return citation_at(self.text(page, quads=False), x, y)
 
     def _index_rows(self, page):
         # Read a single page and avoid instantiating per-glyph quads for the index.
@@ -244,6 +247,12 @@ class PdfEngine:
         width, height = page.rect.width, page.rect.height
         if page.rotation in (90, 270):
             width, height = height, width
+        if page.number not in self.edge_cache:
+            fraction = self.options["edge_band"] / 100
+            self.edge_cache[page.number] = {
+                (side, furniture_key(line.text), line.box[1] / height)
+                for line in lines if (side := edge_band(line, height, fraction))
+            }
         return lines, width, height
 
     def reference_step(self):
@@ -327,7 +336,9 @@ class PdfEngine:
         if self.figure_page < self.doc.page_count:
             return (None,) * len(keys)
         entries = tuple(entry for page_entries in self.figure_pages.values() for entry in page_entries)
-        return self._figure_targets(keys, entries)
+        page, x, y = position
+        return tuple(None if target and target.page == page and mu.Point(x, y) in mu.Rect(target.box) else target
+                     for target in self._figure_targets(keys, entries))
 
     def named_figure_target(self, position, page):
         marker = self.citation_at(*position)
@@ -369,7 +380,7 @@ class PdfEngine:
             self.analysis_doc = doc
         return self.analysis_doc[index]
 
-    def _read_lines(self, page, mark_artifacts=False):
+    def _read_lines(self, page, mark_artifacts=False, *, quads=True):
         text = page.get_text("rawdict", flags=mu.TEXTFLAGS_RAWDICT & ~mu.TEXT_PRESERVE_IMAGES, sort=False)
         artifacts = artifact_glyphs(page) if mark_artifacts else set()
         lines: list[Line] = []
@@ -380,9 +391,9 @@ class PdfEngine:
                 for span in raw["spans"]:
                     for char in span["chars"]:
                         x, y = char["origin"]
+                        quad = tuple(tuple(point) for point in mu.recover_char_quad(raw["dir"], span, char)) if quads else ()
                         glyphs.append(Glyph(
-                            char["c"], tuple(char["bbox"]),
-                            tuple(tuple(point) for point in mu.recover_char_quad(raw["dir"], span, char)),
+                            char["c"], tuple(char["bbox"]), quad,
                             (round(x, 1), round(y, 1), char["c"]) in artifacts,
                         ))
                         sizes.append(span["size"])
@@ -427,15 +438,16 @@ class PdfEngine:
             self.layout_cache.move_to_end(index)
         return self.layout_cache[index]
 
-    def text(self, index):
-        if index in self.text_cache:
-            self.text_cache.move_to_end(index)
-            return self.text_cache[index]
+    def text(self, index, *, quads=True):
+        cache = self.text_cache if quads or index in self.text_cache else self.citation_cache
+        if index in cache:
+            cache.move_to_end(index)
+            return cache[index]
         page = self._analysis_page(index)
         width, height = page.rect.width, page.rect.height
         if page.rotation in (90, 270):
             width, height = height, width
-        lines = self._read_lines(page, self.options.get("artifact", True))
+        lines = self._read_lines(page, self.options.get("artifact", True), quads=quads)
         band = self.options["edge_band"] / 100
         neighbours = set()
         if any(edge_band(line, height, band) for line in lines):
@@ -465,9 +477,9 @@ class PdfEngine:
             else:
                 trailing.append(line)
         result = self._display_lines((*leading, *content, *trailing), page)
-        self.text_cache[index] = result
-        if len(self.text_cache) > 12:
-            self.text_cache.popitem(last=False)
+        cache[index] = result
+        if len(cache) > (12 if quads else 6):
+            cache.popitem(last=False)
         return result
 
     def selection_page(self, index, first, last, origin=None):
