@@ -14,7 +14,7 @@ from .selection import bounds, edge_band, furniture_key
 
 
 RULES = ("furniture", "caption", "small", "figure", "table", "footnote",
-         "margin", "equation", "code", "ruby", "line_number", "artifact")
+         "margin", "equation", "code", "ruby", "line_number", "artifact", "front")
 DEFAULT_RULES = {rule: True for rule in RULES} | {"edge_band": 12, "small_text": 6}
 LABELS = {
     "body": ("本文", "Body text"),
@@ -26,6 +26,7 @@ LABELS = {
     "equation": ("別行立ての数式", "Displayed equations"),
     "code": ("コード・アルゴリズム", "Code and algorithms"), "ruby": ("ルビ", "Ruby"),
     "line_number": ("査読用行番号", "Line numbers"), "artifact": ("装飾タグ", "PDF artifacts"),
+    "front": ("著者・所属・受理日", "Authors, affiliations and dates"),
 }
 NUMBER = re.compile(r"[-–—―\s]*([0-9０-９]+)[-–—―\s]*$")
 MATH = re.compile(r"[=∑∫√≤≥±∂∇]|(?<=\s)\(\d+[a-z]?\)\s*$")
@@ -170,7 +171,56 @@ def _mark_figure_text(lines, result, width, body_ids):
             cluster = [line] if line is not None else []
 
 
-def classify(lines, width, height, neighbours, evidence, options, regions=()):
+# Where the text of an article begins, on its first page: what comes above is the title block.
+BODY_START = re.compile(r"^(?:abstract|summary|key\s*words?|index\s+terms|introduction|1\.?\s+introduction|"
+                        r"要\s*旨|概\s*要|要\s*約|あらまし|アブストラクト|キーワード|はじめに|1\.?\s*はじめに)\b", re.I)
+DATE_LINE = re.compile(r"^(?:manuscript\s+)?(?:received|accepted|revised|published|available\s+online|submitted|"
+                       r"受付|受理|原稿受付|原稿受理|投稿|改訂)\b|^©|^copyright\b|^\(?c\)\s*\d{4}", re.I)
+AFFILIATION = re.compile(r"\b(?:universit(?:y|ät|é|à)|universidad|institut(?:e|ion|o)?|department|dept\.|laborator(?:y|ies)|"
+                         r"faculty|school\s+of|college|centre|center|observatory|academy|hospital|ministry|agency|"
+                         r"division)\b|大学|研究所|研究科|学部|学科|センター|機構|研究院|気象庁|研究部|事業所|観測所|教室", re.I)
+CONTACT = re.compile(r"@|\b(?:corresponding\s+author|correspondence|e-?mail)\b|連絡先|責任著者", re.I)
+LATIN_NAME = re.compile(r"(?:[A-Z][\w'’.-]*\.?)(?:\s+(?:[A-Z][\w'’.-]*\.?|van|von|de|der|la|le|di|da|dos)){1,3}")
+JAPANESE_NAME = re.compile(r"[㐀-鿿々ァ-ヶー]{2,5}")
+
+
+def _author_line(text):
+    """Tell whether a line is a list of author names: several names split by commas, "and" or a middle dot,
+    each possibly followed by a note mark (a digit, an asterisk, a dagger)."""
+    if re.search(r"[()（）［］\[\]「」『』]", text):
+        return False  # a name list has no brackets; a wrapped line of a sentence often has one
+    plain = re.sub(r"[\d*†‡§¶²³¹⁰-⁹＊]+", "", text)
+    parts = [part.strip() for part in re.split(r",|;|\band\b|&|・|、|，", plain) if part.strip()]
+    if len(parts) < 2 or len(text) > 200:
+        return False
+    names = sum(bool(LATIN_NAME.fullmatch(part) or (JAPANESE_NAME.fullmatch(part) and len(parts) >= 3))
+                for part in parts)
+    return names >= len(parts) * .8
+
+
+def _mark_front_matter(lines, result, size, body_ids):
+    """Mark the author line, the affiliations, the contact line and the dates of a first page.
+
+    Only lines above the first line that opens the text (an abstract, keywords, an introduction) are looked at, and
+    when no such line is found nothing is marked: the title and the abstract are text to read, not front matter."""
+    starts = [line for line in lines if line.horizontal and BODY_START.match(line.text.strip())]
+    if not starts:
+        return
+    limit = min(line.box[1] for line in starts)
+    for line in lines:
+        text = line.text.strip()
+        if (result[id(line)].kind or not line.horizontal or line.box[3] > limit + 1 or id(line) in body_ids
+                or line.size > size * 1.15 or not text or len(text) > 220):
+            continue
+        if text[0].islower() or line.text[:1] in ("　", "	"):
+            continue  # a line that goes on from the one above, or opens an indented paragraph: running text
+        sentence = len(text.split()) >= 12 and text.endswith(".")
+        if (DATE_LINE.match(text) or CONTACT.search(text) or (AFFILIATION.search(text) and not sentence)
+                or _author_line(text)):
+            result[id(line)] = replace(line, kind="front")
+
+
+def classify(lines, width, height, neighbours, evidence, options, regions=(), first_page=False):
     if not lines:
         return ()
     edge_fraction = options["edge_band"] / 100
@@ -354,4 +404,6 @@ def classify(lines, width, height, neighbours, evidence, options, regions=()):
                and piece.box[0] <= line.box[2] + reach for piece in pieces):
             result[id(line)] = replace(line, kind="equation")
     _mark_figure_text(lines, result, width, body_ids)
+    if first_page:
+        _mark_front_matter(lines, result, size, body_ids)
     return tuple(result[id(line)] for line in lines)

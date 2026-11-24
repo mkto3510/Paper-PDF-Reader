@@ -594,7 +594,7 @@ class PdfEngine:
                     neighbours.update(self._page_layout(near).edges)
         regions = reading_regions(lines, width)
         evidence = self._page_evidence(index, page)
-        classified = classify(lines, width, height, neighbours, evidence, self.options, regions)
+        classified = classify(lines, width, height, neighbours, evidence, self.options, regions, first_page=index == 0)
         leading, content, trailing = [], [], []
         horizontal_body = sum(len(line.glyphs) for line in classified if line.horizontal) > sum(
             len(line.glyphs) for line in classified if not line.horizontal)

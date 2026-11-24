@@ -608,6 +608,41 @@ def check_figure_text():
     assert all(item.kind == "" for item in result if item.text.startswith(("Running", "More"))), kinds
 
 
+def check_front_matter():
+    """On a first page, the author line, the affiliations, the contact line and the dates above the abstract are front
+    matter; the title and the abstract are not. Without a line that opens the text, nothing is marked."""
+    from paper_reader.analysis_rules import DEFAULT_RULES, classify
+    from paper_reader.selection import Glyph, Line, reading_regions
+
+    def line(text, y, size=10.0, block=0, width=300):
+        box = (56, y, 56 + width, y + size)
+        return Line((Glyph(text, box, ()),), box, size, True, block)
+
+    def kinds(texts, first_page=True):
+        lines = [line(text, 60 + number * 16, 18.0 if number == 0 else 10.0, number) for number, text in enumerate(texts)]
+        body = [line(f"The body of the article goes on here in running sentences, line {row}.", 400 + row * 12,
+                     block=100 + row) for row in range(8)]
+        lines += body
+        result = classify(lines, 612, 792, set(), ([], [], [], [], False), DEFAULT_RULES, reading_regions(lines, 612),
+                          first_page=first_page)
+        return [item.kind for item in result[:len(texts)]]
+
+    head = ["Maximum hurricane intensity preceded by increase in lightning",
+            "Colin Price1*, Mustafa Asfur2 and Yoav Yair2",
+            "Department of Geophysics, Tel Aviv University, Tel Aviv 69978, Israel",
+            "Received 12 March 2015; accepted 3 June 2015",
+            "E-mail: price@example.org",
+            "Abstract",
+            "Hurricanes are the most deadly storms of the Earth and cause devastation every year."]
+    assert kinds(head) == ["", "front", "front", "front", "front", "", ""], kinds(head)
+    assert kinds(head, first_page=False) == [""] * 7
+    no_start = [head[0], head[1], head[2], head[3], head[6]]
+    assert kinds(no_start) == [""] * 5, kinds(no_start)
+    japanese = ["北海道駒ヶ岳火山の噴火履歴", "勝井義雄・篠沢達也・知本康男", "北海道大学大学院理学研究院", "はじめに",
+                "北海道には現在18の活火山が存在し，中でも雌阿寒岳，十勝岳が知られている。"]
+    assert kinds(japanese) == ["", "front", "front", "", ""], kinds(japanese)
+
+
 def check_heading_variants(folder):
     """Letter-spaced and "cited" headings open a bibliography."""
     for number, heading in enumerate(("R E F E R E N C E S", "REFERENCES CITED", "References")):
@@ -890,6 +925,7 @@ if __name__ == "__main__":
         check_selection_paragraphs(folder)
         check_symbol_lines()
         check_figure_text()
+        check_front_matter()
         check_page_layout(folder)
         check_year_lists()
         check_prefixed_labels()
