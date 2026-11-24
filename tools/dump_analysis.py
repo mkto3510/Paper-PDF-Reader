@@ -103,6 +103,7 @@ def main():
     parser.add_argument("--no-text", action="store_true", help="skip the classified lines of sample pages")
     parser.add_argument("--compare", nargs=2, metavar=("BEFORE", "AFTER"))
     args = parser.parse_args()
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     if args.compare:
         sys.exit(1 if compare(*args.compare) else 0)
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))

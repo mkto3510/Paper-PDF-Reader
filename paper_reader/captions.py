@@ -374,10 +374,12 @@ def classify_captions(lines, regions, evidence, width, height):
             isolated = previous is None or line.box[1] - previous.box[3] > line.size * .6
             distinct = (body_size is not None and abs(line.size - body_size) > body_size * .075
                         and not any(abs(row.box[0] - line.box[0]) <= line.size * .6 for row in prose_rows))
-            styled_label = line.leading_bold and (isolated or not tail.strip())
-            # A line of its own that holds only "Figure 1", with a sentence starting right after it.
+            styled_label = line.leading_bold and (isolated or not tail.strip(" .:：|"))
+            # A line of its own that holds only "Figure 1", with a sentence starting right after it. Figure text
+            # may sit close above it, so the gap before is not asked for.
             following = ordered[index + 1] if index + 1 < len(ordered) else None
-            label_start = (isolated and _label_only(line) and following is not None
+            # (A supplementary label alone on a line is usually an entry of the list of supplementary material.)
+            label_start = (_label_only(line) and not re.match(r"(?:s|ed)\d", label) and following is not None
                            and following.box[1] - line.box[3] < line.size * 1.2
                            and (following.text.strip()[:1].isupper() or following.text.strip()[:1] == "("))
             # "FIG. 2" and "TABLE I" in capitals are headings; running text writes "Fig. 2" or "Figure 2".
