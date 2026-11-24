@@ -455,6 +455,28 @@ def check_scanned_caption(folder):
         engine.close()
 
 
+def check_label_close_below_figure_text(folder):
+    """A label alone on a line is a caption when a sentence follows it, even with figure text right above it."""
+    path = folder / "label_below_text.pdf"
+    with mu.open() as pdf:
+        page = pdf.new_page(width=612, height=792)
+        for row in range(6):
+            page.insert_text((56, 70 + row * 12), f"Running prose of the article, line {row}, goes on across the column.", fontsize=10)
+        page.insert_text((120, 300), "FeO (wt %)", fontsize=8)
+        page.insert_text((56, 312), "Figure 7.", fontsize=9, fontname="hebo")
+        page.insert_text((56, 323), "Concentrations of FeO versus Th for different groups of lunar material.", fontsize=9)
+        page.insert_text((56, 400), "Sentences as in Figure 7. then go on in the running text of the article.", fontsize=10)
+        pdf.save(path)
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(path))
+        rows, _ = engine._caption_rows(0)
+        assert [row[0].label for row in rows] == ["7"], rows
+        assert rows[0][0].text.startswith("Figure 7.") and "Concentrations" in rows[0][0].text, rows[0][0].text
+    finally:
+        engine.close()
+
+
 def check_label_on_band_row(folder):
     """A label printed a little higher than the full-width caption text beside it stays on that row."""
     path = folder / "band_row.pdf"
@@ -684,6 +706,7 @@ if __name__ == "__main__":
         check_split_caption(folder)
         check_scanned_caption(folder)
         check_label_on_band_row(folder)
+        check_label_close_below_figure_text(folder)
         check_page_layout(folder)
         check_year_lists()
         check_prefixed_labels()
