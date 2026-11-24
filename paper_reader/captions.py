@@ -10,12 +10,19 @@ from .selection import Box, bounds
 
 NUMBER = (r"(?:(?:[sS]|[a-zA-Z]\.)?\d{1,5}(?:[.-]\d{1,5})*"
           r"(?:\([a-zA-Z]\)|[a-zA-Z](?![a-zA-Z]))?|[IVXLCDM]{1,8}(?![a-zA-Z]))")
+ARABIC = r"\d{1,5}(?:[.-]\d{1,5})*(?:\([a-zA-Z]\)|[a-zA-Z](?![a-zA-Z]))?"
 LABEL = re.compile(
     rf"(?:(?<!\w)(?P<prefix>(?:extended\s+data|supplementa(?:ry|l))\s+)?(?P<english>fig(?:ure)?s?\.?|tables?)"
     rf"\s*(?P<eng_number>{NUMBER})"
     rf"|第?\s*(?P<japanese>[図表])\s*(?:[-−]\s*)?(?P<jp_number>{NUMBER})"
-    rf"|第\s*(?P<ordinal>{NUMBER})\s*(?P<ordinal_kind>[図表]))", re.I,
+    rf"|第\s*(?P<ordinal>{NUMBER})\s*(?P<ordinal_kind>[図表])"
+    # Other names of figures and tables. They take Arabic numbers only: "plate d" or "scheme i" are not labels.
+    rf"|(?<!\w)(?P<word>plates?|schemes?|photos?|photographs?|abb(?:ildung(?:en)?)?\.?|tabellen?)"
+    rf"\s*(?P<word_number>{ARABIC})"
+    rf"|(?P<jword>写真|図版)\s*(?:[-−]\s*)?(?P<jword_number>{ARABIC}))", re.I,
 )
+# Names that print their own series of numbers: Plate 1 is not Figure 1.
+WORD_TAGS = {"plate": "pl", "scheme": "sc", "photo": "ph", "photograph": "ph", "写真": "ph", "図版": "pl"}
 FOLLOWING_NUMBER = re.compile(rf"\s*(?P<sep>,|、|・|–|—|〜|～|~|\s-\s|\band\b|と|および)\s*(?P<number>{NUMBER})", re.I)
 CAPTION_END = re.compile(r"^\s*[.:：|]\s*(?=\S)")
 BODY_LEAD = re.compile(
@@ -45,19 +52,39 @@ def label_key(text):
     return normalize("NFKC", text).casefold().replace("(", "").replace(")", "")
 
 
+def _word(match):
+    """The name of a label that is not Figure or Table: plate, scheme, photo, Abbildung, Tabelle, 写真."""
+    word = (match["word"] or match["jword"] or "").casefold().rstrip(".")
+    if word.startswith("photograph"):
+        return "photo"
+    return "abbildung" if word.startswith("abb") else word.rstrip("n") if word.startswith("tabelle") else word.rstrip("s")
+
+
+def _running_word(match):
+    """A name printed in lower case (plate, scheme, photo) is a common noun; labels are capitalized."""
+    return bool(match["word"]) and match["word"][0].islower()
+
+
 def _raw_label(match):
+    if match["word"] or match["jword"]:
+        word = _word(match)
+        return ("table" if word.startswith("tabelle") else "figure",
+                label_key(match["word_number"] or match["jword_number"]))
     kind = (match["english"] or match["japanese"] or match["ordinal_kind"]).casefold()
     return ("figure" if kind.startswith("fig") or kind == "図" else "table",
             label_key(match["eng_number"] or match["jp_number"] or match["ordinal"]))
 
 
 def _tagged(match, number):
-    """Keep "Extended Data Fig. 3" and "Supplementary Fig. 3" apart from the figure 3 of the article."""
+    """Keep "Extended Data Fig. 3", "Supplementary Fig. 3" and "Plate 3" apart from the figure 3 of the article."""
     prefix = match["prefix"] if "prefix" in match.re.groupindex else None
-    if not prefix:
+    if match["word"] or match["jword"]:
+        tag = WORD_TAGS.get(_word(match), "")
+    elif prefix:
+        tag = "ed" if prefix.casefold().startswith("extended") else "s"
+    else:
         return number
-    tag = "ed" if prefix.casefold().startswith("extended") else "s"
-    return number if number.startswith(tag) else tag + number
+    return number if not tag or number.startswith(tag) else tag + number
 
 
 def figure_label(match):
@@ -75,6 +102,8 @@ def _label_interval(first, last):
 
 def figure_mentions(text):
     for match in LABEL.finditer(text):
+        if _running_word(match):
+            continue
         start, end = match.span()
         kind, label = _raw_label(match)
         if match["english"] and match["english"].casefold().rstrip(".").endswith("s") and re.fullmatch(r"\d+-\d+", label):
@@ -106,7 +135,10 @@ def figure_mentions(text):
 
 def caption_heading(text):
     text = normalize("NFKC", text.strip())
-    return LABEL.match(text) or LEGACY_LABEL.match(text)
+    match = LABEL.match(text)
+    if match and _running_word(match):
+        match = None  # "tectonic plate 3 moves": the word is part of a sentence
+    return match or LEGACY_LABEL.match(text)
 
 
 def _nearby_object(line, regions, page_lines, kind):

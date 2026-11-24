@@ -541,6 +541,15 @@ def check_prefixed_labels():
     assert keys("Supplementary Fig. S3 shows") == [(("figure", "s3"),)]
     heading = caption_heading(normalize("NFKC", "Extended Data Fig. 1 | MT data misfit analysis."))
     assert figure_label(heading) == ("figure", "ed1"), figure_label(heading)
+    # Plates, schemes and photographs print their own numbers; Abbildung and Tabelle are figure and table.
+    assert keys("shown on Plate 1 and Fig. 1") == [(("figure", "pl1"),), (("figure", "1"),)]
+    assert keys("Plates 1 and 2") == [(("figure", "pl1"), ("figure", "pl2"))]
+    assert keys("Scheme 2 shows") == [(("figure", "sc2"),)]
+    assert keys("写真 3 に示す") == [(("figure", "ph3"),)]
+    assert keys("Abbildung 4 und Tabelle 2") == [(("figure", "4"),), (("table", "2"),)]
+    assert keys("the tectonic plate 3 moves, plate d, scheme i") == []
+    assert figure_label(caption_heading("Plate 1. (a) Surface expressions")) == ("figure", "pl1")
+    assert caption_heading("plate 3 moves north") is None
 
 
 def check_panel_mentions():
