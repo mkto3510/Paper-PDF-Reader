@@ -455,6 +455,67 @@ def check_scanned_caption(folder):
         engine.close()
 
 
+def check_paragraphs(folder):
+    """Paragraphs: a heading stands alone, a paragraph continues into the next column, an indented line after a
+    finished sentence starts a new one, and a lone symbol is not a paragraph."""
+    path = folder / "paragraphs.pdf"
+    with mu.open() as pdf:
+        page = pdf.new_page(width=612, height=792)
+        page.insert_text((56, 80), "1. Introduction", fontsize=11, fontname="hebo")
+        for row in range(20):
+            page.insert_text((56, 100 + row * 12), f"Running text of the first paragraph, line {row}, goes on across the column", fontsize=10)
+        right = [(320, "continues at the top of the right column and the sentence"),
+                 (320, "then ends here. It is finished."),
+                 (334, "A new paragraph begins after the indent. Its second line"),
+                 (320, "wraps around the column as running text does.")]
+        for row, (x, text) in enumerate(right):
+            page.insert_text((x, 100 + row * 12), text, fontsize=10)
+        page.insert_text((300, 60), "X", fontsize=10)
+        pdf.save(path)
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(path))
+        texts = [item.text for item in engine.paragraphs()]
+    finally:
+        engine.close()
+    assert "1. Introduction" in texts, texts
+    joined = [text for text in texts if text.startswith("Running text")]
+    assert len(joined) == 1 and "line 19" in joined[0] and joined[0].endswith("It is finished."), texts
+    assert any(text.startswith("A new paragraph begins") and text.endswith("does.") for text in texts), texts
+    assert "X" not in texts, texts
+
+
+def check_paragraph_edges(folder):
+    """A bold line ending in a colon is a heading, numbered items and bibliography entries are separate paragraphs,
+    and the entries of a bibliography are marked as references."""
+    path = folder / "paragraph_edges.pdf"
+    with mu.open() as pdf:
+        page = pdf.new_page(width=612, height=792)
+        page.insert_text((56, 80), "Acknowledgments:", fontsize=10, fontname="hebo")
+        page.insert_text((56, 94), "This study was supported by a grant from the national research fund.", fontsize=10)
+        page.insert_text((56, 106), "We thank the reviewers for their careful reading of the manuscript.", fontsize=10)
+        page.insert_text((56, 150), "References", fontsize=11, fontname="hebo")
+        entries = [("Dieterich JH, Kilgore B. 1996a. Implications of fault constitutive", "properties for earthquake prediction. Proc. Natl. Acad. Sci. 93:3787"),
+                   ("Doser DI, Kanamori H. 1986. Depth of seismicity in the Imperial", "Valley region. J. Geophys. Res. 91:675"),
+                   ("Edmond JM, Paterson MS. 1972. Volume changes during the deformation", "of rocks at high pressures. Int. J. Rock Mech. 9:161")]
+        for row, (first, second) in enumerate(entries):
+            page.insert_text((56, 170 + row * 30), first, fontsize=9)
+            page.insert_text((68, 181 + row * 30), second, fontsize=9)
+        pdf.save(path)
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(path))
+        found = engine.paragraphs()
+    finally:
+        engine.close()
+    texts = [(item.kind, item.text) for item in found]
+    assert ("body", "Acknowledgments:") in texts, texts
+    assert any(kind == "body" and text.startswith("This study was supported") and text.endswith("manuscript.")
+               for kind, text in texts), texts
+    references = [text for kind, text in texts if kind == "reference"]
+    assert len(references) == 3 and references[1].startswith("Doser DI") and references[1].endswith("675"), references
+
+
 def check_heading_variants(folder):
     """Letter-spaced and "cited" headings open a bibliography."""
     for number, heading in enumerate(("R E F E R E N C E S", "REFERENCES CITED", "References")):
@@ -732,6 +793,8 @@ if __name__ == "__main__":
         check_label_on_band_row(folder)
         check_label_close_below_figure_text(folder)
         check_heading_variants(folder)
+        check_paragraphs(folder)
+        check_paragraph_edges(folder)
         check_page_layout(folder)
         check_year_lists()
         check_prefixed_labels()

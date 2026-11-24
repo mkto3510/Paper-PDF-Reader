@@ -20,6 +20,7 @@ from .artifacts import artifact_glyphs
 from .captions import caption_heading, classify_captions
 from .citations import END, HEADING, Reference, ReferenceIndex, citation_at
 from .layout import PageLayout
+from .paragraphs import enumerate_paragraphs
 from .search import find_page
 from .selection import Glyph, Line, bounds, correct_stream_order, edge_band, furniture_key, reading_regions, select
 
@@ -618,6 +619,12 @@ class PdfEngine:
         if len(cache) > (12 if quads else 6):
             cache.popitem(last=False)
         return result
+
+    def paragraphs(self, first=0, last=None):
+        """List the paragraphs of pages first..last that are handed to translation (see paragraphs.py)."""
+        last = self.doc.page_count - 1 if last is None else min(last, self.doc.page_count - 1)
+        pages = {index: self.text(index, quads=False) for index in range(first, last + 1)}
+        return enumerate_paragraphs(pages, self.options)
 
     def selection_page(self, index, first, last, origin=None):
         page = {index: self.text(index)}

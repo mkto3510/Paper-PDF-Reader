@@ -39,7 +39,7 @@ ENTRY_YEAR = re.compile(rf"(?<![\w/])({YEAR})(?![\w/])", re.I)
 END_YEAR = re.compile(rf"(?<![\w/-])({YEAR})[.,]?\s*$", re.I)
 AUTHOR_START = re.compile(rf"^{SURNAME}\s*,\s*(?:[^\W\d_]\.|[A-Z]{{2,3}}[,.\s])")
 HEADING = re.compile(
-    r"^(?:\d+(?:\.\d+)*[.)]?\s+)?(?:references(?:\s+cited)?|bibliography|works cited|literature cited|(?:参\s*考|引\s*用)?\s*文\s*献)\s*[:.]?$",
+    r"^(?:\d+(?:\.\d+)*[.)]?\s+)?(?:references(?:\s+(?:cited|and\s+notes))?|bibliography|works cited|literature cited|(?:参\s*考|引\s*用)?\s*文\s*献)\s*[:.]?$",
     re.I,
 )
 END = re.compile(
