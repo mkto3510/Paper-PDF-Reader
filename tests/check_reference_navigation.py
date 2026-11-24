@@ -551,6 +551,32 @@ def check_selection_paragraphs(folder):
         engine.close()
 
 
+def check_symbol_lines():
+    """A line of math-font glyphs with no word is a piece of an equation; prose with a symbol in it stays body."""
+    from paper_reader.analysis_rules import DEFAULT_RULES, classify, symbols_only
+    from paper_reader.selection import Glyph, Line, reading_regions
+
+    assert symbols_only("\x04x1−y1\x052\x03") and symbols_only("log\x04r1\x03x3−y3\x05")
+    assert symbols_only("i\x08\x08\x08") and not symbols_only("x\x04")
+    assert not symbols_only("(\x0412 MPa K\x031). Aside from the important differences in the")
+    assert not symbols_only("例えば久保ほか2017はラプラス事前分布を用いた")
+
+    def line(text, y, x=56, width=250, block=0):
+        box = (x, y, x + width, y + 10)
+        return Line((Glyph(text, box, ()),), box, 10.0, True, block)
+
+    texts = [(f"Running prose of the article line {row} goes on across the whole column here", 56, 250)
+             for row in range(5)]
+    texts += [("\x04x1−y1\x052\x03\x04x2−y2\x05", 120, 90), ("\x03 \x01 \x02", 130, 20)]
+    texts += [(f"More running prose of the article line {row} goes on across the whole column", 56, 250)
+              for row in range(5)]
+    lines = [line(text, 100 + number * 12, x, width, number) for number, (text, x, width) in enumerate(texts)]
+    result = classify(lines, 612, 792, set(), ([], [], [], [], False), DEFAULT_RULES, reading_regions(lines, 612))
+    kinds = [item.kind for item in result]
+    assert kinds[5] == kinds[6] == "equation", kinds
+    assert all(kind == "" for number, kind in enumerate(kinds) if number not in (5, 6)), kinds
+
+
 def check_heading_variants(folder):
     """Letter-spaced and "cited" headings open a bibliography."""
     for number, heading in enumerate(("R E F E R E N C E S", "REFERENCES CITED", "References")):
@@ -831,6 +857,7 @@ if __name__ == "__main__":
         check_paragraphs(folder)
         check_paragraph_edges(folder)
         check_selection_paragraphs(folder)
+        check_symbol_lines()
         check_page_layout(folder)
         check_year_lists()
         check_prefixed_labels()

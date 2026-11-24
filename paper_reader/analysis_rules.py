@@ -7,6 +7,7 @@ from dataclasses import replace
 from difflib import SequenceMatcher
 import re
 from statistics import median
+import unicodedata
 
 from .captions import classify_captions
 from .selection import bounds, edge_band, furniture_key
@@ -33,6 +34,23 @@ CJK_WORD = re.compile(r"[぀-ヿ㐀-鿿]")
 EQUATION_NUMBER = re.compile(r"[(（]\d+(?:[.\-]\d+)*[a-z]?[)）][,.]?")
 CODE = re.compile(r"^\s*(?:\d+[:.)]\s*)?(?:if|else|for|while|return|end|function|def|procedure)\b|[{};]|←|:=")
 MARGINAL = re.compile(r"^(?:section|exercise|example|remark|note|節|演習|例)\s*[\d.]+", re.I)
+
+
+# Words that can stand in a formula: a line of symbols with only these is a piece of an equation.
+MATH_FUNCTIONS = {"log", "exp", "sin", "cos", "tan", "cot", "sec", "csc", "ln", "det", "max", "min", "lim", "mod",
+                  "erf", "arctan", "arcsin", "arccos", "sinh", "cosh", "tanh", "sup", "inf", "div", "tr", "diag"}
+REAL_WORD = re.compile(r"[A-Za-z]{3,}|[぀-ヿ㐀-鿿]{2,}")
+
+
+def symbols_only(text):
+    """Tell whether a line is a piece of an equation: control or private-use characters (the glyphs of a math font)
+    and no real word. A line of prose with a symbol in it has words and is left alone."""
+    odd = sum(1 for char in text if not char.isspace() and unicodedata.category(char) in ("Cc", "Co"))
+    if odd < 2:
+        return False
+    words = [word for word in REAL_WORD.findall(text) if word.casefold() not in MATH_FUNCTIONS]
+    # One short Latin word is a variable name (bjk, djm); a word of any other script, or a longer one, is text.
+    return not words or (len(words) == 1 and words[0].isascii() and len(words[0]) <= 3 and odd >= len(text) * .15)
 
 
 def overlap(a, b):
@@ -287,7 +305,21 @@ def classify(lines, width, height, neighbours, evidence, options, regions=()):
                 for above in reversed(body_lines))
             if not continuation and (line.horizontal == vertical_body or id(line) not in prose):
                 kind = "small"
+        if not kind and line.horizontal and id(line) not in body_ids and symbols_only(text):
+            kind, equation = "equation", line
         result[id(line)] = replace(line, kind=kind)
         if not kind:
             body_lines.append(line)
+    # A formula is often cut into single symbols ("W", "T", "5") that carry no symbol glyph pair by themselves.
+    # A short line without a word, next to a line that is a piece of an equation, belongs to that equation.
+    pieces = [line for line in lines if result[id(line)].kind == "equation" and symbols_only(line.text.strip())]
+    for line in lines:
+        text = line.text.strip()
+        if (result[id(line)].kind or not line.horizontal or len(text) > 4 or REAL_WORD.search(text)
+                or id(line) in body_ids):
+            continue
+        reach = line.size * 1.5
+        if any(abs(line.box[1] - piece.box[1]) <= reach and line.box[0] <= piece.box[2] + reach
+               and piece.box[0] <= line.box[2] + reach for piece in pieces):
+            result[id(line)] = replace(line, kind="equation")
     return tuple(result[id(line)] for line in lines)
