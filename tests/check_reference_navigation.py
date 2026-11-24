@@ -455,6 +455,30 @@ def check_scanned_caption(folder):
         engine.close()
 
 
+def check_heading_variants(folder):
+    """Letter-spaced and "cited" headings open a bibliography."""
+    for number, heading in enumerate(("R E F E R E N C E S", "REFERENCES CITED", "References")):
+        path = folder / f"heading{number}.pdf"
+        with mu.open() as pdf:
+            first = pdf.new_page(width=612, height=792)
+            first.insert_text((61, 100), "Body text cites Smith (1990) and Lee [2001] in a sentence.", fontsize=10)
+            last = pdf.new_page(width=612, height=792)
+            last.insert_text((61, 100), heading, fontsize=9)
+            for row, line in enumerate(("Smith, A. B., 1990. A study of things. J. Tests 3, 1-5.",
+                                        "Lee, C. D., 2001. Another study of things. J. Tests 4, 6-9.",
+                                        "Kim, E. F., 1999. A third study of things. J. Tests 5, 10-14.")):
+                last.insert_text((61, 120 + row * 14), line, fontsize=9)
+            pdf.save(path)
+        engine = PdfEngine(folder)
+        try:
+            engine.open(str(path))
+            while not engine.reference_step():
+                pass
+            assert [len(region[2]) for region in engine.references.regions] == [3], (heading, engine.references.regions)
+        finally:
+            engine.close()
+
+
 def check_label_close_below_figure_text(folder):
     """A label alone on a line is a caption when a sentence follows it, even with figure text right above it."""
     path = folder / "label_below_text.pdf"
@@ -707,6 +731,7 @@ if __name__ == "__main__":
         check_scanned_caption(folder)
         check_label_on_band_row(folder)
         check_label_close_below_figure_text(folder)
+        check_heading_variants(folder)
         check_page_layout(folder)
         check_year_lists()
         check_prefixed_labels()

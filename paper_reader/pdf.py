@@ -107,6 +107,24 @@ def _join_spaced_headings(lines):
     return [line for line in lines if id(line) not in absorbed] + merged
 
 
+def _close_spaced_letters(lines):
+    """Close up headings printed with a space between letters ("R E F E R E N C E S", set in small capitals).
+
+    Only a short line whose letters, closed up, are a bibliography or end heading is changed, and only when most
+    of its words are one or two letters long, so ordinary words are never joined.
+    """
+    result = []
+    for line in lines:
+        text = line.text.strip()
+        words = text.split()
+        if line.horizontal and 4 <= len(words) and len(text) <= 40 and sum(len(word) <= 2 for word in words) >= len(words) * .7:
+            closed = "".join(words)
+            if (HEADING.fullmatch(closed) or END.fullmatch(closed)) and not (HEADING.fullmatch(text) or END.fullmatch(text)):
+                line = replace(line, glyphs=(Glyph(closed, line.box, ()),))
+        result.append(line)
+    return result
+
+
 def _signature(path: Path):
     stat = path.stat()
     return stat.st_size, stat.st_mtime_ns, stat.st_ino
@@ -327,7 +345,7 @@ class PdfEngine:
                     lines.append(Line((Glyph(text, box, ()),), box, size,
                                       line["wmode"] == 0 and abs(line["dir"][1]) < .15, block_index,
                                       leading_bold=leading_bold))
-        lines = _join_spaced_headings(lines)
+        lines = _close_spaced_letters(_join_spaced_headings(lines))
         width, height = page.rect.width, page.rect.height
         if page.rotation in (90, 270):
             width, height = height, width

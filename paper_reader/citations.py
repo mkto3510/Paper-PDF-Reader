@@ -39,7 +39,7 @@ ENTRY_YEAR = re.compile(rf"(?<![\w/])({YEAR})(?![\w/])", re.I)
 END_YEAR = re.compile(rf"(?<![\w/-])({YEAR})[.,]?\s*$", re.I)
 AUTHOR_START = re.compile(rf"^{SURNAME}\s*,\s*(?:[^\W\d_]\.|[A-Z]{{2,3}}[,.\s])")
 HEADING = re.compile(
-    r"^(?:\d+(?:\.\d+)*[.)]?\s+)?(?:references|bibliography|works cited|literature cited|(?:参\s*考|引\s*用)?\s*文\s*献)\s*[:.]?$",
+    r"^(?:\d+(?:\.\d+)*[.)]?\s+)?(?:references(?:\s+cited)?|bibliography|works cited|literature cited|(?:参\s*考|引\s*用)?\s*文\s*献)\s*[:.]?$",
     re.I,
 )
 END = re.compile(
@@ -496,8 +496,12 @@ class ReferenceIndex:
     def _contents_row(self, heading):
         # Books sometimes store each dotted contents row as two separate spans.
         x0, y0, x1, y1 = heading[4]
+        # A contents number sits at the right margin; a number fragment in the other column of a two-column page
+        # ("793." ending an entry) happens to share the row with a heading but does not reach the margin.
+        margin = max(other[4][2] for other in self.pages[heading[0]])
         return any(other is not heading and re.fullmatch(r"[\d .·…]+", other[2])
                    and other[4][0] - x1 > y1 - y0 and abs(other[4][1] - y0) <= (y1 - y0) * .5
+                   and other[4][2] >= margin - (y1 - y0) * 3
                    for other in self.pages[heading[0]])
 
     def _unheaded(self, rows):
