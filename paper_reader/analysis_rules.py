@@ -39,6 +39,7 @@ MARGINAL = re.compile(r"^(?:section|exercise|example|remark|note|節|演習|例)
 # Words that can stand in a formula: a line of symbols with only these is a piece of an equation.
 MATH_FUNCTIONS = {"log", "exp", "sin", "cos", "tan", "cot", "sec", "csc", "ln", "det", "max", "min", "lim", "mod",
                   "erf", "arctan", "arcsin", "arccos", "sinh", "cosh", "tanh", "sup", "inf", "div", "tr", "diag"}
+LABEL_WORD = re.compile(r"[A-Za-z]{2,}|[぀-ヿ㐀-鿿]")
 REAL_WORD = re.compile(r"[A-Za-z]{3,}|[぀-ヿ㐀-鿿]{2,}")
 
 
@@ -137,6 +138,36 @@ def _similar_edge(line, side, key, neighbours, height):
                               SequenceMatcher(None, key, old_key).ratio() >= .87):
             return True
     return False
+
+
+def _mark_figure_text(lines, result, width, body_ids):
+    """Mark the numbers inside a figure that has no image or drawing to show where it is (a scan, an old print).
+
+    Near a caption, five or more short lines of numbers and symbols that follow each other and do not share a left
+    edge are the tick labels of a figure. A line with a word is never marked: a review of every line that a first
+    version marked by shape alone found that 80% of the lines with words were article text (running text in narrow
+    columns, captions, Japanese text), while the lines of numbers were figure labels or table and equation pieces."""
+    captions = [line for line in lines if result[id(line)].kind == "caption"]
+    if not captions:
+        return
+    short = sorted((line for line in lines
+                    if not result[id(line)].kind and line.horizontal and id(line) not in body_ids
+                    and line.box[2] - line.box[0] < width * .30 and 0 < len(line.text.strip()) <= 28
+                    and not LABEL_WORD.search(line.text)),
+                   key=lambda line: line.box[1])
+    for caption in captions:
+        top = caption.box[1]
+        cluster = []
+        for line in [*(line for line in short if top - 300 <= line.box[1] <= top + 15), None]:
+            if line is not None and (not cluster or line.box[1] - cluster[-1].box[3] <= 30):
+                cluster.append(line)
+                continue
+            edges = {round(item.box[0] / 8) for item in cluster}
+            if len(cluster) >= 5 and len(edges) >= 3:
+                for item in cluster:
+                    if not result[id(item)].kind:
+                        result[id(item)] = replace(item, kind="figure")
+            cluster = [line] if line is not None else []
 
 
 def classify(lines, width, height, neighbours, evidence, options, regions=()):
@@ -322,4 +353,5 @@ def classify(lines, width, height, neighbours, evidence, options, regions=()):
         if any(abs(line.box[1] - piece.box[1]) <= reach and line.box[0] <= piece.box[2] + reach
                and piece.box[0] <= line.box[2] + reach for piece in pieces):
             result[id(line)] = replace(line, kind="equation")
+    _mark_figure_text(lines, result, width, body_ids)
     return tuple(result[id(line)] for line in lines)

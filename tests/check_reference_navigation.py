@@ -577,6 +577,37 @@ def check_symbol_lines():
     assert all(kind == "" for number, kind in enumerate(kinds) if number not in (5, 6)), kinds
 
 
+def check_figure_text():
+    """Numbers that follow each other above a caption and do not share a left edge are the tick labels of a figure; a
+    paragraph, a short list of words and a short list of numbers that share a left edge stay body text, and so do
+    short lines with words (they are running text more often than labels)."""
+    from paper_reader.analysis_rules import DEFAULT_RULES, classify
+    from paper_reader.selection import Glyph, Line, reading_regions
+
+    def line(text, x, y, width, block):
+        box = (x, y, x + width, y + 10)
+        return Line((Glyph(text, box, ()),), box, 10.0, True, block)
+
+    prose = [line(f"Running prose of the article line {row} goes on across the whole column here", 56, 60 + row * 12,
+                  300, row) for row in range(5)]
+    ticks = [("0", 90), ("50", 130), ("100", 200), ("150", 140), ("200", 220), ("250", 170)]
+    words = [("Moho", 95), ("crust", 135), ("mantle", 205), ("slab", 145), ("trench", 225), ("arc", 175)]
+    figure = [line(text, x, 140 + row * 14, 30, 10 + row) for row, (text, x) in enumerate(ticks)]
+    labels = [line(text, x, 230 + row * 14, 30, 16 + row) for row, (text, x) in enumerate(words)]
+    caption = [line("Figure 3. Cross section of the model with the crust and the mantle drawn to scale", 56, 330, 300, 22)]
+    aligned_numbers = ["13", "40", "7", "92", "55", "21"]
+    aligned = [line(text, 56, 400 + row * 12, 20, 30 + row) for row, text in enumerate(aligned_numbers)]
+    more = [line(f"More running prose of the article line {row} goes on across the whole column", 56, 480 + row * 12,
+                 300, 40 + row) for row in range(5)]
+    lines = [*prose, *figure, *labels, *caption, *aligned, *more]
+    result = classify(lines, 612, 792, set(), ([], [], [], [], False), DEFAULT_RULES, reading_regions(lines, 612))
+    kinds = {item.text: item.kind for item in result}
+    assert all(kinds[text] == "figure" for text, _ in ticks), kinds
+    assert all(kinds[text] == "" for text, _ in words), kinds
+    assert all(kinds[text] == "" for text in aligned_numbers), kinds
+    assert all(item.kind == "" for item in result if item.text.startswith(("Running", "More"))), kinds
+
+
 def check_heading_variants(folder):
     """Letter-spaced and "cited" headings open a bibliography."""
     for number, heading in enumerate(("R E F E R E N C E S", "REFERENCES CITED", "References")):
@@ -858,6 +889,7 @@ if __name__ == "__main__":
         check_paragraph_edges(folder)
         check_selection_paragraphs(folder)
         check_symbol_lines()
+        check_figure_text()
         check_page_layout(folder)
         check_year_lists()
         check_prefixed_labels()
