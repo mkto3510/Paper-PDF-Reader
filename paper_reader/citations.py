@@ -22,8 +22,12 @@ STRUCTURE = re.compile(r"(?:\b(?:fig(?:ure)?s?|tables?|eq(?:uation)?s?|sec(?:tio
                        r"|[図表式])\s*$", re.I)
 # AGU journals write author-year citations in square brackets: "[Hanks and Kanamori, 1979]" and "Hess [1965]".
 PARENS = re.compile(r"\(([^()\n]+)\)|\[([^\[\]\n]+)\]")
-AUTHOR_YEAR = re.compile(rf"{AUTHOR}(?:\s*,\s*|\s+)(?P<year>{YEAR})(?:,\s*(?:pp?\.\s*)?\d+(?:-\d+)?)?", re.I)
-NARRATIVE = re.compile(rf"(?<![A-Za-zÀ-ž0-9_'-]){AUTHOR}\s*(?P<date>[(\[]\s*(?P<year>{YEAR})\s*[)\]])", re.I)
+# One author can have several years in a row: "1990a,b", "1990, 1992", "1990; 1992".
+YEARS = rf"(?P<year>{YEAR})(?P<more>(?:\s*[,;]\s*(?:{YEAR}|[a-z](?![\w.])))*)"
+YEAR_ONLY = re.compile(YEARS, re.I)
+PAGE = r"(?:,\s*(?:pp?\.\s*\d+(?:-\d+)?|(?!(?:18|19|20|21)\d{2}\b)\d+(?:-\d+)?))?"
+AUTHOR_YEAR = re.compile(rf"{AUTHOR}(?:\s*,\s*|\s+){YEARS}{PAGE}", re.I)
+NARRATIVE = re.compile(rf"(?<![A-Za-zÀ-ž0-9_'-]){AUTHOR}\s*(?P<date>[(\[]\s*{YEARS}\s*[)\]])", re.I)
 LEAD_IN = re.compile(r"^(?:see(?: also)?|e\.g\.,?|cf\.?)\s+", re.I)
 NUMBER_LABEL = rf"(?:\[({NUMBER})\]|({NUMBER})[.)])"
 NUMBER_ENTRY = re.compile(rf"^{NUMBER_LABEL}\s*(?=[^\W\d_])")
@@ -100,14 +104,23 @@ def number_keys(text):
     return tuple(dict.fromkeys(found))
 
 
-def _author_key(match):
+def _years(match):
+    """The years a citation names for its author: "1990a,b" is 1990a and 1990b."""
+    first = match["year"]
+    result = [first]
+    for token in re.findall(rf"{YEAR}|[a-z]", match["more"] or "", re.I):
+        result.append(token if len(token) > 1 else first[:4] + token)
+    return result
+
+
+def _author_key(match, year=None):
     printed_author = match["author"]
     author = re.sub(r"(?:ら|ほか)$", "", printed_author)
     if trailing := re.search(rf"{KANJI}{{2,}}$", author):
         author = trailing[0]
     elif mixed := re.search(r"(?<=[\u3040-\u30ff\u3400-\u9fff々])[A-Za-zÀ-ž][A-Za-zÀ-ž'-]*$", author):
         author = mixed[0]
-    key = clean_name(author), match["year"].casefold()
+    key = clean_name(author), (year or match["year"]).casefold()
     second = match["second"] or match["jp_second"]
     if second:
         return *key, clean_name(second)
@@ -141,13 +154,23 @@ def citation_spans(text, paragraph_start=False):
                 continue  # "Hess [1965]" is a year, not a reference number
             yield match.span(), Citation(match[0], keys)
     for match in PARENS.finditer(text):
-        authors = [AUTHOR_YEAR.fullmatch(LEAD_IN.sub("", part.strip())) for part in (match[1] or match[2]).split(";")]
-        if all(authors) and all(_plausible(item) for item in authors):
-            keys = tuple(dict.fromkeys(_author_key(item) for item in authors))
-            yield match.span(), Citation(match[0], keys)
+        items = []
+        for part in (match[1] or match[2]).split(";"):
+            part = LEAD_IN.sub("", part.strip())
+            if hit := AUTHOR_YEAR.fullmatch(part):
+                items.append((hit, _years(hit)))
+            elif items and (more := YEAR_ONLY.fullmatch(part)):
+                items.append((items[-1][0], _years(more)))  # "(Smith 1990; 1992)": the same author again
+            else:
+                break
+        else:
+            if all(_plausible(item) for item, _ in items):
+                keys = tuple(dict.fromkeys(_author_key(item, year) for item, years in items for year in years))
+                yield match.span(), Citation(match[0], keys)
     for match in NARRATIVE.finditer(text):
         if not STRUCTURE.search(text[match.start():match.start("date")]) and _plausible(match):
-            yield match.span(), Citation(match[0], (_author_key(match),))
+            keys = tuple(dict.fromkeys(_author_key(match, year) for year in _years(match)))
+            yield match.span(), Citation(match[0], keys)
 
 
 SUPERSCRIPT_DIGITS = frozenset("⁰¹²³⁴⁵⁶⁷⁸⁹")

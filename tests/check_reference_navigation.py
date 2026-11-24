@@ -506,6 +506,25 @@ def check_spurious_bibliography(folder):
         engine.close()
 
 
+def check_year_lists():
+    """One author with several years ("1990a,b", "1990, 1992", "1990; 1992") names every year."""
+    from paper_reader.citations import citation_spans
+
+    def keys(text):
+        return [citation.keys for _, citation in citation_spans(text)]
+
+    assert keys("(Smith, 1990a, b)") == [(("smith", "1990a"), ("smith", "1990b"))]
+    assert keys("(Smith, 1990a,b; Lee, 2001)") == [(("smith", "1990a"), ("smith", "1990b"), ("lee", "2001"))]
+    assert keys("Smith (1990, 1992)") == [(("smith", "1990"), ("smith", "1992"))]
+    assert keys("(Smith et al., 1990, 1992)") == [(("smith", "1990", "*"), ("smith", "1992", "*"))]
+    assert keys("(Smith 1990; 1992)") == [(("smith", "1990"), ("smith", "1992"))]
+    assert keys("Smith and Lee (1990a,b,c)")[0] == tuple(("smith", f"1990{x}", "lee") for x in "abc")
+    # A page number after the year is not another year.
+    assert keys("(Smith, 1990, p. 5)") == [(("smith", "1990"),)]
+    assert keys("(Smith, 1990, 25-30)") == [(("smith", "1990"),)]
+    assert keys("(2010; 2011)") == []
+
+
 def check_prefixed_labels():
     """Extended data and supplementary figures are separate from the figures of the article."""
     from unicodedata import normalize
@@ -632,6 +651,7 @@ if __name__ == "__main__":
         check_split_caption(folder)
         check_scanned_caption(folder)
         check_page_layout(folder)
+        check_year_lists()
         check_prefixed_labels()
         check_panel_mentions()
         check_spurious_bibliography(folder)
