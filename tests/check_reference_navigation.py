@@ -526,7 +526,8 @@ def check_selection_paragraphs(folder):
     with mu.open() as pdf:
         wide = pdf.new_page(width=612, height=792)
         for row in range(8):
-            wide.insert_text((56, 100 + row * 24), f"First paragraph, line {row}, runs on without any indent", fontsize=10)
+            wide.insert_text((56, 100 + row * 24), f"First paragraph, line {row}, runs on without any indent"
+                             + ("." if row == 7 else ""), fontsize=10)
         wide.insert_text((70, 100 + 8 * 24), "Second paragraph begins with an indent after a finished sentence.", fontsize=10)
         for row in range(1, 4):
             wide.insert_text((56, 100 + (8 + row) * 24), f"Second paragraph, line {row}, runs on without any indent", fontsize=10)
@@ -547,6 +548,42 @@ def check_selection_paragraphs(folder):
         assert parts[0].count("every line") == 0 and len(engine.text(0)) == 12
         first, second = select({0: engine.text(0)}, (0, 0, 0), (0, 11, 5), origin="").source.split("\n\n")
         assert first.startswith("First paragraph") and second.startswith("Second paragraph begins"), (first, second)
+    finally:
+        engine.close()
+
+
+def check_paragraph_pitfalls(folder):
+    """Lines that only look like the start of a paragraph do not split one: a line that begins with a word such as
+    "results,", a number followed by a multiplication sign or a decimal point, or a name with an initial; and the
+    subscript of a chemical formula that sits on a line of its own."""
+    from paper_reader.selection import select
+
+    path = folder / "paragraph_pitfalls.pdf"
+    rows = ["The advantage of this experiment is that it provides a calibrated phase and the",
+            "results, therefore, show coupling effects between magnitude and phase. Indeed",
+            "96 × 95/2 = 4560 possible pairs, starting from 96 acquisitions in one day",
+            "0.91. When applied from the origin to the point, the lower crustal slope will",
+            "produce a deviation, and we would like to thank S. Coulson,",
+            "R. Cravey, B. Rosich Tell, N. Walker, and many other people at the institute",
+            "for their support of the work."]
+    with mu.open() as pdf:
+        page = pdf.new_page(width=612, height=792)
+        for row, text in enumerate(rows):
+            page.insert_text((56, 100 + row * 12), text, fontsize=10)
+        formula = pdf.new_page(width=612, height=792)
+        formula.insert_text((56, 100), "where Q is the production rate of H", fontsize=10)
+        formula.insert_text((205, 103), "2", fontsize=7)
+        formula.insert_text((210, 100), "O at the comet, r is the distance from the", fontsize=10)
+        formula.insert_text((56, 112), "center of the comet, and v is the gas velocity of the outflow.", fontsize=10)
+        pdf.save(path)
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(path))
+        for number in (0, 1):
+            lines = engine.text(number)
+            source = select({number: lines}, (number, 0, 0), (number, len(lines) - 1, len(lines[-1].glyphs) - 1),
+                            origin="").source
+            assert "\n\n" not in source, (number, source.split("\n\n"))
     finally:
         engine.close()
 
@@ -641,6 +678,24 @@ def check_front_matter():
     japanese = ["北海道駒ヶ岳火山の噴火履歴", "勝井義雄・篠沢達也・知本康男", "北海道大学大学院理学研究院", "はじめに",
                 "北海道には現在18の活火山が存在し，中でも雌阿寒岳，十勝岳が知られている。"]
     assert kinds(japanese) == ["", "front", "front", "", ""], kinds(japanese)
+    spaced = ["Equilibrium condensation of a solar composition gas", "Glenn J. MacPherson a,*, Michail I. Petaev b",
+              "a Department of Mineral Sciences, National Museum of Natural History", "A B S T R A C T",
+              "New full equilibrium condensation calculations are presented in this abstract."]
+    assert kinds(spaced) == ["", "front", "front", "", ""], kinds(spaced)
+
+    # The notes at the foot of a first page, and a sentence that only starts with the same word.
+    def notes(texts):
+        body = [line(f"The body of the article goes on here in running sentences, line {row}.", 100 + row * 12,
+                     block=100 + row) for row in range(8)]
+        foot = [line(text, 680 + number * 9, 8.0, 200 + number, 240) for number, text in enumerate(texts)]
+        lines = body + foot
+        result = classify(lines, 612, 792, set(), ([], [], [], [], False), DEFAULT_RULES, reading_regions(lines, 612),
+                          first_page=True)
+        return [item.kind for item in result[len(body):]]
+
+    assert notes(["Manuscript received March 6, 2015; revised May 18, 2015; accepted June", "5, 2015.",
+                  "The authors are with the German Aerospace Center (DLR), Wessling 82230,", "Germany (e-mail: a@b.de)."])         == ["front"] * 4
+    assert notes(["Accepted solutions were then compared with the data of the survey."]) == [""]
 
 
 def check_heading_variants(folder):
@@ -923,6 +978,7 @@ if __name__ == "__main__":
         check_paragraphs(folder)
         check_paragraph_edges(folder)
         check_selection_paragraphs(folder)
+        check_paragraph_pitfalls(folder)
         check_symbol_lines()
         check_figure_text()
         check_front_matter()

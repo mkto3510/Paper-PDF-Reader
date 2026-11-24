@@ -21,6 +21,7 @@ import argparse
 from collections import Counter
 from difflib import SequenceMatcher
 import json
+import re
 from pathlib import Path
 import sys
 from unicodedata import normalize
@@ -33,23 +34,31 @@ def key(text):
     return "".join(char for char in normalize("NFKC", text).casefold() if char.isalnum())
 
 
-def close(a, b, length=20, tail=False):
+def similarity(a, b, length=20, tail=False):
     a, b = key(a), key(b)
     if not a or not b:
-        return False
+        return 0
     n = min(len(a), len(b), length)
     left, right = (a[-n:], b[-n:]) if tail else (a[:n], b[:n])
-    return SequenceMatcher(None, left, right).ratio() >= .8
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def close(a, b, length=20, tail=False):
+    return similarity(a, b, length, tail) >= .8
 
 
 def locate(lines, item, after=0):
     """Return (first, last) indexes of the lines that hold the labeled paragraph, or None."""
-    start = None
+    # The line where the paragraph starts is the one whose text (with the next two) is most like the label. Taking the
+    # first line that is close enough would start a few lines early, at an equation number in front of the paragraph.
+    start, best = None, .8
     for index in range(after, len(lines)):
         joined = " ".join(line.text for line in lines[index:index + 3])
-        if lines[index].text.strip() and close(joined, item["start"]):
-            start = index
-            break
+        value = similarity(joined, item["start"]) if lines[index].text.strip() else 0
+        if value > best + 1e-9:
+            start, best = index, value
+            if value >= .999:
+                break
     if start is None:
         return None
     text = ""
@@ -58,6 +67,21 @@ def locate(lines, item, after=0):
         if close(text, item["end"], tail=True) and len(key(text)) >= min(len(key(item["end"])), 8):
             return start, index
     return None
+
+
+EQUATION_NUMBER = re.compile(r"^[(\[]\s*\d+[a-z]?\s*[)\]]$")
+
+
+def equation_sites(lines, first, last):
+    """How many displayed equations the paragraph runs across: groups of lines made of equation pieces or numbers.
+    A sentence that goes on after a displayed equation may be sent as two paragraphs, so a blank line before and
+    after each one is not counted against the selection."""
+    sites, inside = 0, False
+    for line in lines[first:last + 1]:
+        piece = line.kind == "equation" or bool(EQUATION_NUMBER.match(line.text.strip()))
+        sites += piece and not inside
+        inside = piece
+    return sites
 
 
 def select_range(select, page, lines, first, last, origin):
@@ -89,7 +113,9 @@ def score(engine, labels, select, scanned=False):
             after = first
             origin = "caption" if kind == "caption" else ""
             source = select_range(select, page, lines, first, last, origin)
-            splits = source.count("\n\n")
+            raw = source.count("\n\n")
+            splits = max(0, raw - 2 * equation_sites(lines, first, last))
+            result["tolerated_at_equations"] += raw - splits
             group = "scanned" if scanned else ("reference" if kind == "reference" else "text")
             result[f"{group}_paragraphs"] += 1
             result[f"{group}_split_inside"] += splits
@@ -98,7 +124,7 @@ def score(engine, labels, select, scanned=False):
             result["split_inside"] += splits
             result["paragraphs_with_split"] += bool(splits)
             if splits:
-                notes.append((page, f"{splits} blank line(s) inside", kind, item["start"][:40]))
+                notes.append((page, f"{splits} blank line(s) inside (of {raw})", kind, item["start"][:40]))
             if previous is not None and previous[1] < first:
                 joint = select_range(select, page, lines, previous[0], last, "")
                 separated = joint.count("\n\n") > source.count("\n\n") + previous[2]
@@ -109,7 +135,7 @@ def score(engine, labels, select, scanned=False):
                     result["digital_separated"] += separated
                 if not separated:
                     notes.append((page, "run into the previous paragraph", kind, item["start"][:40]))
-            previous = (first, last, splits)
+            previous = (first, last, raw)
     return result, notes
 
 

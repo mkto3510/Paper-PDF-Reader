@@ -26,7 +26,7 @@ LABELS = {
     "equation": ("別行立ての数式", "Displayed equations"),
     "code": ("コード・アルゴリズム", "Code and algorithms"), "ruby": ("ルビ", "Ruby"),
     "line_number": ("査読用行番号", "Line numbers"), "artifact": ("装飾タグ", "PDF artifacts"),
-    "front": ("著者・所属・受理日", "Authors, affiliations and dates"),
+    "front": ("著者・所属・受理日・著作権", "Authors, affiliations, dates and copyright"),
 }
 NUMBER = re.compile(r"[-–—―\s]*([0-9０-９]+)[-–—―\s]*$")
 MATH = re.compile(r"[=∑∫√≤≥±∂∇]|(?<=\s)\(\d+[a-z]?\)\s*$")
@@ -172,7 +172,7 @@ def _mark_figure_text(lines, result, width, body_ids):
 
 
 # Where the text of an article begins, on its first page: what comes above is the title block.
-BODY_START = re.compile(r"^(?:abstract|summary|key\s*words?|index\s+terms|introduction|1\.?\s+introduction|"
+BODY_START = re.compile(r"^(?:abstract|article\s*info|summary|key\s*words?|index\s+terms|introduction|1\.?\s+introduction|"
                         r"要\s*旨|概\s*要|要\s*約|あらまし|アブストラクト|キーワード|はじめに|1\.?\s*はじめに)\b", re.I)
 DATE_LINE = re.compile(r"^(?:manuscript\s+)?(?:received|accepted|revised|published|available\s+online|submitted|"
                        r"受付|受理|原稿受付|原稿受理|投稿|改訂)\b|^©|^copyright\b|^\(?c\)\s*\d{4}", re.I)
@@ -184,12 +184,19 @@ LATIN_NAME = re.compile(r"(?:[A-Z][\w'’.-]*\.?)(?:\s+(?:[A-Z][\w'’.-]*\.?|va
 JAPANESE_NAME = re.compile(r"[㐀-鿿々ァ-ヶー]{2,5}")
 
 
+def _unspaced(text):
+    """A heading set with spaces between its letters ("A B S T R A C T") without them."""
+    text = text.strip()
+    return text.replace(" ", "") if re.fullmatch(r"(?:\S ){2,}\S", text) else text
+
+
 def _author_line(text):
     """Tell whether a line is a list of author names: several names split by commas, "and" or a middle dot,
     each possibly followed by a note mark (a digit, an asterisk, a dagger)."""
     if re.search(r"[()（）［］\[\]「」『』]", text):
         return False  # a name list has no brackets; a wrapped line of a sentence often has one
     plain = re.sub(r"[\d*†‡§¶²³¹⁰-⁹＊]+", "", text)
+    plain = re.sub(r"\s[a-z](?!\w)", "", plain)  # a letter that marks an affiliation: "Petaev b"
     parts = [part.strip() for part in re.split(r",|;|\band\b|&|・|、|，", plain) if part.strip()]
     if len(parts) < 2 or len(text) > 200:
         return False
@@ -203,20 +210,55 @@ def _mark_front_matter(lines, result, size, body_ids):
 
     Only lines above the first line that opens the text (an abstract, keywords, an introduction) are looked at, and
     when no such line is found nothing is marked: the title and the abstract are text to read, not front matter."""
-    starts = [line for line in lines if line.horizontal and BODY_START.match(line.text.strip())]
+    starts = [line for line in lines if line.horizontal and BODY_START.match(_unspaced(line.text))]
     if not starts:
         return
     limit = min(line.box[1] for line in starts)
     for line in lines:
         text = line.text.strip()
         if (result[id(line)].kind or not line.horizontal or line.box[3] > limit + 1 or id(line) in body_ids
-                or line.size > size * 1.15 or not text or len(text) > 220):
+                or (line.size > size * 1.15 and not (line.size < size * 1.5 and _author_line(text)))
+                or not text or len(text) > 220):
             continue
-        if text[0].islower() or line.text[:1] in ("　", "	"):
+        if (text[0].islower() and not re.match(r"[a-z]\s+[A-Z]", text)) or line.text[:1] in ("　", "	"):
             continue  # a line that goes on from the one above, or opens an indented paragraph: running text
         sentence = len(text.split()) >= 12 and text.endswith(".")
         if (DATE_LINE.match(text) or CONTACT.search(text) or (AFFILIATION.search(text) and not sentence)
                 or _author_line(text)):
+            result[id(line)] = replace(line, kind="front")
+
+
+# The notes at the foot of a first page: the dates, the authors and their affiliations, the corresponding author,
+# the contact address and the copyright line. A line of the running text that happens to start with "Accepted" is not
+# one, so a date line needs a month or a year.
+NOTE_DATE = re.compile(r"^(?:manuscript\s+)?(?:received|accepted|revised|published|available\s+online|submitted)\b.{0,70}?"
+                       r"(?:\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b|\b(?:19|20)\d\d\b)", re.I)
+NOTE_LEAD = re.compile(r"^(?:the\s+authors?\s+(?:is|are|was|were)\s+with|\*+\s*corresponding\s+authors?|"
+                       r"corresponding\s+authors?\b|\*?\s*e-?mail\s*:|digital\s+object\s+identifier|copyright\b|\(c\)\s*\d{4}|©)",
+                       re.I)
+
+
+def _mark_front_notes(lines, result, width, height, size):
+    """Mark the notes at the foot of a first page, and the lines that go on from them below."""
+    below = sorted((line for line in lines if line.horizontal and line.box[1] > height * .5), key=lambda l: l.box[1])
+    chain = None  # the first line of the note being followed, the bottom and the right edge of what has been seen
+    for line in below:
+        text = line.text.strip()
+        opens = bool(text) and (text[0].isupper() or text[0] in "*©(") and (NOTE_DATE.match(text) or NOTE_LEAD.match(text))
+        if opens and line.size <= size * 1.05:
+            chain = line, line.box[3], line.box[2]
+        elif chain is not None:
+            start, bottom, right = chain
+            same_column = start.box[0] - size * 2 <= line.box[0] < right
+            if not same_column:
+                continue  # a line of the other column at the same height
+            if line.box[1] > bottom + size * .8 or abs(line.size - start.size) > start.size * .1 or not text:
+                chain = None
+                continue
+            chain = start, max(bottom, line.box[3]), max(right, line.box[2])
+        else:
+            continue
+        if result[id(line)].kind in ("", "small"):  # small print at the foot of a first page is such a note too
             result[id(line)] = replace(line, kind="front")
 
 
@@ -406,4 +448,5 @@ def classify(lines, width, height, neighbours, evidence, options, regions=(), fi
     _mark_figure_text(lines, result, width, body_ids)
     if first_page:
         _mark_front_matter(lines, result, size, body_ids)
+        _mark_front_notes(lines, result, width, height, size)
     return tuple(result[id(line)] for line in lines)
