@@ -13,18 +13,8 @@ import re
 
 from .captions import caption_heading
 from .citations import AUTHOR_START, BARE_ENTRY, END, HEADING, NUMBER_ENTRY, normalize
+from .paragraph_breaks import bold_tells, line_gap, starts_paragraph, usual_gap
 from .selection import Box, Line, clean_source
-
-
-# A sentence or a clause that ends a line: the next line may then start a new paragraph.
-TERMINAL = re.compile(r"[.!?。！？:：…][\"”’'»)\]）」』]*$")
-# A sentence that really ends: after one of these a new paragraph may start. A colon or a comma does not end it.
-SENTENCE_END = re.compile(r"[.!?。！？…][\"”’'»)\]）」』]*$")
-HEADING_LEAD = re.compile(
-    r"^(?:(?:\d+(?:\.\d+)*\.?|[IVXLC]+\.|[A-Z]\.|[0-9０-９]+[.．])\s+[A-ZÀ-Ý぀-鿿]|"
-    r"第\s*[0-9０-９一二三四五六七八九十]+\s*[章節項]|"
-    r"(?:abstract|introduction|references|acknowledg\w*|conclusions?|discussion|methods?|results|summary|"
-    r"appendix|概要|要旨|はじめに|まとめ|参考文献|謝辞|結論|考察)\b)", re.I)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,40 +43,14 @@ def _kept(line: Line, rules) -> str | None:
     return "body" if rules is not None and not rules.get(line.kind, True) else None
 
 
-def _is_heading(text: str, line: Line) -> bool:
-    # "Acknowledgments:" is a heading although a colon ends it; a finished sentence is not.
-    if len(text) > 80 or SENTENCE_END.search(text):
-        return False
-    return bool(line.leading_bold or HEADING_LEAD.match(text))
-
-
-def _flows(previous: Line, line: Line, previous_text: str, text: str) -> bool:
-    """Tell whether `line` continues the paragraph that `previous` ends, when `previous` is the line before it in
-    reading order but not directly above it (the next column, the next page, or past a displayed equation)."""
-    if abs(line.size - previous.size) > previous.size * .1:
-        return False
-    if text[:1].islower() and not SENTENCE_END.search(previous_text):
-        return True  # also past a displayed equation that follows a colon
-    # A line that stops without ending a sentence goes on in the next column or page, in any script.
-    return not TERMINAL.search(previous_text)
-
-
 def _line_gaps(entries) -> dict[int, float]:
-    """The usual space between two lines of a paragraph, for each page (the median over its consecutive lines).
-
-    Japanese typesetting leaves about as much space between lines as the height of a line, so a gap that marks a new
-    paragraph in a European text is only the ordinary line gap there."""
+    """The usual space between two lines of a paragraph, for each page (see paragraph_breaks.usual_gap)."""
     spaces: dict[int, list[float]] = {}
     for (page_a, _, a, _, kind_a), (page_b, _, b, _, kind_b) in zip(entries, entries[1:]):
-        below = b.box[1] - a.box[3]
-        if (page_a == page_b and kind_a == kind_b == "body" and 0 <= below <= max(a.size, b.size) * 2
-                and abs(b.box[0] - a.box[0]) < max(a.size, b.size) * 3.2):
-            spaces.setdefault(page_a, []).append(below)
-    return {page: sorted(values)[len(values) // 2] for page, values in spaces.items() if len(values) >= 5}
-
-
-# "17. M. D. Zoback, ..." : an item of a numbered list printed in the running text.
-NUMBERED_ITEM = re.compile(r"^\[?\d{1,3}[.\]]\s+[A-Z぀-鿿]")
+        gap = line_gap(a, b)
+        if page_a == page_b and kind_a == kind_b == "body" and gap is not None:
+            spaces.setdefault(page_a, []).append(gap)
+    return {page: usual_gap(values) for page, values in spaces.items() if len(values) >= 5}
 
 
 def _section_marks(lines, rules) -> dict[int, bool]:
@@ -163,7 +127,7 @@ def _entry_start(text: str) -> bool:
                 or SURNAME_INITIALS.match(text) or NAMES_YEAR.match(text))
 
 
-def _breaks(previous: tuple, current: tuple, rules, gaps=None) -> bool:
+def _breaks(previous: tuple, current: tuple, rules, gaps=None, bold=None) -> bool:
     (page_a, index_a, a, text_a, kind_a), (page_b, index_b, b, text_b, kind_b) = previous, current
     if kind_a != kind_b:
         return True
@@ -176,32 +140,8 @@ def _breaks(previous: tuple, current: tuple, rules, gaps=None) -> bool:
         return _entry_start(normalize(text_b)) or outdent
     if kind_b == "caption":
         return bool(caption_heading(text_b))  # a new label starts the next caption
-    size = max(a.size, b.size)
-    below = b.box[1] - a.box[3]
-    if NUMBERED_ITEM.match(text_b) and SENTENCE_END.search(text_a):
-        return True
-    head_a, head_b = _is_heading(text_a, a), _is_heading(text_b, b)
-    if head_a or head_b:
-        # A heading that wraps onto a second line stays one paragraph, and so does a whole paragraph set in bold
-        # (an abstract): its lines look like short headings, but each continues the line above.
-        wrapped = (page_a == page_b and abs(a.size - b.size) <= size * .05 and -size * .4 <= below <= size * .9
-                   and not SENTENCE_END.search(text_a)
-                   and ((head_a and head_b) or (a.leading_bold and b.leading_bold)))
-        return not wrapped
-    directly_below = (page_a == page_b and -size * .35 <= below <= size * 2.5
-                      and abs(b.box[0] - a.box[0]) < size * 3.2)
-    if not directly_below:
-        # Another column or page, or text that resumes after a displayed equation.
-        return not _flows(a, b, text_a, text_b)
-    indent = b.box[0] - a.box[0]
-    if text_b[:1].islower() and not SENTENCE_END.search(text_a):
-        return False  # the sentence goes on, whatever the spacing
-    usual = max((gaps or {}).get(page_a, 0), 0)
-    if a.paragraph != b.paragraph:
-        # A PDF often starts new blocks at columns; an indent or a clear gap marks a new paragraph.
-        return 3 < indent < size * 3 or below > max(size * .65, usual + size * .4)
-    # Inside one block the paragraph ends where a line is indented after a finished sentence, or at a clear gap.
-    return below > max(size * .9, usual + size * .6) or (3 < indent < size * 3 and bool(TERMINAL.search(text_a)))
+    return starts_paragraph(a, b, text_a, text_b, (gaps or {}).get(page_a, 0), page_a == page_b,
+                            (bold or {}).get(page_a, True))
 
 
 def enumerate_paragraphs(pages: dict[int, tuple[Line, ...]], rules=None) -> list[Paragraph]:
@@ -243,8 +183,10 @@ def enumerate_paragraphs(pages: dict[int, tuple[Line, ...]], rules=None) -> list
 
     entries = _join_fragments(entries)
     gaps = _line_gaps(entries)
+    bold = {page: bold_tells([line for p, _, line, _, kind in entries if p == page and kind == "body"])
+            for page in {entry[0] for entry in entries}}
     for entry in entries:
-        if group and _breaks(group[-1], entry, rules, gaps):
+        if group and _breaks(group[-1], entry, rules, gaps, bold):
             close()
         group.append(entry)
     close()

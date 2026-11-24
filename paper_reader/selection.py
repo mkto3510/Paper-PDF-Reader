@@ -7,6 +7,8 @@ import re
 from statistics import median
 import unicodedata
 
+from .paragraph_breaks import bold_tells, line_gap, starts_paragraph as new_paragraph, usual_gap
+
 
 Point = tuple[float, float]
 Box = tuple[float, float, float, float]
@@ -329,6 +331,16 @@ def select(pages: dict[int, tuple[Line, ...]], first: tuple[int, int, int],
     starts_paragraph = False
     hyphenated: set[str] = set()
     last_run = None
+    gaps: dict[int, tuple[float, bool]] = {}
+
+    def usual(page):
+        """The usual space between two lines of a paragraph on the page, measured on all of its body lines, and
+        whether a bold lead means anything on the page."""
+        if page not in gaps:
+            body = [line for line in pages[page] if line.horizontal and not line.kind]
+            gaps[page] = (usual_gap([gap for a, b in zip(body, body[1:]) if (gap := line_gap(a, b)) is not None]),
+                          bold_tells(pages[page]))
+        return gaps[page]
 
     def exclude(page, kind, glyphs):
         nonlocal last_run
@@ -367,7 +379,13 @@ def select(pages: dict[int, tuple[Line, ...]], first: tuple[int, int, int],
                 if omit:
                     exclude(page, kind or "body", selected)
                     continue
-            if previous is not None and page == previous[0] and line.paragraph != previous[1]:
+            if previous is not None and not kind and not previous[3].kind:
+                # Body lines: a heading, an indent after a finished sentence, a numbered item or a clear gap (judged
+                # against the usual line gap of the page) starts a new paragraph. See paragraph_breaks.
+                gap, bold = usual(page)
+                if new_paragraph(previous[3], line, previous[4], line.text.strip(), gap, page == previous[0], bold):
+                    text.append("")
+            elif previous is not None and page == previous[0] and line.paragraph != previous[1]:
                 # A PDF often starts new blocks at columns. Keep the separator
                 # for an indented paragraph or a clear gap within one column.
                 moved_right = 3 < line.box[0] - previous[2][0] < line.size * 3
@@ -394,8 +412,9 @@ def select(pages: dict[int, tuple[Line, ...]], first: tuple[int, int, int],
                     overlap = min(line.box[2], following.box[2]) - max(line.box[0], following.box[0])
                     starts_paragraph = (line.horizontal and following.horizontal and overlap > line.size * 3
                                         and 0 < gap < line.size * 2.2 and 3 < indent < line.size * 3)
-                previous = page, line.paragraph, line.box
-                text.append("".join(glyph.text for omitted, run in runs if not omitted for glyph in run))
+                shown = "".join(glyph.text for omitted, run in runs if not omitted for glyph in run)
+                previous = page, line.paragraph, line.box, line, shown.strip()
+                text.append(shown)
             for omitted, run in runs:
                 if omitted:
                     exclude(page, "artifact", run)

@@ -65,7 +65,7 @@ def select_range(select, page, lines, first, last, origin):
     return select({page: lines}, (page, first, 0), (page, last, last_glyph), origin=origin).source
 
 
-def score(engine, labels, select):
+def score(engine, labels, select, scanned=False):
     result = Counter()
     notes = []
     for page_text, items in labels["pages"].items():
@@ -90,6 +90,10 @@ def score(engine, labels, select):
             origin = "caption" if kind == "caption" else ""
             source = select_range(select, page, lines, first, last, origin)
             splits = source.count("\n\n")
+            group = "scanned" if scanned else ("reference" if kind == "reference" else "text")
+            result[f"{group}_paragraphs"] += 1
+            result[f"{group}_split_inside"] += splits
+            result[f"{group}_with_split"] += bool(splits)
             result["paragraphs"] += 1
             result["split_inside"] += splits
             result["paragraphs_with_split"] += bool(splits)
@@ -100,6 +104,9 @@ def score(engine, labels, select):
                 separated = joint.count("\n\n") > source.count("\n\n") + previous[2]
                 result["boundaries"] += 1
                 result["boundaries_separated"] += separated
+                if not scanned:
+                    result["digital_boundaries"] += 1
+                    result["digital_separated"] += separated
                 if not separated:
                     notes.append((page, "run into the previous paragraph", kind, item["start"][:40]))
             previous = (first, last, splits)
@@ -123,7 +130,9 @@ def main():
         engine = PdfEngine()
         engine.open(manifest[labels["key"]]["path"])
         try:
-            counts, notes = score(engine, labels, select)
+            scanned = any(engine._page_evidence(int(page), engine._analysis_page(int(page)))[4]
+                          for page in labels["pages"])
+            counts, notes = score(engine, labels, select, scanned)
         finally:
             engine.close()
         total.update(counts)
@@ -139,9 +148,14 @@ def main():
 
     print()
     print("paragraphs located", total["paragraphs"], "not located", total["not_located"])
+    for group, label in (("text", "body, heading, caption (digital PDFs)"), ("reference", "reference entries (digital PDFs)"),
+                         ("scanned", "all kinds on pages with a full-page image (scans, OCR)")):
+        print(f"  {label}: blank lines inside one paragraph {total[group + '_split_inside']}"
+              f" in {ratio(total[group + '_with_split'], total[group + '_paragraphs'])} of the paragraphs")
     print("split inside (blank lines inside one paragraph):", total["split_inside"],
           "in", ratio(total["paragraphs_with_split"], total["paragraphs"]), "of the paragraphs")
-    print("separated from the previous paragraph:", ratio(total["boundaries_separated"], total["boundaries"]))
+    print("separated from the previous paragraph:", ratio(total["boundaries_separated"], total["boundaries"]),
+          "; digital PDFs only:", ratio(total["digital_separated"], total["digital_boundaries"]))
 
 
 if __name__ == "__main__":

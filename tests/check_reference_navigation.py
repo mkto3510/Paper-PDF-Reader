@@ -516,6 +516,41 @@ def check_paragraph_edges(folder):
     assert len(references) == 3 and references[1].startswith("Doser DI") and references[1].endswith("675"), references
 
 
+def check_selection_paragraphs(folder):
+    """A selection splits paragraphs where a paragraph starts, judged against the usual line gap of the page: wide
+    line spacing (Japanese typesetting) does not split a paragraph, an indented line after a finished sentence
+    starts a new one, and a page whose every line is marked bold (OCR text) is not read as a list of headings."""
+    from paper_reader.selection import select
+
+    path = folder / "selection_paragraphs.pdf"
+    with mu.open() as pdf:
+        wide = pdf.new_page(width=612, height=792)
+        for row in range(8):
+            wide.insert_text((56, 100 + row * 24), f"First paragraph, line {row}, runs on without any indent", fontsize=10)
+        wide.insert_text((70, 100 + 8 * 24), "Second paragraph begins with an indent after a finished sentence.", fontsize=10)
+        for row in range(1, 4):
+            wide.insert_text((56, 100 + (8 + row) * 24), f"Second paragraph, line {row}, runs on without any indent", fontsize=10)
+        bold = pdf.new_page(width=612, height=792)
+        for row in range(10):
+            bold.insert_text((56, 100 + row * 12), f"Every line {row} of this page is set in bold type as OCR text is marked",
+                             fontsize=10, fontname="hebo")
+        pdf.save(path)
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(path))
+        for number, expected in ((0, 2), (1, 1)):
+            lines = engine.text(number)
+            source = select({number: lines}, (number, 0, 0), (number, len(lines) - 1, len(lines[-1].glyphs) - 1),
+                            origin="").source
+            parts = source.split("\n\n")
+            assert len(parts) == expected, (number, len(parts), parts)
+        assert parts[0].count("every line") == 0 and len(engine.text(0)) == 12
+        first, second = select({0: engine.text(0)}, (0, 0, 0), (0, 11, 5), origin="").source.split("\n\n")
+        assert first.startswith("First paragraph") and second.startswith("Second paragraph begins"), (first, second)
+    finally:
+        engine.close()
+
+
 def check_heading_variants(folder):
     """Letter-spaced and "cited" headings open a bibliography."""
     for number, heading in enumerate(("R E F E R E N C E S", "REFERENCES CITED", "References")):
@@ -795,6 +830,7 @@ if __name__ == "__main__":
         check_heading_variants(folder)
         check_paragraphs(folder)
         check_paragraph_edges(folder)
+        check_selection_paragraphs(folder)
         check_page_layout(folder)
         check_year_lists()
         check_prefixed_labels()
