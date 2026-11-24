@@ -45,6 +45,25 @@ def _compose_accents(glyphs):
     return tuple(result)
 
 
+def _baseline(raw):
+    """Return (size, baseline) of the span that holds most characters of a line."""
+    spans = [span for span in raw["spans"] if span["chars"]]
+    if not spans:
+        return None
+    main = max(spans, key=lambda span: len(span["chars"]))
+    return main["size"], main["chars"][0]["origin"][1], len(main["chars"])
+
+
+def _is_raised(span, y, base):
+    """Tell whether a character is a superscript: small and sitting above the line's main baseline."""
+    if base is None or not span["chars"]:
+        return False
+    size, baseline, count = base
+    if count <= len(span["chars"]):
+        return False  # the main text of the line is never a superscript
+    return bool(span["flags"] & 1) or (span["size"] <= size * .8 and y < baseline - size * .15)
+
+
 def _join_spaced_headings(lines):
     """Join letter-spaced headings that PDFs store as one line per character.
 
@@ -328,10 +347,14 @@ class PdfEngine:
         lines, width, height = self._index_rows(page)
         in_bibliography = self.in_bibliography and index not in self.chapter_pages
         regions = None
+        carried = False
         if skip_bibliography and not any(HEADING.fullmatch(line.text.strip()) or END.fullmatch(line.text.strip())
                                          for line in lines):
-            # No section heading here, so reading order cannot change which lines are eligible.
-            eligible = set() if in_bibliography else {id(line) for line in lines}
+            # No section heading here, so reading order cannot change which lines are eligible. A bibliography
+            # state carried from an earlier page is only trusted while no confirmed caption shows up (a contents
+            # line or another article's heading can start it by mistake); see the end of this method.
+            carried = in_bibliography
+            eligible = {id(line) for line in lines}
         elif skip_bibliography:
             regions = reading_regions(lines, width)
             eligible = set()
@@ -357,11 +380,15 @@ class PdfEngine:
                 x0 >= group.box[0] - .1 and x1 <= group.box[2] + .1 and abs(y0 - group.box[1]) < .1
                 for x0, y0, x1, _ in starts)]
         matrix = page.rotation_matrix
-        return tuple(
+        found = tuple(
             (group, Reference(index, tuple(mu.Rect(group.box) * matrix), group.text[:110],
                               tuple(mu.Rect(group.object_box) * matrix) if group.object_box else None))
             for group in groups if group.kind != "other" and not group.continued
-        ), in_bibliography
+        )
+        if carried:
+            # Confirmed captions end a bibliography state that was carried in; without any, it goes on.
+            return (found, False) if found else ((), True)
+        return found, in_bibliography
 
     def figure_step(self, budget_ms=None):
         """Read pages for the figure index, like reference_step."""
@@ -385,9 +412,10 @@ class PdfEngine:
         for kind, label in keys:
             exact = [target for group, target in entries if (group.kind, group.label) == (kind, label)]
             if not exact and len(label) > 1 and label[-2].isdigit() and label[-1].isalpha():
-                exact = [target for group, target in entries
-                         if (group.kind, group.label) == (kind, label[:-1])
-                         and f"({label[-1]})" in group.text.casefold()]
+                # "Fig. 3b" is a panel of figure 3. A caption that lists the panel wins when several share the number.
+                base = [(group, target) for group, target in entries if (group.kind, group.label) == (kind, label[:-1])]
+                exact = ([target for group, target in base if f"({label[-1]})" in group.text.casefold()]
+                         or [target for _, target in base])
             targets.append(exact[0] if len(exact) == 1 else None)
         return tuple(targets)
 
@@ -482,6 +510,7 @@ class PdfEngine:
             for raw in block.get("lines", ()):
                 glyphs = []
                 sizes = []
+                base = _baseline(raw)
                 for span in raw["spans"]:
                     for char in span["chars"]:
                         x, y = char["origin"]
@@ -489,6 +518,7 @@ class PdfEngine:
                         glyphs.append(Glyph(
                             char["c"], tuple(char["bbox"]), quad,
                             (round(x, 1), round(y, 1), char["c"]) in artifacts,
+                            _is_raised(span, y, base),
                         ))
                         sizes.append(span["size"])
                 if glyphs and any(glyph.text.strip() for glyph in glyphs):

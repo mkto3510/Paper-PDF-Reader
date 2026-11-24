@@ -19,6 +19,7 @@ class Glyph:
     box: Box
     quad: Quad
     artifact: bool = False
+    raised: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,10 +165,14 @@ def reading_regions(lines, width):
     side = [line for line in lines if id(line) not in spanning_ids]
     regions = []
 
+    # Entry numbers sit left of their text, so they may start inside the gutter. Anything that starts after the
+    # left column has ended belongs to the right column.
+    left_edge = max((line.box[2] for line in horizontal if line.box[2] < center - gutter / 2), default=center)
+
     def emit_columns(group):
         left, right = [], []
         for line in group:
-            (right if line.box[0] > center else left).append(line)
+            (right if line.box[0] > min(center, left_edge) else left).append(line)
         regions.extend(_horizontal_order(column) for column in (left, right) if column)
 
     # Consecutive full-width lines (e.g. an abstract) form one region.

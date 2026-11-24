@@ -20,9 +20,10 @@ AUTHOR = (rf"(?P<author>{SURNAME})(?:\s+(?:et\s+al\.?|(?:and|&)\s+(?P<second>{SU
 NUMBER_GROUP = re.compile(rf"\[\s*{NUMBER}(?:\s*[-,]\s*{NUMBER})*\s*\]")
 STRUCTURE = re.compile(r"(?:\b(?:fig(?:ure)?s?|tables?|eq(?:uation)?s?|sec(?:tion)?s?|algorithm|appendix)\.?"
                        r"|[図表式])\s*$", re.I)
-PARENS = re.compile(r"\(([^()\n]+)\)")
+# AGU journals write author-year citations in square brackets: "[Hanks and Kanamori, 1979]" and "Hess [1965]".
+PARENS = re.compile(r"\(([^()\n]+)\)|\[([^\[\]\n]+)\]")
 AUTHOR_YEAR = re.compile(rf"{AUTHOR}(?:\s*,\s*|\s+)(?P<year>{YEAR})(?:,\s*(?:pp?\.\s*)?\d+(?:-\d+)?)?", re.I)
-NARRATIVE = re.compile(rf"(?<![A-Za-zÀ-ž0-9_'-]){AUTHOR}\s*(?P<date>\(\s*(?P<year>{YEAR})\s*\))", re.I)
+NARRATIVE = re.compile(rf"(?<![A-Za-zÀ-ž0-9_'-]){AUTHOR}\s*(?P<date>[(\[]\s*(?P<year>{YEAR})\s*[)\]])", re.I)
 LEAD_IN = re.compile(r"^(?:see(?: also)?|e\.g\.,?|cf\.?)\s+", re.I)
 NUMBER_LABEL = rf"(?:\[({NUMBER})\]|({NUMBER})[.)])"
 NUMBER_ENTRY = re.compile(rf"^{NUMBER_LABEL}\s*(?=[^\W\d_])")
@@ -49,6 +50,8 @@ EARLY_STOP_MARGIN = 1
 BOOK_PAGES = 60
 # Stopping early needs at least this many entries behind the heading.
 EARLY_STOP_ENTRIES = 3
+# A numbered run this long with mostly bibliographic entries is a reference list wherever it sits.
+STRONG_RUN = 8
 AUTHOR_END = re.compile(r"(?<=[^\W\d_]{2})\.\s+|\s*[「『“\"]")
 INITIAL = re.compile(r"(?:[^\W\d_]\.?|[A-Z]{2,3})")
 NAME_WORD = re.compile(r"[^\W\d_]+(?:[-'][^\W\d_]+)*")
@@ -86,6 +89,8 @@ class Reference:
 def number_keys(text):
     found = []
     for part in text[1:-1].split(","):
+        if re.search(r"(?<!\d)0\d", part):
+            return ()  # "[001]" is a crystal direction, not reference number 1
         edges = [int(value) for value in part.split("-")]
         if len(edges) > 2 or not 0 < edges[0] <= edges[-1] < edges[0] + 50:
             return ()
@@ -111,18 +116,90 @@ def _author_key(match):
     return key
 
 
-def citation_spans(text):
+NOT_AUTHORS = {"january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
+                "november", "december", "received", "accepted", "revised", "published", "submitted", "version"}
+
+
+def _plausible(match):
+    """Reject names that cannot be authors: words that start in lower case ("law (1979)") and dates or
+    manuscript states ("December 1987", "Received 1975")."""
+    for group in ("author", "second"):
+        words = (match[group] or "").split()
+        if words and (words[-1].casefold() in NOT_AUTHORS or words[-1][0].islower()):
+            return False
+    return True
+
+
+def citation_spans(text, paragraph_start=False):
+    """Yield (span, Citation) pairs. paragraph_start tells that text begins a paragraph: AGU journals number
+    their paragraphs "[1]", "[2]", and those numbers are not citations."""
     for match in NUMBER_GROUP.finditer(text):
+        if paragraph_start and not text[:match.start()].strip():
+            continue
         if not STRUCTURE.search(text[:match.start()]) and (keys := number_keys(match[0])):
+            if len(keys) == 1 and keys[0] >= 1800:
+                continue  # "Hess [1965]" is a year, not a reference number
             yield match.span(), Citation(match[0], keys)
     for match in PARENS.finditer(text):
-        authors = [AUTHOR_YEAR.fullmatch(LEAD_IN.sub("", part.strip())) for part in match[1].split(";")]
-        if all(authors):
+        authors = [AUTHOR_YEAR.fullmatch(LEAD_IN.sub("", part.strip())) for part in (match[1] or match[2]).split(";")]
+        if all(authors) and all(_plausible(item) for item in authors):
             keys = tuple(dict.fromkeys(_author_key(item) for item in authors))
             yield match.span(), Citation(match[0], keys)
     for match in NARRATIVE.finditer(text):
-        if not STRUCTURE.search(text[match.start():match.start("date")]):
+        if not STRUCTURE.search(text[match.start():match.start("date")]) and _plausible(match):
             yield match.span(), Citation(match[0], (_author_key(match),))
+
+
+SUPERSCRIPT_DIGITS = frozenset("⁰¹²³⁴⁵⁶⁷⁸⁹")
+RAISED_NUMBERS = re.compile(r"\d{1,3}(?:\s*[,-]\s*\d{1,3})*")
+LATIN = "A-Za-zÀ-ž"
+BEFORE_MARK = ".,;:!?”’\"]"
+MATH_WORDS = {"sin", "cos", "tan", "cot", "sec", "csc", "exp", "log", "ln", "max", "min", "lim", "det", "mod"}
+
+
+def _mathy(token):
+    """Tell whether a word holds mathematical symbols or Greek letters, as formulas do."""
+    return any(unicodedata.category(char) in ("Sm", "Cc") or char in "/^_" or ord(char) >= 0x1D400
+               or "GREEK" in unicodedata.name(char, "") for char in token)
+
+
+def _has_prose(plain):
+    """Tell whether text holds running sentences. Author lines with affiliation numbers have none."""
+    words = re.findall(rf"(?<![{LATIN}])[a-zà-ž]{{4,}}", plain)
+    return len(words) >= 2 or len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff]", plain)) >= 8
+
+
+def superscript_spans(text, raised):
+    """Find citation numbers printed as superscripts, such as "…as shown¹,²".
+
+    Every character of the number must be raised, and it must follow a word or sentence punctuation in running
+    text. Exponents (m², 10³, cos²θ, σ⁻²) and author-affiliation numbers are skipped.
+    """
+    if not _has_prose("".join(char for char, lifted in zip(text, raised) if not lifted)):
+        return
+    index, size = 0, len(text)
+    while index < size:
+        if not raised[index] or not text[index].isdigit():
+            index += 1
+            continue
+        end = index + 1
+        while end < size and (raised[end] or (text[end] in ",-" and end + 1 < size and raised[end + 1])):
+            end += 1
+        run, before = text[index:end], text[:index]
+        previous = before[-1:]
+        following = text[end:end + 1]
+        if previous.isalpha():
+            word = re.search(rf"[{LATIN}]*$", before)[0]
+            exponent = bool(re.match(rf"[{LATIN}]", previous)) and (len(word) <= 2 or word.lower() in MATH_WORDS)
+        else:
+            exponent = not previous or previous not in BEFORE_MARK or (previous in "\"”’" and before[-2:-1].isdigit())
+        # Isotopes (87Sr), symbols with subscripts-like numbers (σ12, ε54Cr) and formulas are not citations.
+        exponent = (exponent or bool(re.match(rf"[{LATIN}\u0370-\u03ff]", following))
+                    or _mathy(before.split(" ")[-1]))
+        if (not exponent and RAISED_NUMBERS.fullmatch(run)
+                and (keys := number_keys(f"[{run.replace(' ', '')}]"))):
+            yield (index, end), Citation(run, keys)
+        index = end
 
 
 def _clickable(line):
@@ -154,28 +231,32 @@ def citation_at(lines, x, y):
             first -= 1
         while last < min(len(lines), index + 4) and _wrapped(lines[last - 1], lines[last]):
             last += 1
-        text, positions = [], []
+        text, positions, raised = [], [], []
         for row in lines[first:last]:
             if text:
                 if (text[-1] in ("-", "‐", "\u00ad") and len(text) > 1
                         and text[-2][-1:].isalpha() and row.text.lstrip()[:1].isalpha()):
                     text.pop()
                     positions.pop()
+                    raised.pop()
                 else:
                     text.append(" ")
                     positions.append(None)
+                    raised.append(False)
             segments = []
             for glyph in row.glyphs:
+                lifted = glyph.raised or glyph.text in SUPERSCRIPT_DIGITS
                 if segments and glyph.text and unicodedata.combining(glyph.text[0]):
-                    previous, box = segments.pop()
-                    segments.append((previous + glyph.text, bounds((box, glyph.box))))
+                    previous, box, was_lifted = segments.pop()
+                    segments.append((previous + glyph.text, bounds((box, glyph.box)), was_lifted))
                 else:
-                    segments.append((glyph.text, glyph.box))
-            for glyph_text, box in segments:
+                    segments.append((glyph.text, glyph.box, lifted))
+            for glyph_text, box, lifted in segments:
                 part = unicodedata.normalize("NFKC", glyph_text)
                 if part:
                     text.append(part)
                     positions.extend([box if row is line else None] * len(part))
+                    raised.extend([lifted] * len(part))
 
         def hit(start, end):
             visible = [box for box in positions[start:end] if box is not None]
@@ -194,7 +275,11 @@ def citation_at(lines, x, y):
             for (start, end), citation in figures:
                 if own_label not in citation.keys and (box := hit(start, end)):
                     return replace(citation, box=box)
-        for (start, end), citation in citation_spans(normalized.translate(DASHES)):
+        paragraph_start = first == 0 or not _wrapped(lines[first - 1], lines[first])
+        spans = list(citation_spans(normalized.translate(DASHES), paragraph_start))
+        if line.kind != "table":
+            spans.extend(superscript_spans(normalized.translate(DASHES), raised))
+        for (start, end), citation in spans:
             if (box := hit(start, end)) and not any(a < end and start < b for (a, b), _ in figures):
                 # A reference with surrounding text is meaningful in a
                 # caption or table cell. A naked number in a cell is not.
@@ -265,7 +350,10 @@ def _bare_numbering(rows):
 def _entry_identity(text, bare=False):
     number, end = _entry_label(text, bare)
     content = text[end:] if number is not None else text
-    year = ENTRY_YEAR.search(content, 0, 210)
+    # A page number such as "1835-1850" looks like a year but is not one.
+    year = next((hit for hit in ENTRY_YEAR.finditer(content, 0, 210)
+                 if not re.match(r"[-–]\d", content[hit.end():hit.end() + 2])
+                 and not re.search(r"\d[-–]$", content[max(0, hit.start() - 2):hit.start()])), None)
     lead, delimiter, remainder = content.partition(":")
     if delimiter and AUTHOR_START.match(lead):
         # Some styles place the year after the venue or DOI. In those styles
@@ -275,7 +363,13 @@ def _entry_identity(text, bare=False):
         if terminal and (terminal_authors := _entry_authors(lead)):
             return number, terminal_authors, terminal[1].casefold(), True
     authors = _entry_authors(content[:year.start()]) if year else ()
-    return number, authors, year[1].casefold() if year else "", bool(authors and year or BIBLIOGRAPHIC.search(content))
+    value = year[1].casefold() if year else ""
+    if year and (terminal := END_YEAR.search(content.rstrip())) and terminal.start(1) != year.start(1):
+        # "Davis, T. N., Alaska earthquake of July 10, 1958; ..., Bull. Seismol. Soc. Am., 50, 221, 1960."
+        # Title words before the first year show that it is part of the title, and the entry's year ends it.
+        if len(re.findall(r"(?<![^\W\d_])[a-z]{5,}", content[:year.start()])) >= 1:
+            value = terminal[1].casefold()
+    return number, authors, value, bool(authors and year or BIBLIOGRAPHIC.search(content))
 
 
 def _author_matches(author, value):
@@ -298,7 +392,8 @@ def _author_targets(key, entries):
         return matches or [entry for authors, entry in first if len(authors) > 1
                            and _without_accents(key[2]) == _without_accents(authors[1])]
     if len(key) == 3:
-        return [entry for authors, entry in first if any(authors[1:])]
+        # An empty field is the entry's own "et al.", so any later field means several authors.
+        return [entry for authors, entry in first if len(authors) > 1]
     return [entry for authors, entry in first if not any(authors[1:])]
 
 
@@ -386,8 +481,6 @@ class ReferenceIndex:
         start = int(self.page_count * .5)
         candidates = []
         for row in rows:
-            if row[0] < start:
-                continue
             if END.fullmatch(row[2]):
                 candidates.append(None)
             elif match := NUMBER_ENTRY.match(row[2]):
@@ -419,11 +512,14 @@ class ReferenceIndex:
             # Refuse numbered runs embedded in later body prose. A closing
             # heading may follow a bibliography even before the document ends.
             next_row = rows[stop] if stop < len(rows) else None
-            if last[0] < next_chapter - 2 and not (next_row and END.fullmatch(next_row[2])):
-                continue
             section = rows[offsets[first[:2]]:stop]
             entries = self._entries(section)
-            if sum(evidence for _, _, _, _, evidence in entries) >= 2:
+            evidence = sum(item[4] for item in entries)
+            placed = (first[0] >= start and (last[0] >= next_chapter - 2 or bool(next_row and END.fullmatch(next_row[2]))))
+            # Short articles print the list right after the text, before methods or extended data. A long numbered
+            # run in which most entries look bibliographic is accepted wherever it sits.
+            strong = len(entries) >= STRONG_RUN and evidence >= len(entries) * .7
+            if evidence >= 2 and (placed or strong):
                 self._add_region(first, section, entries)
 
     def _add_region(self, first, section, entries):
@@ -467,6 +563,11 @@ class ReferenceIndex:
                 text += " " + subsequent[2]
                 last = subsequent
             number, authors, year, evidence = _entry_identity(text, bare)
+            if (label[0].isdigit() and _entry_label(label, bare)[0] is None
+                    and not (bare and number is not None and number < 1000)):
+                # The tail of an entry whose first lines are in another column or page ("439:3225-38", "398."),
+                # or a year at the end of a line. In a list of bare numbers a lone number ("14") heads an entry.
+                continue
             if number is not None or (authors and year):
                 entries.append((number, authors, year, Reference(page, box, label[:110]), evidence))
         return entries

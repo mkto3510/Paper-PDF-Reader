@@ -328,6 +328,194 @@ def check_scan_order(folder):
         engine.close()
 
 
+def check_superscript_citations(folder):
+    """Numbers printed as superscripts act as citations. Exponents and unit powers do not."""
+    path = folder / "superscript.pdf"
+    rows = (  # (baseline, text, raised number, expected keys)
+        (100, "The result was confirmed", "3", (3,)),
+        (130, "Other work agrees,", "1,2", (1, 2)),
+        (160, "The area in km", "2", None),
+        (190, "The scale is 10", "3", None),
+        (220, "A later point", "4-6", (4, 5, 6)),
+        (250, "A rate in cm/year", "2", None),
+        (280, "Taro Yamada", "1", None),
+    )
+    with mu.open() as pdf:
+        for _ in range(2):
+            pdf.new_page(width=612, height=780)
+        for y, text, note, _ in rows:
+            pdf[0].insert_text((55, y), text, fontsize=11)
+            pdf[0].insert_text((56 + mu.get_text_length(text, fontsize=11), y - 5), note, fontsize=7)
+        pdf[1].insert_text((55, 100), "References")
+        for number in range(1, 8):
+            pdf[1].insert_text((55, 110 + number * 25),
+                               f"{number}. A. Author{number}, Title number {number}. Journal of Tests, 7 (1970) 12.")
+        pdf.save(path)
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(path))
+        scan_steps(engine)
+        for y, text, note, expected in rows:
+            point = (0, 58 + mu.get_text_length(text, fontsize=11), y - 7)
+            citation = engine.citation_at(*point)
+            assert (citation.keys if citation else None) == expected, (text, note, citation)
+        point = (0, 58 + mu.get_text_length(rows[0][1], fontsize=11), 93)
+        target, = engine.reference_targets(point, (3,))
+        assert target.label.startswith("3. A. Author3"), target
+    finally:
+        engine.close()
+
+
+def check_bracket_author_year(folder):
+    """AGU journals cite as "Hess [1965]" and "[Hanks and Kanamori, 1979]" and number paragraphs "[1]"."""
+    path = folder / "agu.pdf"
+    with mu.open() as pdf:
+        for _ in range(2):
+            pdf.new_page(width=612, height=780)
+        pdf[0].insert_text((55, 100), "[1] The introduction begins here with a plain sentence.")
+        pdf[0].insert_text((55, 130), "Hess [1965] mapped the ridge, as did others.")
+        pdf[0].insert_text((55, 160), "Moment is defined elsewhere [Hanks and Kanamori, 1979].")
+        pdf[0].insert_text((55, 190), "See also reference [7] for another view.")
+        pdf[0].insert_text((55, 220), "The crystal direction [001] is the easy axis.")
+        pdf[0].insert_text((55, 250), "As in the friction law (1979) and the event (December 1987) here.")
+        pdf[1].insert_text((55, 100), "References")
+        pdf[1].insert_text((55, 130), "Hess, H. H. (1965), Mapping the oceanic ridge, Journal of Tests, 12, 1-9.")
+        pdf[1].insert_text((55, 160), "Hanks, T. C., and H. Kanamori (1979), A moment magnitude scale, Journal of Tests, 84, 2348.")
+        pdf.save(path)
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(path))
+        scan_steps(engine)
+        expected = (("[1] The", "[1]", None), ("Hess [1965", "[1965]", (("hess", "1965"),)),
+                    ("Kanamori, 1979", "[Hanks", (("hanks", "1979", "kanamori"),)), ("[7]", "[7]", (7,)),
+                    ("[001]", "[001]", None), ("law", "law", None), ("December", "December", None))
+        for text, search, keys in expected:
+            point = (0, *click_point_in(engine, 0, search))
+            citation = engine.citation_at(*point)
+            assert (citation.keys if citation else None) == keys, (text, citation)
+        point = (0, *click_point_in(engine, 0, "[1965]"))
+        target, = engine.reference_targets(point, (("hess", "1965"),))
+        assert target.label.startswith("Hess, H. H."), target
+    finally:
+        engine.close()
+
+
+def check_split_caption(folder):
+    """A label on a line of its own ("Figure 1.") with the title beside it still captions the figure above."""
+    path = folder / "split_caption.pdf"
+    swatch = mu.Pixmap(mu.csRGB, mu.IRect(0, 0, 40, 40))
+    swatch.clear_with(180)
+    with mu.open() as pdf:
+        page = pdf.new_page(width=612, height=792)
+        page.insert_image(mu.Rect(88, 60, 288, 248), pixmap=swatch)
+        page.insert_image(mu.Rect(207, 150, 288, 247), pixmap=swatch)  # a panel inside the figure
+        page.insert_text((61, 276), "Figure 1.", fontsize=10)
+        page.insert_text((110.1, 275.9), "Tectonic setting of the fault", fontsize=10)
+        page.insert_text((61, 288), "zone. Topographic relief map is shown.", fontsize=10)
+        page.insert_text((61, 400), "Ordinary body text follows the caption here.", fontsize=10)
+        pdf.save(path)
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(path))
+        rows, _ = engine._caption_rows(0)
+        assert len(rows) == 1, rows
+        text = rows[0][0].text
+        assert text.startswith("Figure 1.") and "Tectonic setting" in text and "Topographic relief" in text, text
+    finally:
+        engine.close()
+
+
+def check_spurious_bibliography(folder):
+    """A "References" line in a contents list must not hide the captions of every later page."""
+    path = folder / "spurious.pdf"
+    swatch = mu.Pixmap(mu.csRGB, mu.IRect(0, 0, 40, 40))
+    swatch.clear_with(180)
+    with mu.open() as pdf:
+        for _ in range(4):
+            pdf.new_page(width=612, height=792)
+        pdf[0].insert_text((61, 100), "Contents", fontsize=14)
+        pdf[0].insert_text((61, 130), "References", fontsize=10)
+        for number in (1, 2):
+            page = pdf[number]
+            page.insert_image(mu.Rect(88, 60, 288, 248), pixmap=swatch)
+            page.insert_text((61, 270), f"Figure {number}. A caption for figure {number} with a title.", fontsize=10)
+        pdf[3].insert_text((61, 100), "References", fontsize=12)
+        for number in range(1, 5):
+            pdf[3].insert_text((61, 110 + number * 14), f"{number}. A. Author, Title {number}. J Tests 3:1-5 (1990).")
+        pdf.save(path)
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(path))
+        while not engine.figure_step():
+            pass
+        found = sorted(entry[0].label for entries in engine.figure_pages.values() for entry in entries)
+        assert found == ["1", "2"], found
+    finally:
+        engine.close()
+
+
+def check_prefixed_labels():
+    """Extended data and supplementary figures are separate from the figures of the article."""
+    from unicodedata import normalize
+
+    from paper_reader.captions import caption_heading, figure_label, figure_mentions
+
+    def keys(text):
+        return [item[2] for item in figure_mentions(text)]
+
+    assert keys("see Extended Data Fig. 3 and Fig. 3a") == [(("figure", "ed3"),), (("figure", "3a"),)]
+    assert keys("in Supplementary Figs. 3 and 4 only") == [(("figure", "s3"), ("figure", "s4"))]
+    assert keys("Supplementary Table 2 lists") == [(("table", "s2"),)]
+    assert keys("Fig. S3 shows") == [(("figure", "s3"),)]
+    assert keys("Supplementary Fig. S3 shows") == [(("figure", "s3"),)]
+    heading = caption_heading(normalize("NFKC", "Extended Data Fig. 1 | MT data misfit analysis."))
+    assert figure_label(heading) == ("figure", "ed1"), figure_label(heading)
+
+
+def check_panel_mentions():
+    """"Fig. 3b" goes to the caption of figure 3, even when that caption does not list its panels."""
+    from paper_reader.captions import Caption
+    from paper_reader.citations import Reference
+
+    def entry(label, text, page):
+        box = (0, 0, 1, 1)
+        return Caption("figure", label, text, box, None, False), Reference(page, box, text)
+
+    entries = [entry("3", "Figure 3. Displacement fields.", 2), entry("4", "Figure 4. (a) Map. (b) Section.", 3),
+               entry("5", "Figure 5. First case.", 4), entry("5", "Figure 5. Second case (b).", 5)]
+    found = PdfEngine._figure_targets((("figure", "3b"), ("figure", "4b"), ("figure", "5b"), ("figure", "5c"),
+                                       ("figure", "9a")), entries)
+    assert [target.page if target else None for target in found] == [2, 3, 5, None, None], found
+
+
+def check_orphan_tail(folder):
+    """A line such as "439:3225-38", the tail of an entry that started elsewhere, must not start an entry."""
+    path = folder / "tail.pdf"
+    with mu.open() as pdf:
+        for _ in range(2):
+            pdf.new_page(width=612, height=780)
+        pdf[0].insert_text((55, 100), "As shown before (Lavie et al. 2017) the effect is clear.")
+        pdf[1].insert_text((55, 100), "References")
+        pdf[1].insert_text((55, 130), "Smith J, Jones K. 1990. A first paper on tests. J Tests 3:1-5.")
+        pdf[1].insert_text((55, 142), "439:3225-38")
+        pdf[1].insert_text((55, 154), "Lavie B, Ehrenreich D, Bourrier V. 2017. A second paper on tests. J Tests 8:1-9.")
+        pdf[1].insert_text((55, 166), "Brown A, Green C. 2001. A third paper on tests. J Tests 9:2-4.")
+        pdf[1].insert_text((55, 178), "Nozette S, et al., The mission to the Moon, J. Tests, 99, 1835-1850, 1994.")
+        pdf.save(path)
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(path))
+        scan_steps(engine)
+        point = (0, *click_point_in(engine, 0, "Lavie"))
+        citation = engine.citation_at(*point)
+        target, = engine.reference_targets(point, citation.keys)
+        assert target.label.startswith("Lavie B"), target
+        years = {entry[3].label[:6]: entry[2] for region in engine.references.regions for entry in region[2]}
+        assert years["Nozett"] == "1994", years  # not the page number 1835
+    finally:
+        engine.close()
+
+
 def click_point_in(engine, page, text):
     with mu.open(engine.temp) as pdf:
         rect = pdf[page].search_for(text)[0]
@@ -386,5 +574,12 @@ if __name__ == "__main__":
         check_unheaded_bibliography()
         check_two_column_table()
         check_scan_order(folder)
+        check_superscript_citations(folder)
+        check_bracket_author_year(folder)
+        check_orphan_tail(folder)
+        check_split_caption(folder)
+        check_prefixed_labels()
+        check_panel_mentions()
+        check_spurious_bibliography(folder)
         check_window(app, folder, path)
     print("PASS figure/table jumps, named links, captions, citation overlap, and color actions")
