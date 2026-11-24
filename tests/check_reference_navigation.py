@@ -455,6 +455,30 @@ def check_scanned_caption(folder):
         engine.close()
 
 
+def check_label_on_band_row(folder):
+    """A label printed a little higher than the full-width caption text beside it stays on that row."""
+    path = folder / "band_row.pdf"
+    swatch = mu.Pixmap(mu.csRGB, mu.IRect(0, 0, 40, 40))
+    swatch.clear_with(180)
+    with mu.open() as pdf:
+        page = pdf.new_page(width=612, height=792)
+        for row in range(8):
+            page.insert_text((56, 520 + row * 12), f"Left column prose line {row} of the article text here.", fontsize=10)
+            page.insert_text((320, 520 + row * 12), f"Right column prose line {row} of the article text.", fontsize=10)
+        page.insert_image(mu.Rect(120, 60, 500, 290), pixmap=swatch)
+        page.insert_text((56, 316), "Figure 2.", fontsize=11)
+        page.insert_text((150, 316), "Antiplane displacement due to anelastic strain in a rectangular shear zone, black", fontsize=10)
+        page.insert_text((56, 328), "dashed box, shown across the full width of the page for this test only.", fontsize=10)
+        pdf.save(path)
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(path))
+        rows, _ = engine._caption_rows(0)
+        assert [row[0].label for row in rows] == ["2"], rows
+    finally:
+        engine.close()
+
+
 def check_page_layout(folder):
     """The scans share one reading of a page; changing the band rule discards it."""
     path = folder / "layout.pdf"
@@ -659,6 +683,7 @@ if __name__ == "__main__":
         check_orphan_tail(folder)
         check_split_caption(folder)
         check_scanned_caption(folder)
+        check_label_on_band_row(folder)
         check_page_layout(folder)
         check_year_lists()
         check_prefixed_labels()

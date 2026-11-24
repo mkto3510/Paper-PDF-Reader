@@ -183,11 +183,14 @@ def reading_regions(lines, width):
         bands[-1].append(line)
     for band in bands:
         top, bottom = min(l.box[1] for l in band), max(l.box[3] for l in band)
-        emit_columns(line for line in side if line.box[1] < top)
-        within = [line for line in side if top <= line.box[1] < bottom and line.horizontal]
+        # A label ("Figure 2.") printed in its own text object on the first row of the band can sit a little higher
+        # than the text beside it; it still belongs to that row.
+        first_row = top - typical * .35
+        emit_columns(line for line in side if line.box[1] < first_row)
+        within = [line for line in side if first_row <= line.box[1] < bottom and line.horizontal]
         regions.append(_horizontal_order([*band, *within]))
         claimed = {id(line) for line in within}
-        side = [line for line in side if line.box[1] >= top and id(line) not in claimed]
+        side = [line for line in side if line.box[1] >= first_row and id(line) not in claimed]
     emit_columns(side)
     return regions
 
