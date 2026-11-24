@@ -552,6 +552,19 @@ def check_selection_paragraphs(folder):
         engine.close()
 
 
+def check_old_settings(folder):
+    """A settings file saved before the "front" rule existed loads with that rule on and keeps the other choices."""
+    import json
+
+    from paper_reader.preferences import load_preferences
+
+    path = folder / "old_settings.json"
+    path.write_text(json.dumps({"language": "ja", "rules": {"furniture": True, "caption": False, "edge_band": 10}}),
+                    encoding="utf-8")
+    rules = load_preferences(path)["rules"]
+    assert rules["front"] is True and rules["caption"] is False and rules["edge_band"] == 10, rules
+
+
 def check_paragraph_pitfalls(folder):
     """Lines that only look like the start of a paragraph do not split one: a line that begins with a word such as
     "results,", a number followed by a multiplication sign or a decimal point, or a name with an initial; and the
@@ -979,6 +992,7 @@ if __name__ == "__main__":
         check_paragraph_edges(folder)
         check_selection_paragraphs(folder)
         check_paragraph_pitfalls(folder)
+        check_old_settings(folder)
         check_symbol_lines()
         check_figure_text()
         check_front_matter()
