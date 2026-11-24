@@ -180,11 +180,13 @@ def _breaks(previous: tuple, current: tuple, rules, gaps=None) -> bool:
     below = b.box[1] - a.box[3]
     if NUMBERED_ITEM.match(text_b) and SENTENCE_END.search(text_a):
         return True
-    if _is_heading(text_a, a) or _is_heading(text_b, b):
-        # A heading that wraps onto a second line stays one paragraph.
-        wrapped = (_is_heading(text_a, a) and _is_heading(text_b, b) and page_a == page_b
-                   and abs(a.size - b.size) <= size * .05 and 0 <= below <= size * .9
-                   and not TERMINAL.search(text_a))
+    head_a, head_b = _is_heading(text_a, a), _is_heading(text_b, b)
+    if head_a or head_b:
+        # A heading that wraps onto a second line stays one paragraph, and so does a whole paragraph set in bold
+        # (an abstract): its lines look like short headings, but each continues the line above.
+        wrapped = (page_a == page_b and abs(a.size - b.size) <= size * .05 and -size * .4 <= below <= size * .9
+                   and not SENTENCE_END.search(text_a)
+                   and ((head_a and head_b) or (a.leading_bold and b.leading_bold)))
         return not wrapped
     directly_below = (page_a == page_b and -size * .35 <= below <= size * 2.5
                       and abs(b.box[0] - a.box[0]) < size * 3.2)
