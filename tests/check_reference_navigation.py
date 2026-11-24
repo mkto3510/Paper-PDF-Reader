@@ -516,6 +516,41 @@ def check_paragraph_edges(folder):
     assert len(references) == 3 and references[1].startswith("Doser DI") and references[1].endswith("675"), references
 
 
+def check_column_order(folder):
+    """A heading at the bottom of a column that the PDF stream writes before the text above it is read after that
+    text, and a selection from the top of the column to the heading takes the text in between."""
+    from paper_reader.selection import select
+
+    path = folder / "column_order.pdf"
+    with mu.open() as pdf:
+        page = pdf.new_page(width=612, height=792)
+        for row in range(30):
+            page.insert_text((56, 100 + row * 12), f"Left column line {row} of the article text goes here.", fontsize=10)
+        # The stream writes the bottom of the right column first.
+        page.insert_text((320, 600), "References", fontsize=11, fontname="hebo")
+        for row in range(3):
+            page.insert_text((320, 620 + row * 12), f"Reference entry {row}, Author A. 2001. Title of the paper.", fontsize=10)
+        for row in range(30):
+            page.insert_text((320, 100 + row * 12), f"Right column line {row} of the article text here.", fontsize=10)
+        pdf.save(path)
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(path))
+        lines = engine.text(0)
+        texts = [line.text for line in lines]
+        heading = next(i for i, text in enumerate(texts) if text.startswith("References"))
+        top = next(i for i, text in enumerate(texts) if text.startswith("Right column line 0"))
+        bottom = max(i for i, text in enumerate(texts) if text.startswith("Right column line"))
+        assert top < bottom < heading, (top, bottom, heading)
+        first = next(i for i, text in enumerate(texts) if text.startswith("Right column line 20"))
+        last = max(i for i, text in enumerate(texts) if text.startswith("Reference entry"))
+        source = select({0: lines}, (0, first, 0), (0, last, len(lines[last].glyphs) - 1), origin="").source
+        assert "Right column line 29" in source and "References" in source and "Reference entry 2" in source, source
+        assert source.index("Right column line 29") < source.index("References"), source
+    finally:
+        engine.close()
+
+
 def check_heading_variants(folder):
     """Letter-spaced and "cited" headings open a bibliography."""
     for number, heading in enumerate(("R E F E R E N C E S", "REFERENCES CITED", "References")):
@@ -795,6 +830,7 @@ if __name__ == "__main__":
         check_heading_variants(folder)
         check_paragraphs(folder)
         check_paragraph_edges(folder)
+        check_column_order(folder)
         check_page_layout(folder)
         check_year_lists()
         check_prefixed_labels()

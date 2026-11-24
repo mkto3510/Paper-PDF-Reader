@@ -200,6 +200,43 @@ def reading_order(lines, width):
 
 
 def correct_stream_order(lines, width, graphics=()):
+    """Repair the order of the lines of a page, preserving the PDF's order wherever it reads right.
+
+    Two repairs: columns that the PDF stream crosses again and again, and a column whose lines jump back up the page
+    (a heading printed at the bottom of a column that the stream writes before the text above it)."""
+    return _restore_column_order(_repair_column_crossings(lines, width, graphics), width)
+
+
+def _restore_column_order(lines, width):
+    """Put the lines of a column that jumps back up the page in the order of the page.
+
+    Only a column (region of reading_regions) with a jump of five line heights or more is touched, and only its own
+    lines change places among themselves; the rest of the page keeps the order of the stream."""
+    main = [line for line in lines if line.horizontal and not line.kind]
+    if len(main) < 6:
+        return lines
+    typical = median(line.size for line in main)
+    def jumps(sequence):
+        return sum(b.box[1] < a.box[1] - typical * 5 and min(a.box[2], b.box[2]) - max(a.box[0], b.box[0])
+                   > min(a.box[2] - a.box[0], b.box[2] - b.box[0]) * .5 for a, b in zip(sequence, sequence[1:]))
+
+    position = {id(line): index for index, line in enumerate(lines)}
+    result = list(lines)
+    for region in reading_regions(main, width):
+        if len(region) < 4:
+            continue
+        slots = sorted(position[id(line)] for line in region)
+        if jumps([lines[slot] for slot in slots]):
+            for slot, line in zip(slots, region):
+                result[slot] = line
+    # A page that would jump more than before keeps the order of the stream.
+    body = {id(line) for line in main}
+    after = jumps([line for line in result if id(line) in body])
+    before = jumps([line for line in lines if id(line) in body])
+    return tuple(result) if after <= before else lines
+
+
+def _repair_column_crossings(lines, width, graphics=()):
     """Repair repeated column crossings while preserving the PDF's order elsewhere."""
     main = [line for line in lines if line.horizontal and not line.kind]
     if len(main) < 6:
