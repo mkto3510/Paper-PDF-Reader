@@ -351,8 +351,12 @@ def classify_captions(lines, regions, evidence, width, height):
             # "FIG. 2" and "TABLE I" in capitals are headings; running text writes "Fig. 2" or "Figure 2".
             capitals = (heading.re is LABEL and bool(heading["english"]) and heading["english"].rstrip(".").isupper()
                         and len(heading["english"].rstrip(".")) > 2)
+            # Scanned pages carry no figure object: "Fig. 2. The effects..." that is set
+            # in bold or in smaller type than the prose (flush with the column, so "distinct" does not apply).
+            punctuated = (bool(CAPTION_END.match(tail)) and tail.lstrip(" .:：|")[:1].isupper()
+                          and (line.leading_bold or (body_size is not None and line.size < body_size * .95)))
             if object_box is None and not (continued or distinct or styled_label or label_start or capitals
-                                           or (isolated and CAPTION_END.match(tail))):
+                                           or punctuated or (isolated and CAPTION_END.match(tail))):
                 continue
             active = [line]
             metadata = kind, label, object_box, continued

@@ -425,6 +425,36 @@ def check_split_caption(folder):
         engine.close()
 
 
+def check_scanned_caption(folder):
+    """A scanned page has no figure object; a smaller or bold "Fig. 2. Title" opening a block is still a caption."""
+    path = folder / "scanned_caption.pdf"
+    with mu.open() as pdf:
+        page = pdf.new_page(width=612, height=792)
+        for row in range(6):
+            page.insert_text((61, 70 + row * 12), f"Running prose of the article, line {row}, goes on across the column here.",
+                             fontsize=10)
+        page.insert_text((120, 200), "Depth (km)", fontsize=7)
+        page.insert_text((130, 243), "0   50   100", fontsize=7)
+        page.insert_text((61, 250), "Fig. 2. The effects of imposing a boundary at depth.", fontsize=8)
+        page.insert_text((61, 262), "Curve (a) shows the solution.", fontsize=8)
+        for row in range(4):
+            page.insert_text((61, 300 + row * 12), f"More prose, line {row}, continues the argument in full sentences.",
+                             fontsize=10)
+        # In running text the same words at body size, inside a paragraph, are not a caption.
+        page.insert_text((61, 380), "as discussed before, the model reproduces the data and", fontsize=10)
+        page.insert_text((61, 392), "Fig. 3. Is mentioned in passing at the body size here.", fontsize=10)
+        page.insert_text((61, 404), "so the argument continues without any figure nearby.", fontsize=10)
+        pdf.save(path)
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(path))
+        rows, _ = engine._caption_rows(0)
+        labels = sorted(row[0].label for row in rows)
+        assert labels == ["2"], labels
+    finally:
+        engine.close()
+
+
 def check_spurious_bibliography(folder):
     """A "References" line in a contents list must not hide the captions of every later page."""
     path = folder / "spurious.pdf"
@@ -578,6 +608,7 @@ if __name__ == "__main__":
         check_bracket_author_year(folder)
         check_orphan_tail(folder)
         check_split_caption(folder)
+        check_scanned_caption(folder)
         check_prefixed_labels()
         check_panel_mentions()
         check_spurious_bibliography(folder)
