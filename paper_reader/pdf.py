@@ -19,12 +19,15 @@ from .analysis_rules import DEFAULT_RULES, classify, page_evidence
 from .artifacts import artifact_glyphs
 from .captions import caption_heading, classify_captions
 from .citations import END, HEADING, Reference, ReferenceIndex, citation_at
+from .layout import PageLayout
 from .search import find_page
-from .selection import Glyph, Line, bounds, correct_stream_order, edge_band, furniture_key, reading_order, reading_regions, select
+from .selection import Glyph, Line, bounds, correct_stream_order, edge_band, furniture_key, reading_regions, select
 
 
 # Pages on each side of a figure mention that figure_nearby reads before the full scan is needed.
 FIGURE_WINDOW = 6
+# Pages whose index lines, reading regions and caption decisions are kept for the scans.
+PAGE_LAYOUTS = 128
 
 _SPACING_ACCENTS = {"´": "\u0301", "ˆ": "\u0302", "˜": "\u0303",
                     "¨": "\u0308", "¸": "\u0327", "ˇ": "\u030c", "˚": "\u030a"}
@@ -121,8 +124,8 @@ class PdfEngine:
         self.backed_up = False
         self.text_cache: OrderedDict = OrderedDict()
         self.citation_cache: OrderedDict = OrderedDict()
-        self.layout_cache: OrderedDict = OrderedDict()
-        self.edge_cache = {}
+        self.evidence_cache: OrderedDict = OrderedDict()
+        self.page_layouts: OrderedDict = OrderedDict()
         self.display_lists = OrderedDict()
         self.options = DEFAULT_RULES.copy()
         self.history = []
@@ -164,7 +167,7 @@ class PdfEngine:
             self.state_ids = count(1)
             self.saved_revision = 0
             self.text_cache.clear()
-            self.edge_cache.clear()
+            self.page_layouts.clear()
             return {"pages": pages, "outline": outline, "name": path.name, "signature": stamp}
         finally:
             if self.temp != snapshot:
@@ -179,7 +182,8 @@ class PdfEngine:
         self.named_figure_pages.clear()
         self.in_bibliography = False
         self.chapter_pages = set()
-        self.layout_cache.clear()
+        self.evidence_cache.clear()
+        self.page_layouts.clear()
         self.citation_cache.clear()
         self.display_lists.clear()
         if self.analysis_doc is not None:
@@ -234,7 +238,7 @@ class PdfEngine:
         self.options = DEFAULT_RULES | settings
         self.text_cache.clear()
         self.citation_cache.clear()
-        self.edge_cache.clear()
+        self.page_layouts.clear()
 
     def content_bounds(self, index):
         page = self.doc[index]
@@ -291,6 +295,22 @@ class PdfEngine:
     def citation_at(self, page, x, y):
         return citation_at(self.text(page, quads=False), x, y)
 
+    def _page_layout(self, index):
+        """Return the page as the index reads it, from the cache when it was read before."""
+        cache = self.page_layouts
+        if index in cache:
+            cache.move_to_end(index)
+            return cache[index]
+        page = self._analysis_page(index)
+        lines, width, height = self._index_rows(page)
+        fraction = self.options["edge_band"] / 100
+        edges = frozenset((side, furniture_key(line.text), line.box[1] / height)
+                          for line in lines if (side := edge_band(line, height, fraction)))
+        cache[index] = layout = PageLayout(lines, width, height, edges)
+        if len(cache) > PAGE_LAYOUTS:
+            cache.popitem(last=False)
+        return layout
+
     def _index_rows(self, page):
         # Read a single page and avoid instantiating per-glyph quads for the index.
         blocks = page.get_text("dict", flags=mu.TEXTFLAGS_DICT & ~mu.TEXT_PRESERVE_IMAGES)["blocks"]
@@ -311,12 +331,6 @@ class PdfEngine:
         width, height = page.rect.width, page.rect.height
         if page.rotation in (90, 270):
             width, height = height, width
-        if page.number not in self.edge_cache:
-            fraction = self.options["edge_band"] / 100
-            self.edge_cache[page.number] = {
-                (side, furniture_key(line.text), line.box[1] / height)
-                for line in lines if (side := edge_band(line, height, fraction))
-            }
         return lines, width, height
 
     def reference_step(self, budget_ms=None):
@@ -329,9 +343,8 @@ class PdfEngine:
         while not self.references.complete:
             index = self.references.next_page
             page = self._analysis_page(index)
-            lines, width, _ = self._index_rows(page)
             matrix = page.rotation_matrix
-            rows = [(line, tuple(mu.Rect(line.box) * matrix)) for line in reading_order(lines, width)]
+            rows = [(line, tuple(mu.Rect(line.box) * matrix)) for line in self._page_layout(index).reading_order]
             self.references.add_page(index, rows)
             if perf_counter() >= deadline:
                 break
@@ -344,9 +357,9 @@ class PdfEngine:
 
     def _caption_rows(self, index, skip_bibliography=False):
         page = self._analysis_page(index)
-        lines, width, height = self._index_rows(page)
+        layout = self._page_layout(index)
+        lines = layout.lines
         in_bibliography = self.in_bibliography and index not in self.chapter_pages
-        regions = None
         carried = False
         if skip_bibliography and not any(HEADING.fullmatch(line.text.strip()) or END.fullmatch(line.text.strip())
                                          for line in lines):
@@ -356,9 +369,8 @@ class PdfEngine:
             carried = in_bibliography
             eligible = {id(line) for line in lines}
         elif skip_bibliography:
-            regions = reading_regions(lines, width)
             eligible = set()
-            for region in regions:
+            for region in layout.regions:
                 for line in region:
                     text = line.text.strip()
                     if HEADING.fullmatch(text):
@@ -371,9 +383,7 @@ class PdfEngine:
             eligible = {id(line) for line in lines}
         if not any(id(line) in eligible and caption_heading(line.text) for line in lines):
             return (), in_bibliography
-        if regions is None:
-            regions = reading_regions(lines, width)
-        groups, _, _ = classify_captions(lines, regions, self._page_evidence(index, page), width, height)
+        groups, _, _ = layout.captions(self._page_evidence(index, page))
         if skip_bibliography:
             starts = {line.box for line in lines if id(line) in eligible}
             groups = [group for group in groups if any(
@@ -530,21 +540,6 @@ class PdfEngine:
                                       leading_bold=leading_bold))
         return lines
 
-    def _edge_keys(self, index):
-        if index not in self.edge_cache:
-            page = self._analysis_page(index)
-            height = page.rect.width if page.rotation in (90, 270) else page.rect.height
-            limit = self.options["edge_band"] / 100
-            keys = set()
-            for block in page.get_text("dict", flags=mu.TEXTFLAGS_DICT & ~mu.TEXT_PRESERVE_IMAGES)["blocks"]:
-                for line in block.get("lines", ()):
-                    _, top, _, bottom = line["bbox"]
-                    side = -1 if bottom <= height * limit else (1 if top >= height * (1 - limit) else 0)
-                    if side:
-                        keys.add((side, furniture_key("".join(span["text"] for span in line["spans"])), top / height))
-            self.edge_cache[index] = keys
-        return self.edge_cache[index]
-
     def _display_lines(self, lines, page):
         if not page.rotation:
             return tuple(lines)
@@ -554,13 +549,13 @@ class PdfEngine:
                      for line in lines)
 
     def _page_evidence(self, index, page):
-        if index not in self.layout_cache:
-            self.layout_cache[index] = page_evidence(page)
-            if len(self.layout_cache) > 24:
-                self.layout_cache.popitem(last=False)
+        if index not in self.evidence_cache:
+            self.evidence_cache[index] = page_evidence(page)
+            if len(self.evidence_cache) > 24:
+                self.evidence_cache.popitem(last=False)
         else:
-            self.layout_cache.move_to_end(index)
-        return self.layout_cache[index]
+            self.evidence_cache.move_to_end(index)
+        return self.evidence_cache[index]
 
     def text(self, index, *, quads=True):
         cache = self.text_cache if quads or index in self.text_cache else self.citation_cache
@@ -577,7 +572,7 @@ class PdfEngine:
         if any(edge_band(line, height, band) for line in lines):
             for near in range(max(0, index - 3), min(self.doc.page_count, index + 4)):
                 if near != index:
-                    neighbours.update(self._edge_keys(near))
+                    neighbours.update(self._page_layout(near).edges)
         regions = reading_regions(lines, width)
         evidence = self._page_evidence(index, page)
         classified = classify(lines, width, height, neighbours, evidence, self.options, regions)

@@ -455,6 +455,28 @@ def check_scanned_caption(folder):
         engine.close()
 
 
+def check_page_layout(folder):
+    """The scans share one reading of a page; changing the band rule discards it."""
+    path = folder / "layout.pdf"
+    with mu.open() as pdf:
+        page = pdf.new_page(width=612, height=792)
+        page.insert_text((61, 40), "Running head of the journal", fontsize=8)
+        page.insert_text((61, 200), "Figure 1. A caption of some length for the figure.", fontsize=10)
+        pdf.save(path)
+    engine = PdfEngine(folder)
+    try:
+        engine.open(str(path))
+        layout = engine._page_layout(0)
+        assert engine._page_layout(0) is layout
+        assert layout.regions is layout.regions and layout.reading_order
+        assert any(key[1].startswith("running head") for key in layout.edges), layout.edges
+        engine.update_rules({"edge_band": 3})
+        assert engine._page_layout(0) is not layout
+        assert not engine._page_layout(0).edges
+    finally:
+        engine.close()
+
+
 def check_spurious_bibliography(folder):
     """A "References" line in a contents list must not hide the captions of every later page."""
     path = folder / "spurious.pdf"
@@ -609,6 +631,7 @@ if __name__ == "__main__":
         check_orphan_tail(folder)
         check_split_caption(folder)
         check_scanned_caption(folder)
+        check_page_layout(folder)
         check_prefixed_labels()
         check_panel_mentions()
         check_spurious_bibliography(folder)
