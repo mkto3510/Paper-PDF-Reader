@@ -7,15 +7,17 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import pymupdf as mu
-from PySide6.QtCore import QPoint, QRect, QSize, QTimer
+from PySide6.QtCore import QEvent, QPoint, QRect, QSize, QTimer, Qt
 from PySide6.QtGui import QGuiApplication
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QCheckBox, QMessageBox, QPushButton
 
 from check_chrome_notes import wait
 from paper_reader.analysis_rules import DEFAULT_RULES, classify
 from paper_reader.application import Application
-from paper_reader.dialogs import dialog_corner
+from paper_reader.dialogs import SettingsDialog, dialog_corner
 from paper_reader.selection import Glyph, Line, correct_stream_order, select
+from paper_reader.translation import Job
 
 
 def glyph(text, x0, y0, x1, y1):
@@ -114,9 +116,11 @@ def check_window(app, root):
         assert "illustration" not in dialog.source.toPlainText()
         next(button for button in dialog.findChildren(QPushButton) if button.text() == "Show excluded text").click()
         assert area.contains(dialog.frameGeometry())
-        restorer = next(box for box in dialog.findChildren(QCheckBox) if "Restore excluded" in box.text())
+        restorer = next(box for box in dialog.findChildren(QCheckBox) if "Include excluded" in box.text())
+        label = restorer.text()
         dialog.source.setPlainText("Edited filtered text")
         restorer.setChecked(True)
+        assert restorer.text() == label, "The checkbox label must not change with its state"
         assert "illustration" in dialog.source.toPlainText()
         dialog.source.setPlainText("Edited complete text")
         restorer.setChecked(False)
@@ -134,7 +138,7 @@ def check_window(app, root):
         card.editor.selectAll()
         card.editor.insertPlainText("Draft preserved through switching")
         assert "*" in window.tabs.tabText(window.tabs.indexOf(a))
-        assert window.windowTitle() == "Paper PDF Viewer — Unsaved changes"
+        assert window.windowTitle() == f"{a.document.path.name} — Paper PDF Viewer — Unsaved changes"
         QTimer.singleShot(60, lambda: choose("Cancel"))
         window.tabs.setCurrentWidget(b)
         assert window.pane is a
@@ -151,6 +155,8 @@ def check_window(app, root):
         assert window.pane is b and not a.document.dirty
         with mu.open(first) as saved:
             assert saved[0].first_annot.info["content"] == "Draft preserved through switching"
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        assert not window.findChildren(QMessageBox), "Confirmation boxes were not released"
 
         window.tabs.setCurrentWidget(a)
         for corner in (area.topLeft(), area.topRight(), area.bottomLeft()):
@@ -193,6 +199,186 @@ def check_window(app, root):
         control.shutdown()
 
 
+def check_tabs(app, root):
+    """Tab menus act on the clicked tab without switching, names show "&", and windows come back."""
+    first, second = root / "Smith&Jones.pdf", root / "other.pdf"
+    for path in (first, second):
+        make_pdf(path)
+    control = Application(app, root)
+    control.preferences.data.update(language="en", autoSave=False)
+    try:
+        window = control.new_window()
+        window.open_paths([str(first), str(second)])
+        wait(lambda: window.tabs.count() == 2, "Sample tabs did not load")
+        panes = {pane.document.path.name: pane for pane in (window.tabs.widget(i) for i in range(2))}
+        a, b = panes["Smith&Jones.pdf"], panes["other.pdf"]
+        wait(lambda: a.document.annotations.get(0), "Highlight did not load")
+        assert window.tabs.tabText(window.tabs.indexOf(a)) == "Smith&&Jones.pdf"
+        window.update_status()
+        assert window.tabs.tabText(window.tabs.indexOf(a)) == "Smith&&Jones.pdf"
+
+        # The menu duplicates the tab that was clicked, and never asks to save because it never switches.
+        window.tabs.setCurrentWidget(a)
+        key = next(iter(a.document.annotations[0]))
+        a.pick_note(key, edit=True)
+        card = a.notes.cards[key]
+        card.editor.selectAll()
+        card.editor.insertPlainText("Unsaved draft")
+        assert a.notes.has_drafts()
+        bar = window.tabs.tabBar()
+        point = bar.tabRect(window.tabs.indexOf(b)).center()
+        picked = []
+        with patch.object(window, "confirm_switch", side_effect=AssertionError("The tab menu switched tabs")):
+            QTimer.singleShot(80, lambda: picked.append(QApplication.activePopupWidget() is not None))
+            QTimer.singleShot(160, lambda: QTest.keyClick(QApplication.activePopupWidget(), Qt.Key.Key_Escape))
+            window.tab_menu(point)
+        assert picked == [True], "The tab menu did not open"
+        assert window.pane is a
+        count = window.tabs.count()
+        with patch.object(window, "confirm_switch", return_value=True):
+            window.duplicate(False, window.tabs.indexOf(b))
+        assert window.tabs.count() == count + 1 and window.pane.document is b.document
+
+        # A window that is closed while a document is still loading says so instead of ignoring the click.
+        shown = []
+        window.opening.add(b.document)
+        with patch.object(window, "show_message", shown.append):
+            window.close()
+        assert shown == ["A document is still loading."] and window in control.windows
+        window.opening.clear()
+
+        # A PDF sent to a minimized window restores it.
+        window.showMinimized()
+        QApplication.processEvents()
+        assert window.isMinimized(), "The test platform cannot minimize windows"
+        control.receive_paths([str(second)])
+        QApplication.processEvents()
+        assert not window.isMinimized() and not (window.windowState() & Qt.WindowState.WindowMinimized)
+        # A maximized window that was minimized comes back maximized, not as a normal window.
+        window.showMaximized()
+        QApplication.processEvents()
+        assert window.isMaximized()
+        window.showMinimized()
+        QApplication.processEvents()
+        window.present()
+        QApplication.processEvents()
+        assert not window.isMinimized() and window.isMaximized(), window.windowState()
+    finally:
+        control.shutdown()
+
+
+def check_data_protection(app, root):
+    """Unsaved translations, drafts on close, copies, and the settings profile are never lost silently."""
+    path = root / "protect.pdf"
+    make_pdf(path)
+    control = Application(app, root)
+    control.preferences.data.update(language="en", autoSave=False)
+    try:
+        window = control.new_window()
+        window.open_paths([str(path)])
+        wait(lambda: window.pane and window.pane.document.annotations.get(0), "Sample did not load")
+        a = window.pane
+        doc = a.document
+        key = next(iter(doc.annotations[0]))
+
+        # A translation dialog with unsaved text asks before every way of discarding it.
+        a.view.select_all()
+        area = window.screen().availableGeometry()
+        a.translate_selection(area.bottomRight())
+        wait(lambda: a.annotation_dialog is not None, "Translation did not open")
+        dialog = a.annotation_dialog
+        assert dialog.confirm_close() and not dialog.unsaved()
+        dialog.output.setPlainText("An edited translation")
+        assert dialog.unsaved()
+        QTimer.singleShot(60, lambda: choose("Keep editing"))
+        dialog.reject()
+        assert a.annotation_dialog is dialog and dialog.isVisible()
+        # The real Esc key and the title-bar close button take the same guarded path.
+        QTimer.singleShot(60, lambda: choose("Keep editing"))
+        QTest.keyClick(dialog, Qt.Key.Key_Escape)
+        assert a.annotation_dialog is dialog and dialog.isVisible()
+        QTimer.singleShot(60, lambda: choose("Keep editing"))
+        dialog.close()
+        assert a.annotation_dialog is dialog and dialog.isVisible()
+        QTimer.singleShot(60, lambda: choose("Keep editing"))
+        assert not window.close_tabs([0]) and window.tabs.count() == 1 and a.annotation_dialog is dialog
+        QTimer.singleShot(60, lambda: choose("Keep editing"))
+        a.open_translation(source="Another", comment="")
+        assert a.annotation_dialog is dialog
+        # A running translation counts as unsaved and locks the text box until it ends.
+        dialog.output.setPlainText(dialog.baseline)
+        assert not dialog.unsaved()
+        job = Job(None, None)
+        dialog.job = job
+        job.changed.connect(dialog.update_job)
+        job.set_state("running", "partial")
+        assert dialog.unsaved() and dialog.output.isReadOnly()
+        job.set_state("canceled")
+        assert not dialog.output.isReadOnly()
+        dialog.output.setPlainText("Typed again")
+        QTimer.singleShot(60, lambda: choose("Discard"))
+        dialog.reject()
+        wait(lambda: a.annotation_dialog is None, "Discarding did not close the translation window")
+
+        # A tab that leaves its document open elsewhere saves every draft, not only the selected card's.
+        window.duplicate(False)
+        clone = window.pane
+        assert clone is not a and clone.document is doc
+        clone.notes.drafts[key] = "Parked draft"
+        assert window.close_tabs([window.tabs.indexOf(clone)])
+        wait(lambda: doc.get_note(key)["comment"] == "Parked draft", "The parked draft was lost on close")
+
+        # Save as writes a copy and says so; the open document and its marker do not change.
+        shown = []
+        copy = root / "copy.pdf"
+        with patch.object(window, "show_message", shown.append):
+            wait(lambda: not doc.busy, "The document stayed busy")
+            assert window.save_document(doc, str(copy))
+            assert copy.exists() and len(shown) == 1 and doc.path.resolve() == path.resolve()
+            assert window.save_document(doc, str(path)) and len(shown) == 1, "Saving over the original is not a copy"
+
+        # Editing another profile never changes the profile used for translation.
+        settings = SettingsDialog(window)
+        original = control.preferences.data["activeProfile"]
+        assert settings.active_profile == original and "(in use)" in settings.profiles.currentText()
+        settings.add_profile(False)
+        new_key = settings.profile_key
+        assert new_key != original and settings.use_profile.isEnabled() and not settings.use_profile.isChecked()
+        settings.commit()
+        assert control.preferences.data["activeProfile"] == original
+        settings = SettingsDialog(window)
+        settings.select_profile(new_key)
+        settings.use_profile.setChecked(True)
+        assert not settings.use_profile.isEnabled() and "(in use)" in settings.profiles.currentText()
+        QTimer.singleShot(60, lambda: choose("Delete"))
+        settings.remove_profile()
+        assert settings.active_profile == next(iter(settings.data["profiles"])) != new_key
+        # Validation selects the failing profile, names it, and blocks empty languages.
+        good_url = control.preferences.data["profiles"][original]["endpoint"]
+        settings.add_profile(True)
+        broken = settings.profile_key
+        settings.fields["endpoint"].setText("not a url")
+        settings.select_profile(settings.active_profile)
+        assert settings.profile_key != broken
+        with patch("paper_reader.dialogs.warn") as warning:
+            settings.commit()
+            assert warning.call_count == 1 and settings.profile_key == broken
+            assert settings.data["profiles"][broken]["name"] in warning.call_args.args[2]
+            assert "Invalid translation service URL." in warning.call_args.args[2]
+            control.preferences.data["language"] = "ja"
+            settings.commit()
+            assert "URL が正しくありません" in warning.call_args.args[2], warning.call_args.args[2]
+            assert "Invalid" not in warning.call_args.args[2]
+            control.preferences.data["language"] = "en"
+            settings.fields["endpoint"].setText(good_url)
+            settings.languages["langTo"].setText("  ")
+            settings.commit()
+            assert warning.call_count == 3 and settings.tabs.currentIndex() == 0
+        settings.close()
+    finally:
+        control.shutdown()
+
+
 if __name__ == "__main__":
     freeze_support()
     check_stream()
@@ -202,4 +388,8 @@ if __name__ == "__main__":
     app = QApplication([])
     with TemporaryDirectory() as work:
         check_window(app, Path(work).resolve())
+    with TemporaryDirectory() as work:
+        check_data_protection(app, Path(work).resolve())
+    with TemporaryDirectory() as work:
+        check_tabs(app, Path(work).resolve())
     print("PASS stream order, geometry, translated sources, toolbar and guarded saving")

@@ -10,6 +10,7 @@ from math import ceil
 from PySide6.QtCore import QEvent, QPointF, QRectF, QTextBoundaryFinder, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF, QTransform
 from PySide6.QtWidgets import QAbstractScrollArea, QApplication
+from shiboken6 import isValid
 
 from .selection import join_selections, nearest, select
 
@@ -359,6 +360,8 @@ class PaperView(QAbstractScrollArea):
             generation, index = self.generation, self.page
 
             def ready(box, error):
+                if not isValid(self):
+                    return
                 if not error and generation == self.generation and self.zoom_mode == mode and index == self.page:
                     current = self.location()
                     self.content_box = box
@@ -468,13 +471,16 @@ class PaperView(QAbstractScrollArea):
             return (generation, scale, rotation) == (self.generation, self.zoom, self.rotation) and page in self.positions
 
         def needed():
-            if not current() or not self.isVisible():
+            # The view may have been deleted while this request was queued (its tab was closed).
+            if not isValid(self) or not current() or not self.isVisible():
                 return False
             tile = QRectF(tx, ty, TILE, TILE).translated(self._page_rectangle(page).topLeft())
             visible = tile.intersects(QRectF(self.viewport().rect()))
             return visible or (prefetch and tile.intersects(self._prefetch_area()))
 
         def received(result, error):
+            if not isValid(self):
+                return
             self.pending.discard(key)
             if result and generation == self.generation:
                 value = tile_image(result)
@@ -731,12 +737,14 @@ class PaperView(QAbstractScrollArea):
         generation = self.generation
 
         def received(lines, error):
-            if generation != self.generation or self.text_pending.get(index) is not callbacks:
+            if not isValid(self) or generation != self.generation or self.text_pending.get(index) is not callbacks:
                 return
             self.text_pending.pop(index)
             if lines is not None:
                 self.text_cache[index] = lines
-                if len(self.text_cache) > 12:
+                # Keep every visible page: a selection over more than 12 pages would otherwise evict
+                # pages it still needs, and the highlight would flicker as they are read again.
+                while len(self.text_cache) > min(64, max(12, len(self._visible_pages()) + 4)):
                     self.text_cache.popitem(last=False)
                 self._select_endpoints()
                 self.viewport().update()
@@ -746,7 +754,7 @@ class PaperView(QAbstractScrollArea):
                 ready(lines)
 
         self.session.request("text", (index,), received, priority=5 if interactive or callback else 7, key=key,
-                             needed=lambda: generation == self.generation and (
+                             needed=lambda: isValid(self) and generation == self.generation and (
                                  index in self._visible_pages() or bool(callbacks) or
                                  index in tuple(p[0] for p in (self.anchor, self.pointer) if p)))
 
@@ -777,7 +785,7 @@ class PaperView(QAbstractScrollArea):
         collected = [[], []]
 
         def advance():
-            if revision != self.selection_revision or generation != self.generation:
+            if not isValid(self) or revision != self.selection_revision or generation != self.generation:
                 return
             index = next(pending, None)
             if index is None:
@@ -785,7 +793,7 @@ class PaperView(QAbstractScrollArea):
                 return
 
             def received(result, error):
-                if revision != self.selection_revision or generation != self.generation:
+                if not isValid(self) or revision != self.selection_revision or generation != self.generation:
                     return
                 if error:
                     self.message.emit(error)
@@ -797,7 +805,8 @@ class PaperView(QAbstractScrollArea):
                 advance()
 
             self.session.request("selection_page", (index, *bounds_, origin), received, priority=6,
-                                 needed=lambda: revision == self.selection_revision and generation == self.generation)
+                                 needed=lambda: (isValid(self) and revision == self.selection_revision
+                                                 and generation == self.generation))
 
         advance()
 
