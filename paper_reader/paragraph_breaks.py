@@ -19,7 +19,7 @@ SENTENCE_END = re.compile(r"[.!?。！？…][\"”’'»)\]）」』]*$")
 # A section number or a letter (1. 2.3 A. IV.) and then a word that starts with a capital: "2.3 Methods", but not
 # "2.3 MPa", "2.3 Å resolution", "0.91. When ..." or a year ("2009. Kerinci had ...").
 HEADING_NUMBER = re.compile(
-    r"^(?:(?!0\.\d)\d{1,2}(?:\.\d{1,2})*\.?|[IVXLC]+\.|[A-Z]\.|[0-9０-９]{1,2}[.．])\s+"
+    r"^(?:(?!0\.\d)\d{1,2}(?:\.\d{1,2})*\.?|[IVXLC]+\.|[A-Z]\.|[0-9０-９]{1,2}[.\uff0e])\s+"
     r"(?:[A-ZÀ-ÖØ-Ý][a-zà-öø-ÿ]|[A-ZÀ-ÖØ-Ý]{2,}\b|[AI]\s|[A-Z]\.|[぀-鿿])")
 HEADING_WORD = re.compile(
     r"^(?:第\s*[0-9０-９一二三四五六七八九十]+\s*[章節項]|"
