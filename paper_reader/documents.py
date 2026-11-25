@@ -12,6 +12,10 @@ from .session import PdfSession
 from .translation import Translations
 from .view import TileCache
 
+# One reference or figure scan request reads pages for about this long, so the scan is not slowed by a
+# worker round trip per page. Requests that arrive meanwhile wait at most this long.
+SCAN_BUDGET_MS = 40
+
 
 def signature(path):
     try:
@@ -240,6 +244,23 @@ class Document(QObject):
             if kind in self.references_ready:
                 targets(citation)
                 return
+            if kind == "figure":
+                # The caption is usually near the mention, so try the neighbouring pages before the full scan.
+                self.request("figure_nearby", (position, citation.keys),
+                             lambda result, error: nearby(citation, result, error), priority=2, needed=needed)
+                return
+            scan(citation)
+
+        def nearby(citation, result, error):
+            if not needed():
+                return
+            if result and all(result):
+                callback(citation, result, None)
+            else:
+                scan(citation)
+
+        def scan(citation):
+            kind = citation.kind
             waiters = self.reference_waiters.setdefault(kind, [])
             waiters[:] = [waiter for waiter in waiters if waiter[2]()]
             waiters.append((citation, targets, needed, callback))
@@ -261,7 +282,7 @@ class Document(QObject):
             if not active():
                 completed(None, None)
                 return
-            self.request(f"{kind}_step", (), completed, priority=8, needed=active)
+            self.request(f"{kind}_step", (SCAN_BUDGET_MS,), completed, priority=8, needed=active)
 
         def completed(done, error):
             if self.reference_scans.get(kind) is not scan:

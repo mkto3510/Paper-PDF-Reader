@@ -7,13 +7,14 @@ from dataclasses import replace
 from difflib import SequenceMatcher
 import re
 from statistics import median
+import unicodedata
 
 from .captions import classify_captions
 from .selection import bounds, edge_band, furniture_key
 
 
 RULES = ("furniture", "caption", "small", "figure", "table", "footnote",
-         "margin", "equation", "code", "ruby", "line_number", "artifact")
+         "margin", "equation", "code", "ruby", "line_number", "artifact", "front")
 DEFAULT_RULES = {rule: True for rule in RULES} | {"edge_band": 12, "small_text": 6}
 LABELS = {
     "body": ("本文", "Body text"),
@@ -25,6 +26,7 @@ LABELS = {
     "equation": ("別行立ての数式", "Displayed equations"),
     "code": ("コード・アルゴリズム", "Code and algorithms"), "ruby": ("ルビ", "Ruby"),
     "line_number": ("査読用行番号", "Line numbers"), "artifact": ("装飾タグ", "PDF artifacts"),
+    "front": ("著者・所属・受理日・著作権", "Authors, affiliations, dates and copyright"),
 }
 NUMBER = re.compile(r"[-–—―\s]*([0-9０-９]+)[-–—―\s]*$")
 MATH = re.compile(r"[=∑∫√≤≥±∂∇]|(?<=\s)\(\d+[a-z]?\)\s*$")
@@ -33,6 +35,24 @@ CJK_WORD = re.compile(r"[぀-ヿ㐀-鿿]")
 EQUATION_NUMBER = re.compile(r"[(（]\d+(?:[.\-]\d+)*[a-z]?[)）][,.]?")
 CODE = re.compile(r"^\s*(?:\d+[:.)]\s*)?(?:if|else|for|while|return|end|function|def|procedure)\b|[{};]|←|:=")
 MARGINAL = re.compile(r"^(?:section|exercise|example|remark|note|節|演習|例)\s*[\d.]+", re.I)
+
+
+# Words that can stand in a formula: a line of symbols with only these is a piece of an equation.
+MATH_FUNCTIONS = {"log", "exp", "sin", "cos", "tan", "cot", "sec", "csc", "ln", "det", "max", "min", "lim", "mod",
+                  "erf", "arctan", "arcsin", "arccos", "sinh", "cosh", "tanh", "sup", "inf", "div", "tr", "diag"}
+LABEL_WORD = re.compile(r"[A-Za-z]{2,}|[぀-ヿ㐀-鿿]")
+REAL_WORD = re.compile(r"[A-Za-z]{3,}|[぀-ヿ㐀-鿿]{2,}")
+
+
+def symbols_only(text):
+    """Tell whether a line is a piece of an equation: control or private-use characters (the glyphs of a math font)
+    and no real word. A line of prose with a symbol in it has words and is left alone."""
+    odd = sum(1 for char in text if not char.isspace() and unicodedata.category(char) in ("Cc", "Co"))
+    if odd < 2:
+        return False
+    words = [word for word in REAL_WORD.findall(text) if word.casefold() not in MATH_FUNCTIONS]
+    # One short Latin word is a variable name (bjk, djm); a word of any other script, or a longer one, is text.
+    return not words or (len(words) == 1 and words[0].isascii() and len(words[0]) <= 3 and odd >= len(text) * .15)
 
 
 def overlap(a, b):
@@ -121,7 +141,128 @@ def _similar_edge(line, side, key, neighbours, height):
     return False
 
 
-def classify(lines, width, height, neighbours, evidence, options, regions=()):
+def _mark_figure_text(lines, result, width, body_ids):
+    """Mark the numbers inside a figure that has no image or drawing to show where it is (a scan, an old print).
+
+    Near a caption, five or more short lines of numbers and symbols that follow each other and do not share a left
+    edge are the tick labels of a figure. A line with a word is never marked: a review of every line that a first
+    version marked by shape alone found that 80% of the lines with words were article text (running text in narrow
+    columns, captions, Japanese text), while the lines of numbers were figure labels or table and equation pieces."""
+    captions = [line for line in lines if result[id(line)].kind == "caption"]
+    if not captions:
+        return
+    short = sorted((line for line in lines
+                    if not result[id(line)].kind and line.horizontal and id(line) not in body_ids
+                    and line.box[2] - line.box[0] < width * .30 and 0 < len(line.text.strip()) <= 28
+                    and not LABEL_WORD.search(line.text)),
+                   key=lambda line: line.box[1])
+    for caption in captions:
+        top = caption.box[1]
+        cluster = []
+        for line in [*(line for line in short if top - 300 <= line.box[1] <= top + 15), None]:
+            if line is not None and (not cluster or line.box[1] - cluster[-1].box[3] <= 30):
+                cluster.append(line)
+                continue
+            edges = {round(item.box[0] / 8) for item in cluster}
+            if len(cluster) >= 5 and len(edges) >= 3:
+                for item in cluster:
+                    if not result[id(item)].kind:
+                        result[id(item)] = replace(item, kind="figure")
+            cluster = [line] if line is not None else []
+
+
+# Where the text of an article begins, on its first page: what comes above is the title block.
+BODY_START = re.compile(r"^(?:abstract|article\s*info|summary|key\s*words?|index\s+terms|introduction|1\.?\s+introduction|"
+                        r"要\s*旨|概\s*要|要\s*約|あらまし|アブストラクト|キーワード|はじめに|1\.?\s*はじめに)\b", re.I)
+DATE_LINE = re.compile(r"^(?:manuscript\s+)?(?:received|accepted|revised|published|available\s+online|submitted|"
+                       r"受付|受理|原稿受付|原稿受理|投稿|改訂)\b|^©|^copyright\b|^\(?c\)\s*\d{4}", re.I)
+AFFILIATION = re.compile(r"\b(?:universit(?:y|ät|é|à)|universidad|institut(?:e|ion|o)?|department|dept\.|laborator(?:y|ies)|"
+                         r"faculty|school\s+of|college|centre|center|observatory|academy|hospital|ministry|agency|"
+                         r"division)\b|大学|研究所|研究科|学部|学科|センター|機構|研究院|気象庁|研究部|事業所|観測所|教室", re.I)
+CONTACT = re.compile(r"@|\b(?:corresponding\s+author|correspondence|e-?mail)\b|連絡先|責任著者", re.I)
+LATIN_NAME = re.compile(r"(?:[A-Z][\w'’.-]*\.?)(?:\s+(?:[A-Z][\w'’.-]*\.?|van|von|de|der|la|le|di|da|dos)){1,3}")
+JAPANESE_NAME = re.compile(r"[㐀-鿿々ァ-ヶー]{2,5}")
+
+
+def _unspaced(text):
+    """A heading set with spaces between its letters ("A B S T R A C T") without them."""
+    text = text.strip()
+    return text.replace(" ", "") if re.fullmatch(r"(?:\S ){2,}\S", text) else text
+
+
+def _author_line(text):
+    """Tell whether a line is a list of author names: several names split by commas, "and" or a middle dot,
+    each possibly followed by a note mark (a digit, an asterisk, a dagger)."""
+    if re.search(r"[()（）［］\[\]「」『』]", text):
+        return False  # a name list has no brackets; a wrapped line of a sentence often has one
+    plain = re.sub(r"[\d*†‡§¶²³¹⁰-⁹＊]+", "", text)
+    plain = re.sub(r"\s[a-z](?!\w)", "", plain)  # a letter that marks an affiliation: "Petaev b"
+    parts = [part.strip() for part in re.split(r",|;|\band\b|&|・|、|，", plain) if part.strip()]
+    if len(parts) < 2 or len(text) > 200:
+        return False
+    names = sum(bool(LATIN_NAME.fullmatch(part) or (JAPANESE_NAME.fullmatch(part) and len(parts) >= 3))
+                for part in parts)
+    return names >= len(parts) * .8
+
+
+def _mark_front_matter(lines, result, size, body_ids):
+    """Mark the author line, the affiliations, the contact line and the dates of a first page.
+
+    Only lines above the first line that opens the text (an abstract, keywords, an introduction) are looked at, and
+    when no such line is found nothing is marked: the title and the abstract are text to read, not front matter."""
+    starts = [line for line in lines if line.horizontal and BODY_START.match(_unspaced(line.text))]
+    if not starts:
+        return
+    limit = min(line.box[1] for line in starts)
+    for line in lines:
+        text = line.text.strip()
+        if (result[id(line)].kind or not line.horizontal or line.box[3] > limit + 1 or id(line) in body_ids
+                or (line.size > size * 1.15 and not (line.size < size * 1.5 and _author_line(text)))
+                or not text or len(text) > 220):
+            continue
+        if (text[0].islower() and not re.match(r"[a-z]\s+[A-Z]", text)) or line.text[:1] in ("　", "	"):
+            continue  # a line that goes on from the one above, or opens an indented paragraph: running text
+        sentence = len(text.split()) >= 12 and text.endswith(".")
+        if (DATE_LINE.match(text) or CONTACT.search(text) or (AFFILIATION.search(text) and not sentence)
+                or _author_line(text)):
+            result[id(line)] = replace(line, kind="front")
+
+
+# The notes at the foot of a first page: the dates, the authors and their affiliations, the corresponding author,
+# the contact address and the copyright line. A line of the running text that happens to start with "Accepted" is not
+# one, so a date line needs a month or a year.
+NOTE_DATE = re.compile(r"^(?:manuscript\s+)?(?:received|accepted|revised|published|available\s+online|submitted)\b.{0,70}?"
+                       r"(?:\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b|\b(?:19|20)\d\d\b)", re.I)
+NOTE_LEAD = re.compile(r"^(?:the\s+authors?\s+(?:is|are|was|were)\s+with|\*+\s*corresponding\s+authors?|"
+                       r"corresponding\s+authors?\b|\*?\s*e-?mail\s*:|digital\s+object\s+identifier|copyright\b|\(c\)\s*\d{4}|©)",
+                       re.I)
+
+
+def _mark_front_notes(lines, result, width, height, size):
+    """Mark the notes at the foot of a first page, and the lines that go on from them below."""
+    below = sorted((line for line in lines if line.horizontal and line.box[1] > height * .5), key=lambda l: l.box[1])
+    chain = None  # the first line of the note being followed, the bottom and the right edge of what has been seen
+    for line in below:
+        text = line.text.strip()
+        opens = bool(text) and (text[0].isupper() or text[0] in "*©(") and (NOTE_DATE.match(text) or NOTE_LEAD.match(text))
+        if opens and line.size <= size * 1.05:
+            chain = line, line.box[3], line.box[2]
+        elif chain is not None:
+            start, bottom, right = chain
+            same_column = start.box[0] - size * 2 <= line.box[0] < right
+            if not same_column:
+                continue  # a line of the other column at the same height
+            if line.box[1] > bottom + size * .8 or abs(line.size - start.size) > start.size * .1 or not text:
+                chain = None
+                continue
+            chain = start, max(bottom, line.box[3]), max(right, line.box[2])
+        else:
+            continue
+        if result[id(line)].kind in ("", "small"):  # small print at the foot of a first page is such a note too
+            result[id(line)] = replace(line, kind="front")
+
+
+def classify(lines, width, height, neighbours, evidence, options, regions=(), first_page=False):
     if not lines:
         return ()
     edge_fraction = options["edge_band"] / 100
@@ -287,7 +428,25 @@ def classify(lines, width, height, neighbours, evidence, options, regions=()):
                 for above in reversed(body_lines))
             if not continuation and (line.horizontal == vertical_body or id(line) not in prose):
                 kind = "small"
+        if not kind and line.horizontal and id(line) not in body_ids and symbols_only(text):
+            kind, equation = "equation", line
         result[id(line)] = replace(line, kind=kind)
         if not kind:
             body_lines.append(line)
+    # A formula is often cut into single symbols ("W", "T", "5") that carry no symbol glyph pair by themselves.
+    # A short line without a word, next to a line that is a piece of an equation, belongs to that equation.
+    pieces = [line for line in lines if result[id(line)].kind == "equation" and symbols_only(line.text.strip())]
+    for line in lines:
+        text = line.text.strip()
+        if (result[id(line)].kind or not line.horizontal or len(text) > 4 or REAL_WORD.search(text)
+                or id(line) in body_ids):
+            continue
+        reach = line.size * 1.5
+        if any(abs(line.box[1] - piece.box[1]) <= reach and line.box[0] <= piece.box[2] + reach
+               and piece.box[0] <= line.box[2] + reach for piece in pieces):
+            result[id(line)] = replace(line, kind="equation")
+    _mark_figure_text(lines, result, width, body_ids)
+    if first_page:
+        _mark_front_matter(lines, result, size, body_ids)
+        _mark_front_notes(lines, result, width, height, size)
     return tuple(result[id(line)] for line in lines)

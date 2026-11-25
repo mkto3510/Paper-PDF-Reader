@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 from statistics import median
 import unicodedata
+
+from .paragraph_breaks import bold_tells, is_fragment, on_same_line, page_gap, starts_paragraph as new_paragraph
 
 
 Point = tuple[float, float]
@@ -19,6 +21,7 @@ class Glyph:
     box: Box
     quad: Quad
     artifact: bool = False
+    raised: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,10 +167,14 @@ def reading_regions(lines, width):
     side = [line for line in lines if id(line) not in spanning_ids]
     regions = []
 
+    # Entry numbers sit left of their text, so they may start inside the gutter. Anything that starts after the
+    # left column has ended belongs to the right column.
+    left_edge = max((line.box[2] for line in horizontal if line.box[2] < center - gutter / 2), default=center)
+
     def emit_columns(group):
         left, right = [], []
         for line in group:
-            (right if line.box[0] > center else left).append(line)
+            (right if line.box[0] > min(center, left_edge) else left).append(line)
         regions.extend(_horizontal_order(column) for column in (left, right) if column)
 
     # Consecutive full-width lines (e.g. an abstract) form one region.
@@ -178,11 +185,14 @@ def reading_regions(lines, width):
         bands[-1].append(line)
     for band in bands:
         top, bottom = min(l.box[1] for l in band), max(l.box[3] for l in band)
-        emit_columns(line for line in side if line.box[1] < top)
-        within = [line for line in side if top <= line.box[1] < bottom and line.horizontal]
+        # A label ("Figure 2.") printed in its own text object on the first row of the band can sit a little higher
+        # than the text beside it; it still belongs to that row.
+        first_row = top - typical * .35
+        emit_columns(line for line in side if line.box[1] < first_row)
+        within = [line for line in side if first_row <= line.box[1] < bottom and line.horizontal]
         regions.append(_horizontal_order([*band, *within]))
         claimed = {id(line) for line in within}
-        side = [line for line in side if line.box[1] >= top and id(line) not in claimed]
+        side = [line for line in side if line.box[1] >= first_row and id(line) not in claimed]
     emit_columns(side)
     return regions
 
@@ -309,6 +319,17 @@ def join_selections(parts: list[Selection]) -> Selection:
                      exclusions=tuple(item for part in parts for item in part.exclusions))
 
 
+def next_printed_line(lines, index):
+    """The body line on the printed line below `lines[index]` (the pieces that sit on the same printed line are
+    skipped), or None."""
+    following = index + 1
+    while following < len(lines) and not lines[following].kind and on_same_line(lines[following - 1], lines[following]):
+        following += 1
+    if following < len(lines) and not lines[following].kind:
+        return lines[following]
+    return None
+
+
 def select(pages: dict[int, tuple[Line, ...]], first: tuple[int, int, int],
            last: tuple[int, int, int], include_skipped: bool = False, *, origin="legacy", rules=None) -> Selection:
     start, end = sorted((first, last))
@@ -321,6 +342,14 @@ def select(pages: dict[int, tuple[Line, ...]], first: tuple[int, int, int],
     starts_paragraph = False
     hyphenated: set[str] = set()
     last_run = None
+    gaps: dict[int, tuple[float, bool]] = {}
+
+    def usual(page):
+        """The usual space between two lines of a paragraph on the page, measured on all of its body lines, and
+        whether a bold lead means anything on the page."""
+        if page not in gaps:
+            gaps[page] = page_gap(pages[page]), bold_tells(pages[page])
+        return gaps[page]
 
     def exclude(page, kind, glyphs):
         nonlocal last_run
@@ -359,7 +388,17 @@ def select(pages: dict[int, tuple[Line, ...]], first: tuple[int, int, int],
                 if omit:
                     exclude(page, kind or "body", selected)
                     continue
-            if previous is not None and page == previous[0] and line.paragraph != previous[1]:
+            fragment = False
+            if previous is not None and not kind and not previous[3].kind:
+                # Body lines: a heading, an indent after a finished sentence, a numbered item or a clear gap (judged
+                # against the usual line gap of the page) starts a new paragraph. See paragraph_breaks.
+                gap, bold = usual(page)
+                if is_fragment(previous[3], line, page == previous[0]):
+                    fragment = True  # a subscript or superscript: part of the line it sits on
+                elif new_paragraph(previous[3], line, previous[4], line.text.strip(), gap, page == previous[0], bold,
+                                   next_printed_line(lines, index)):
+                    text.append("")
+            elif previous is not None and page == previous[0] and line.paragraph != previous[1]:
                 # A PDF often starts new blocks at columns. Keep the separator
                 # for an indented paragraph or a clear gap within one column.
                 moved_right = 3 < line.box[0] - previous[2][0] < line.size * 3
@@ -386,8 +425,16 @@ def select(pages: dict[int, tuple[Line, ...]], first: tuple[int, int, int],
                     overlap = min(line.box[2], following.box[2]) - max(line.box[0], following.box[0])
                     starts_paragraph = (line.horizontal and following.horizontal and overlap > line.size * 3
                                         and 0 < gap < line.size * 2.2 and 3 < indent < line.size * 3)
-                previous = page, line.paragraph, line.box
-                text.append("".join(glyph.text for omitted, run in runs if not omitted for glyph in run))
+                shown = "".join(glyph.text for omitted, run in runs if not omitted for glyph in run)
+                if not fragment:
+                    # The next text object on a printed line is judged by the left edge of the whole line.
+                    whole = line
+                    if previous is not None and not kind and not previous[3].kind                             and on_same_line(previous[3], line, page == previous[0]):
+                        x0, y0, x1, y1 = previous[3].box
+                        whole = replace(line, box=(min(x0, line.box[0]), min(y0, line.box[1]),
+                                                   max(x1, line.box[2]), max(y1, line.box[3])))
+                    previous = page, line.paragraph, line.box, whole, shown.strip()
+                text.append(shown)
             for omitted, run in runs:
                 if omitted:
                     exclude(page, "artifact", run)

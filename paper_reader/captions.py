@@ -10,11 +10,19 @@ from .selection import Box, bounds
 
 NUMBER = (r"(?:(?:[sS]|[a-zA-Z]\.)?\d{1,5}(?:[.-]\d{1,5})*"
           r"(?:\([a-zA-Z]\)|[a-zA-Z](?![a-zA-Z]))?|[IVXLCDM]{1,8}(?![a-zA-Z]))")
+ARABIC = r"\d{1,5}(?:[.-]\d{1,5})*(?:\([a-zA-Z]\)|[a-zA-Z](?![a-zA-Z]))?"
 LABEL = re.compile(
-    rf"(?:(?<!\w)(?P<english>fig(?:ure)?s?\.?|tables?)\s*(?P<eng_number>{NUMBER})"
+    rf"(?:(?<!\w)(?P<prefix>(?:extended\s+data|supplementa(?:ry|l))\s+)?(?P<english>fig(?:ure)?s?\.?|tables?)"
+    rf"\s*(?P<eng_number>{NUMBER})"
     rf"|第?\s*(?P<japanese>[図表])\s*(?:[-−]\s*)?(?P<jp_number>{NUMBER})"
-    rf"|第\s*(?P<ordinal>{NUMBER})\s*(?P<ordinal_kind>[図表]))", re.I,
+    rf"|第\s*(?P<ordinal>{NUMBER})\s*(?P<ordinal_kind>[図表])"
+    # Other names of figures and tables. They take Arabic numbers only: "plate d" or "scheme i" are not labels.
+    rf"|(?<!\w)(?P<word>plates?|schemes?|photos?|photographs?|abb(?:ildung(?:en)?)?\.?|tabellen?)"
+    rf"\s*(?P<word_number>{ARABIC})"
+    rf"|(?P<jword>写真|図版)\s*(?:[-−]\s*)?(?P<jword_number>{ARABIC}))", re.I,
 )
+# Names that print their own series of numbers: Plate 1 is not Figure 1.
+WORD_TAGS = {"plate": "pl", "scheme": "sc", "photo": "ph", "photograph": "ph", "写真": "ph", "図版": "pl"}
 FOLLOWING_NUMBER = re.compile(rf"\s*(?P<sep>,|、|・|–|—|〜|～|~|\s-\s|\band\b|と|および)\s*(?P<number>{NUMBER})", re.I)
 CAPTION_END = re.compile(r"^\s*[.:：|]\s*(?=\S)")
 BODY_LEAD = re.compile(
@@ -44,10 +52,44 @@ def label_key(text):
     return normalize("NFKC", text).casefold().replace("(", "").replace(")", "")
 
 
-def figure_label(match):
+def _word(match):
+    """The name of a label that is not Figure or Table: plate, scheme, photo, Abbildung, Tabelle, 写真."""
+    word = (match["word"] or match["jword"] or "").casefold().rstrip(".")
+    if word.startswith("photograph"):
+        return "photo"
+    return "abbildung" if word.startswith("abb") else word.rstrip("n") if word.startswith("tabelle") else word.rstrip("s")
+
+
+def _running_word(match):
+    """A name printed in lower case (plate, scheme, photo) is a common noun; labels are capitalized."""
+    return bool(match["word"]) and match["word"][0].islower()
+
+
+def _raw_label(match):
+    if match["word"] or match["jword"]:
+        word = _word(match)
+        return ("table" if word.startswith("tabelle") else "figure",
+                label_key(match["word_number"] or match["jword_number"]))
     kind = (match["english"] or match["japanese"] or match["ordinal_kind"]).casefold()
     return ("figure" if kind.startswith("fig") or kind == "図" else "table",
             label_key(match["eng_number"] or match["jp_number"] or match["ordinal"]))
+
+
+def _tagged(match, number):
+    """Keep "Extended Data Fig. 3", "Supplementary Fig. 3" and "Plate 3" apart from the figure 3 of the article."""
+    prefix = match["prefix"] if "prefix" in match.re.groupindex else None
+    if match["word"] or match["jword"]:
+        tag = WORD_TAGS.get(_word(match), "")
+    elif prefix:
+        tag = "ed" if prefix.casefold().startswith("extended") else "s"
+    else:
+        return number
+    return number if not tag or number.startswith(tag) else tag + number
+
+
+def figure_label(match):
+    kind, label = _raw_label(match)
+    return kind, (_tagged(match, label) if match.re is LABEL else label)
 
 
 def _label_interval(first, last):
@@ -60,17 +102,19 @@ def _label_interval(first, last):
 
 def figure_mentions(text):
     for match in LABEL.finditer(text):
+        if _running_word(match):
+            continue
         start, end = match.span()
-        kind, label = figure_label(match)
+        kind, label = _raw_label(match)
         if match["english"] and match["english"].casefold().rstrip(".").endswith("s") and re.fullmatch(r"\d+-\d+", label):
             labels = _label_interval(*label.split("-"))
         else:
             labels = [label]
-        keys = [(kind, value) for value in labels]
+        keys = [(kind, _tagged(match, value)) for value in labels]
         if not keys:
             continue
         while extra := FOLLOWING_NUMBER.match(text, end):
-            following = label_key(extra["number"])
+            following = _tagged(match, label_key(extra["number"]))
             if extra["sep"].strip() in ("–", "—", "〜", "～", "~", "-"):
                 previous = keys[-1][1]
                 numbers = _label_interval(previous, following)
@@ -91,10 +135,19 @@ def figure_mentions(text):
 
 def caption_heading(text):
     text = normalize("NFKC", text.strip())
-    return LABEL.match(text) or LEGACY_LABEL.match(text)
+    match = LABEL.match(text)
+    if match and _running_word(match):
+        match = None  # "tectonic plate 3 moves": the word is part of a sentence
+    return match or LEGACY_LABEL.match(text)
 
 
 def _nearby_object(line, regions, page_lines, kind):
+    # Prefer a close object. A figure printed with a wider margin above its caption is accepted when no close one exists.
+    return (_objects_within(line, regions, page_lines, kind, 3)
+            or _objects_within(line, regions, page_lines, kind, 4))
+
+
+def _objects_within(line, regions, page_lines, kind, reach):
     left, top, right, bottom = line.box
     candidates = []
     for box in regions:
@@ -102,15 +155,21 @@ def _nearby_object(line, regions, page_lines, kind):
         if shared < min(right - left, box[2] - box[0]) * .5:
             continue
         gap = max(top - box[3], box[1] - bottom)
-        if not -line.size * .3 <= gap <= line.size * 3:
+        if not -line.size * .3 <= gap <= line.size * reach:
             continue
         band_top, band_bottom = (box[3], top) if box[3] <= top else (bottom, box[1])
+        # Short rows between the figure and its caption are axis labels, not a paragraph that separates them.
         if any(band_top < other.box[1] < band_bottom
                and min(box[2], other.box[2]) - max(box[0], other.box[0]) > line.size * 4
+               and len(other.text.strip()) > 30
                for other in page_lines if other is not line):
             continue
         if box not in candidates:
             candidates.append(box)
+    # A panel inside a larger figure object is part of that object.
+    candidates = [box for box in candidates if not any(
+        other is not box and other[0] - 2 <= box[0] and other[1] - 2 <= box[1]
+        and box[2] <= other[2] + 2 and box[3] <= other[3] + 2 for other in candidates)]
     if len(candidates) == 1:
         return candidates[0]
     if len(candidates) > 1:
@@ -172,6 +231,49 @@ def _continues(above, below, *, split=False):
             and -size * .75 <= below.box[1] - above.box[3] <= size * .6)
 
 
+def _row_order(lines):
+    """Order lines top to bottom, then left to right, and keep a lone label ahead of its title.
+
+    Text objects on one row can differ by a fraction of a point in height, which would put a title ahead of
+    the label at its left. Only the right-hand neighbor of a label-only line is moved, so other lines keep
+    the order they would have had."""
+    ordered = sorted(lines, key=lambda line: (line.box[1], line.box[0]))
+    index = 0
+    while index < len(ordered):
+        line = ordered[index]
+        if _label_only(line):
+            for other in range(index):
+                neighbor = ordered[other]
+                if (abs(neighbor.box[1] - line.box[1]) < line.size * .4
+                        and 0 <= neighbor.box[0] - line.box[2] < line.size * 1.8):
+                    ordered.insert(index, ordered.pop(other))
+                    index += 1  # the label moved one place to the left
+                    break
+        index += 1
+    return ordered
+
+
+def _inline_mention(line, ordered, has_delimiter):
+    """Tell whether a label that stands alone is a cross-reference inside a sentence: text of the same row
+    touches it on the left, or the text on its right goes on like a sentence ("), then ...")."""
+    neighbors = [other for other in ordered if other is not line and abs(other.box[1] - line.box[1]) < line.size * .4]
+    # Within a sentence the neighbor is about a word space away. The gutter between columns is much wider.
+    if any(-line.size * .3 <= line.box[0] - other.box[2] < line.size * .6 for other in neighbors):
+        return True
+    right = next((other for other in neighbors if 0 <= other.box[0] - line.box[2] < line.size * 1.8), None)
+    if right is None:
+        return False
+    first = right.text.lstrip()[:1]
+    return first in (")", "]", ",", ";") or (first.islower() and not has_delimiter)
+
+
+def _label_only(line):
+    """Tell whether a line holds just a caption label such as "Figure 1." (the title follows in another object)."""
+    text = normalize("NFKC", line.text.strip())
+    heading = caption_heading(text)
+    return bool(heading) and not text[heading.end():].strip(" .:：|")
+
+
 def classify_captions(lines, regions, evidence, width, height):
     """Return confirmed caption groups, their lines, and protected body rows."""
     figures, rules, _, tables, _ = evidence
@@ -187,18 +289,22 @@ def classify_captions(lines, regions, evidence, width, height):
         sizes[round(line.size, 1)] += len(line.text)
     body_size = sizes.most_common(1)[0][0] if sizes else None
     for region in regions or (lines,):
-        ordered = sorted((line for line in region if line.horizontal),
-                         key=lambda line: (line.box[1], line.box[0]))
+        ordered = _row_order(line for line in region if line.horizontal)
         active = []
         split_tail = set()
         metadata = None
         for index, line in enumerate(ordered):
             text = normalize("NFKC", line.text.strip())
             heading = caption_heading(text)
-            adjacent_label = (len(active) == 1 and active[0].leading_bold
+            # A label may be a line of its own ("Figure 1.") with the title in the next text object of the same row,
+            # and the following rows may start at the label's left edge rather than at the title's.
+            adjacent_label = (len(active) == 1 and (active[0].leading_bold or _label_only(active[0]))
                               and abs(active[0].box[1] - line.box[1]) < line.size * .4
                               and 0 <= line.box[0] - active[0].box[2] < line.size * 1.8)
-            if active and not heading and (_continues(active[-1], line) or adjacent_label or id(line) in split_tail):
+            from_label = (len(active) == 2 and _label_only(active[0]) and _continues(
+                replace(active[1], box=(active[0].box[0], *active[1].box[1:])), line))
+            if active and not heading and (_continues(active[-1], line) or adjacent_label or from_label
+                                           or id(line) in split_tail):
                 active.append(line)
                 caption_ids.add(id(line))
                 continue
@@ -212,8 +318,15 @@ def classify_captions(lines, regions, evidence, width, height):
             previous = ordered[index - 1] if index else None
             tail = text[heading.end():]
             continued = bool(CONTINUED.match(tail))
+            # "(Fig. 2.7), then" wrapped to the start of a line: a closing mark right after the label.
             english_body = (heading.re is LABEL and heading["english"]
-                            and tail.lstrip()[:1].islower())
+                            and (tail.lstrip()[:1].islower() or tail.lstrip()[:1] in (")", "]")))
+            following_number = FOLLOWING_NUMBER.match(tail)
+            if heading.re is LABEL and ((following_number and re.search(r"\d", following_number["number"]))
+                                        or re.match(r"\s*(?:および|及び|と|や|、|・)", tail)):
+                english_body = True  # "図3.5および図3.6より": a list of mentions inside a sentence
+            if not english_body and _label_only(line):
+                english_body = _inline_mention(line, ordered, bool(tail.strip(" .:：|")) or bool(tail.strip()))
             # A real sentence can begin with a label, including within a paragraph.
             if not continued and (english_body or BODY_LEAD.match(tail.lstrip()) or (
                     previous is not None and not caption_heading(previous.text)
@@ -227,7 +340,21 @@ def classify_captions(lines, regions, evidence, width, height):
                     following = other
                 continue
             kind, label = figure_label(heading) if heading.re is LABEL else ("other", "")
-            object_box = _nearby_object(line, figures if kind == "figure" else tables, ordered, kind)
+            search = line
+            if _label_only(line):
+                # Measure the caption by its whole text, not by the few characters of its label: the title may
+                # follow on the same row or on the rows below.
+                last = line
+                for other in ordered[index + 1:index + 8]:
+                    same_row = (abs(other.box[1] - line.box[1]) < line.size * .4
+                                and 0 <= other.box[0] - search.box[2] < line.size * 1.8)
+                    next_row = (other.paragraph == line.paragraph and other.box[1] > last.box[1] + line.size * .5
+                                and other.box[1] - last.box[3] < line.size * .8)
+                    if not (same_row or next_row):
+                        break
+                    search = replace(search, box=bounds((search.box, other.box)))
+                    last = other if next_row else last
+            object_box = _nearby_object(search, figures if kind == "figure" else tables, ordered, kind)
             if kind == "table":
                 object_box = object_box or _ruled_table(line, rules, lines)
                 candidate_lines = [line]
@@ -247,8 +374,23 @@ def classify_captions(lines, regions, evidence, width, height):
             isolated = previous is None or line.box[1] - previous.box[3] > line.size * .6
             distinct = (body_size is not None and abs(line.size - body_size) > body_size * .075
                         and not any(abs(row.box[0] - line.box[0]) <= line.size * .6 for row in prose_rows))
-            styled_label = line.leading_bold and (isolated or not tail.strip())
-            if object_box is None and not (continued or distinct or styled_label or (isolated and CAPTION_END.match(tail))):
+            styled_label = line.leading_bold and (isolated or not tail.strip(" .:：|"))
+            # A line of its own that holds only "Figure 1", with a sentence starting right after it. Figure text
+            # may sit close above it, so the gap before is not asked for.
+            following = ordered[index + 1] if index + 1 < len(ordered) else None
+            # (A supplementary label alone on a line is usually an entry of the list of supplementary material.)
+            label_start = (_label_only(line) and not re.match(r"(?:s|ed)\d", label) and following is not None
+                           and following.box[1] - line.box[3] < line.size * 1.2
+                           and (following.text.strip()[:1].isupper() or following.text.strip()[:1] == "("))
+            # "FIG. 2" and "TABLE I" in capitals are headings; running text writes "Fig. 2" or "Figure 2".
+            capitals = (heading.re is LABEL and bool(heading["english"]) and heading["english"].rstrip(".").isupper()
+                        and len(heading["english"].rstrip(".")) > 2)
+            # Scanned pages carry no figure object: "Fig. 2. The effects..." that is set
+            # in bold or in smaller type than the prose (flush with the column, so "distinct" does not apply).
+            punctuated = (bool(CAPTION_END.match(tail)) and tail.lstrip(" .:：|")[:1].isupper()
+                          and (line.leading_bold or (body_size is not None and line.size < body_size * .95)))
+            if object_box is None and not (continued or distinct or styled_label or label_start or capitals
+                                           or punctuated or (isolated and CAPTION_END.match(tail))):
                 continue
             active = [line]
             metadata = kind, label, object_box, continued
