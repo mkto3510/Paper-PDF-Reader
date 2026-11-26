@@ -1,7 +1,7 @@
 # GUI の文字サイズ調節
 
 *   **Author:** mkto3510
-*   **Status:** Draft（2026-11-26 に，第 2 回の設計レビューの指摘と決定，実機の実験の結果を反映して改訂）
+*   **Status:** 実装済み（0.2.12．手順 0〜7．未確認の項目は Open Questions）．2026-11-26 に，第 2 回の設計レビューの指摘と決定，実機の実験の結果を反映して改訂
 *   **Date:** 2026-11-25
 
 --------------------------------------------------------------------------------
@@ -276,7 +276,7 @@ Preferences.fonts_changed (信号)
 *   **Qt が内部で作るメニュー**は，ダイアログ部位に従う（R1）．入力欄（`QLineEdit`，`QTextEdit`，`QPlainTextEdit`，`QTextBrowser`）の標準の右クリック，選択できるラベル，`QInputDialog` の内蔵の入力欄，数値の入力欄，編集できるコンボボックスである．メニュー部位だけを大きくしても，これらのメニューは大きくならない．
 *   **漏れの検出**: 実行時の試験で，文書を読み込んだ実際のウィンドウで，サブメニュー，右クリック，色の選択のメニューを開き，`Reader` の木の下のすべての `QMenu` が `AreaMenu` であることを確かめる（親が入力欄・ラベル・数値の入力欄の，Qt が内部で作るメニューは除く）．静的な走査は行わない．
 *   **メニューバーの項目の文字（実験 1・3 で判明）**: Qt 6.12 の `windows11` スタイルは，`QMenuBar` の項目の文字を，ウィジェットのフォントにかかわらず，約 9 pt の固定の大きさで描く（レイアウトの幅は，フォントに従って広がる）．ポップアップ，ボタン，ラベル，タブバー，ツールボタン，入力欄は，フォントに従う．対策は，`AreaMenuBar` に，`QProxyStyle` の派生（`MenuBarFontStyle`）を付けることである．
-    *   **適用の条件**: `QApplication.style().objectName()` が `windows11` のときだけ付ける（`windowsvista`，`Fusion` は，フォントに従うことを確かめた）．基底のスタイルは，同じ名前で新しく作る（`QProxyStyle("windows11")`．アプリのスタイルの実体は包まない．`QProxyStyle` が所有権を取るため．この方式で，実験 9 で描画を確かめた）．
+    *   **適用の条件**: `QApplication.style().objectName()` が `windows11` で，かつメニュー部位の大きさが基準と違うときだけ付ける（100% では，今までと同じ描画のままにする．実装済み．`windowsvista`，`Fusion` は，フォントに従うことを確かめた）．基底のスタイルは，同じ名前で新しく作る（`QProxyStyle("windows11")`．アプリのスタイルの実体は包まない．`QProxyStyle` が所有権を取るため．この方式で，実験 9 で描画を確かめた）．
     *   **描画**: `CE_MenuBarItem` を，文字なしの `QStyleOptionMenuItem` で，基底のスタイルに描かせたあと，ウィジェットのフォントで，項目の矩形の中央に，文字を `drawItemText` で描く．色は `QPalette.WindowText`（無効のときは，無効のパレット）を使う．メニュー名に `&`（ニーモニック）はないので，下線の描画は要らない．
     *   **保持**: `QWidget.setStyle` は所有権を取らないので，`AreaMenuBar` が，プロキシを属性として持つ．
     *   **確認**: 27 pt の文字が描けることと，選択中（ホバー）の背景，無効の灰色が出ることを，ダークモードで確かめた（実験 1・3・9）．手順 5b では，押下の見た目，ライトモード，Alt キーでメニューバーへ移れること，メニューバーの高さを確かめる．`windowsvista` スタイルを `QMenuBar` だけに付ける案は，ダークモードの配色にならず，文字が見えなくなったので採らない．
@@ -329,7 +329,7 @@ Preferences.fonts_changed (信号)
 | 色の絞り込みボタン（`Notes` の `colors`） | 25×25 の固定をやめ，`max(25, fontMetrics().height() + 5)` の正方形にする．`Notes` の `FontChange` で付け直す．9 pt では今のまま（25 px）． |
 | 高さ 64 の入力ボックス（`SettingsDialog` の翻訳サービスのタブ） | `setFixedHeight(max(64, lineSpacing() × 3 + 10))` にする．設定画面の文字の上限で文字が下がると，余る（許容する）． |
 | 翻訳ウィンドウの引用欄（`TranslationDialog` の `excerpt`） | 属性にして，フォームに入れたあとに，`setMaximumHeight(max(110, lineSpacing() × 5 + 10))` を付ける．`apply_font` で付け直す． |
-| ページ欄（`Header.page`） | 最小を `max(42, horizontalAdvance("0000") + 16)`，最大を最小 + 12 にする．`Header.apply_fonts` で再評価する．9 pt では今のまま（42〜54）． |
+| ページ欄（`Header.page`） | 最小を `round(42 × 倍率)`，最大を `round(54 × 倍率)` にする（倍率は，ツールバー部位の大きさ ÷ 基準，1 未満は 1）．`Header.apply_fonts` で再評価する．100% では今のまま（42〜54）．`horizontalAdvance("0000")` から求める案は，100% の幅が 42 px と一致するとは限らないので採らなかった． |
 | 「…について」の見出し（`AboutDialog`） | ダイアログ部位のフォントを基準に，1.5 倍の大きさを，ポイント指定で付ける（`QApplication.font().pointSizeF()` を使う）． |
 
 *   **翻訳ウィンドウ（`TranslationDialog`）**: 文字サイズの反映による再配置で，`preferred_size`（保存する大きさ）を更新しない．既存の `self.fitting`（`fit_screen` が画面に収めるあいだに立つ印）は使い回さず，新しい属性 `self.applying_font` を使う．`self.fitting = False` の隣で，`__init__` の先頭（最初の `resize` より前）に，`False` で初期化する．`apply_font` は，`applying_font = True` にして `setFont` し，`self.layout().activate()` で再配置を同期して済ませてから，`finally` で下ろす（実験 8 で，`activate()` を呼ぶと，最小サイズに合わせたリサイズが旗の立っているあいだに届き，呼ばないと，旗を下ろしたあとに届くことを確かめた）．`resizeEvent` は，`fitting` か `applying_font` が立っているあいだは，`preferred_size` を更新しない．`__init__` では，`self.resize(self.preferred_size)` の前に，翻訳部位のフォントを付ける．
