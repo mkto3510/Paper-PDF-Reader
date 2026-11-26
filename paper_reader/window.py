@@ -74,9 +74,18 @@ class Reader(QMainWindow):
 
     def apply_fonts(self):
         """Apply the saved sizes to this window. Each stage runs on its own, so one failure stops no other."""
-        for stage in (self.apply_roots,):
+        for stage in (self.apply_roots, self.apply_translation_fonts):
             try:
                 stage()
+            except Exception:
+                traceback.print_exc()
+
+    def apply_translation_fonts(self):
+        for index in range(self.tabs.count()):
+            try:
+                dialog = self.tabs.widget(index).annotation_dialog
+                if dialog is not None:
+                    dialog.apply_font()
             except Exception:
                 traceback.print_exc()
 

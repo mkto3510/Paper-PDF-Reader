@@ -525,6 +525,7 @@ class TranslationDialog(QDialog):
         super().__init__(pane, Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.pane, self.document = pane, pane.document
+        self.fonts = pane.fonts
         self.preferences = pane.preferences
         self.translations = self.document.store.translations
         self.choices, self.key = choices, key
@@ -535,8 +536,11 @@ class TranslationDialog(QDialog):
         self.anchor = point
         self.preferred_size = QSize(*self.preferences.data["dialogSize"])
         self.fitting = False
+        self.applying_font = False  # set while a font change reflows the window, which is not a user resize
+        self.excerpt = None
         self.work_screen = None
         self.screen_monitoring = False
+        self.setFont(self.fonts.font("translation"))
         self.resize(self.preferred_size)
         t = pane.t
         self.setWindowTitle(t("翻訳", "Translate"))
@@ -586,15 +590,15 @@ class TranslationDialog(QDialog):
             form.addRow(summary)
             details = QPushButton(t("除外した箇所を表示", "Show excluded text"))
             details.setCheckable(True)
-            excerpt = QTextEdit()
+            excerpt = self.excerpt = QTextEdit()
             excerpt.setReadOnly(True)
             excerpt.setPlainText("\n\n".join(headings[key] + "\n" + "\n".join(parts)
                                              for key, parts in items.items()))
-            excerpt.setMaximumHeight(110)
             excerpt.hide()
             details.toggled.connect(excerpt.setVisible)
             form.addRow(details)
             form.addRow(excerpt)
+            self.fit_excerpt()
             include = QCheckBox(t("除外した箇所も翻訳に含める", "Include excluded text in translation"))
             include.toggled.connect(self.include)
             form.addRow(include)
@@ -638,8 +642,22 @@ class TranslationDialog(QDialog):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.isVisible() and not self.fitting and self.work_screen is not None:
+        if self.isVisible() and not self.fitting and not self.applying_font and self.work_screen is not None:
             self.preferred_size = event.size()
+
+    def apply_font(self):
+        """Take a new translation-area size. The reflow it causes must not replace the saved window size."""
+        self.applying_font = True
+        try:
+            self.setFont(self.fonts.font("translation"))
+            self.layout().activate()
+            self.fit_excerpt()
+        finally:
+            self.applying_font = False
+
+    def fit_excerpt(self):
+        if self.excerpt is not None:
+            self.excerpt.setMaximumHeight(max(110, self.excerpt.fontMetrics().lineSpacing() * 5 + 10))
 
     def schedule_fit(self, *_):
         QTimer.singleShot(0, self, lambda: self.fit_screen(self.screen()))

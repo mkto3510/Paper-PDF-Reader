@@ -13,6 +13,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
 from check_chrome_notes import make_annotated_pdf, wait
+from check_layout_dialog import make_pdf
 from paper_reader import font_ui, fonts
 from paper_reader.application import Application
 from paper_reader.dialogs import SettingsDialog
@@ -346,6 +347,43 @@ def check_reader_fonts(app, root):
         control.shutdown()
 
 
+def check_translation_window_font(app, root):
+    """An open translation window follows its area, and the reflow does not change the saved size."""
+    fixed_base(app)
+    path = root / "translate.pdf"
+    make_pdf(path)
+    control = Application(app, root)
+    control.preferences.data.update(language="en", autoSave=False)
+    try:
+        window = control.new_window()
+        window.open_paths([str(path)])
+        wait(lambda: window.pane and window.pane.document.annotations.get(0), "Sample did not load")
+        pane = window.pane
+        pane.view.select_all()
+        pane.translate_selection(window.screen().availableGeometry().bottomRight())
+        wait(lambda: pane.annotation_dialog is not None, "Translation did not open")
+        dialog = pane.annotation_dialog
+        QTest.qWait(200)
+        assert dialog.font().pointSizeF() == 11.5, "The translation window starts at its 130% default"
+        saved = control.preferences.data["dialogSize"]
+        preferred = dialog.preferred_size
+        control.preferences.save(control.preferences.data | {"fontTranslation": 300})
+        QTest.qWait(300)
+        assert dialog.font().pointSizeF() == 27.0 and dialog.output.font().pointSizeF() == 27.0
+        assert not dialog.applying_font
+        assert dialog.preferred_size == preferred, "A font change must not replace the size to be saved"
+        assert control.preferences.data["dialogSize"] == saved
+        # A window opened after the change starts at the new size.
+        dialog.reject()
+        wait(lambda: pane.annotation_dialog is None, "The translation window did not close")
+        pane.translate_selection(window.screen().availableGeometry().bottomRight())
+        wait(lambda: pane.annotation_dialog is not None, "Translation did not reopen")
+        assert pane.annotation_dialog.font().pointSizeF() == 27.0
+        pane.annotation_dialog.reject()
+    finally:
+        control.shutdown()
+
+
 if __name__ == "__main__":
     freeze_support()
     app = QApplication([])
@@ -364,4 +402,6 @@ if __name__ == "__main__":
         check_settings_dialog_fits_screen(app, Path(work).resolve())
     with TemporaryDirectory() as work:
         check_reader_fonts(app, Path(work).resolve())
+    with TemporaryDirectory() as work:
+        check_translation_window_font(app, Path(work).resolve())
     print("PASS font sizes: preferences, arithmetic, saving, startup, settings, reader")
