@@ -88,6 +88,11 @@ class WrappingOutline(QTreeWidget):
         super().resizeEvent(event)
         self.relayout.start()
 
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange and hasattr(self, "relayout"):
+            self.relayout.start()
+
 
 class OutlineDelegate(QStyledItemDelegate):
     def sizeHint(self, option, index):
@@ -133,6 +138,13 @@ class ButtonGrid(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.flow()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange and hasattr(self, "columns"):
+            # The buttons' size hints change with the font; flow again once they have caught up.
+            self.columns = 0
+            QTimer.singleShot(0, self, self.flow)
 
     def flow(self, width=None):
         if not self.buttons:

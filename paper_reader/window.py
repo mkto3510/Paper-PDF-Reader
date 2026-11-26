@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import traceback
 
 from PySide6.QtCore import QEvent, QEventLoop, QSignalBlocker, QTimer, Qt
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
@@ -37,6 +38,7 @@ class Reader(QMainWindow):
         super().__init__()
         self.controller = controller
         self.fonts = controller.fonts
+        self.setFont(self.fonts.base_font())  # the ground: parts without an area of their own keep this size
         self.preferences = controller.preferences
         self.setMinimumWidth(MINIMUM_WIDTH)
         self.resize(1180, 820)
@@ -66,7 +68,24 @@ class Reader(QMainWindow):
         bar.tabMoved.connect(lambda *_: self.tab_list.refresh() if self.tab_list.isVisible() else None)
         self.last_pane = None
         self.preferences.changed.connect(self.refresh_settings)
+        self.preferences.fonts_changed.connect(self.apply_fonts)
         self.refresh_settings()
+        self.apply_fonts()
+
+    def apply_fonts(self):
+        """Apply the saved sizes to this window. Each stage runs on its own, so one failure stops no other."""
+        for stage in (self.apply_roots,):
+            try:
+                stage()
+            except Exception:
+                traceback.print_exc()
+
+    def apply_roots(self):
+        for index in range(self.tabs.count()):
+            try:
+                self.tabs.widget(index).apply_fonts()
+            except Exception:
+                traceback.print_exc()
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -367,6 +386,7 @@ class Reader(QMainWindow):
         pane.message.connect(self.show_message)
         doc.drafts_changed.connect(pane.location_changed)
         self.chrome.search.addWidget(pane.search_panel)
+        pane.apply_fonts()
         index = self.tabs.addTab(pane, tab_title(doc.path.name))
         self.tabs.setCurrentIndex(index)
         if self.pane is pane:

@@ -206,7 +206,7 @@ def check_card_editor(panel, key, doc):
     assert short == card.editor_minimum
     editor.setFocus()
     editor.selectAll()
-    editor.insertPlainText("A medium comment that needs a few lines. " * 6)
+    editor.insertPlainText("A medium comment that needs a few lines. " * 4)  # about 30% taller at the 130% default, so fewer repeats stay "medium"
     wait(lambda: editor.height() > short, "The comment editor did not grow with a medium text")
     assert editor.height() < max(card.editor_minimum, int(panel.viewport.height() * .7)), "The medium text hit the limit"
     QTest.qWait(100)  # let the editor lay its text out at its final width

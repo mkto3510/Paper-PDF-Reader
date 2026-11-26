@@ -147,14 +147,14 @@ def dialog_corner(work_area, frame_size, preferred):
 
 
 AREA_TEXT = {
-    "menu": (("メニュー", "メニューバーと，開いたメニュー"), ("Menus", "the menu bar and opened menus")),
-    "toolbar": (("ツールバー", "ボタンの行，ページ欄，検索の一致数"),
+    "menu": (("メニュー", "メニューバーと、開いたメニュー"), ("Menus", "the menu bar and opened menus")),
+    "toolbar": (("ツールバー", "ボタンの行、ページ欄、検索の一致数"),
                 ("Toolbar", "the button row, page box and match count")),
-    "tab": (("タブ", "タブの並びと，開いている PDF の一覧"), ("Tabs", "the tab strip and the list of open PDFs")),
+    "tab": (("タブ", "タブの並びと、開いている PDF の一覧"), ("Tabs", "the tab strip and the list of open PDFs")),
     "outline": (("目次", "左の目次"), ("Outline", "the table of contents")),
     "notes": (("注釈", "注釈のパネルとカード"), ("Annotations", "the annotation panel and cards")),
     "translation": (("翻訳ウィンドウ", "翻訳の結果の窓"), ("Translation window", "the translation result window")),
-    "dialog": (("ダイアログ", "設定，プロパティ，確認の窓，ツールチップなど（メインウィンドウの本体は変わりません）"),
+    "dialog": (("ダイアログ", "設定、プロパティ、確認の窓、ツールチップなど（メインウィンドウの本体は変わりません）"),
                ("Dialogs", "Settings, Properties, message boxes, tooltips and the rest "
                            "(the main window itself is not affected)")),
     "notice": (("お知らせ", "一時的な通知"), ("Notices", "temporary messages")),
@@ -268,8 +268,8 @@ class SettingsDialog(QDialog):
         everything.clicked.connect(lambda: [self.font_rows[area.id][0].setValue(area.default)
                                             for area in fonts.AREAS])
         outer.addWidget(everything, 0, Qt.AlignmentFlag.AlignLeft)
-        exceptions = QLabel(t("次は，文字サイズを変えられません: ファイルを選ぶ窓，ウィンドウの題名，起動時の失敗を知らせる窓．"
-                              "設定画面は，画面に収まる大きさに自動で縮みます．",
+        exceptions = QLabel(t("次は、文字サイズを変えられません: ファイルを選ぶ窓、ウィンドウの題名、起動時の失敗を知らせる窓。"
+                              "設定画面は、画面に収まる大きさに自動で縮みます。",
                               "These cannot change size: file dialogs, window titles, and startup error messages. "
                               "The Settings window shrinks automatically to fit the screen."))
         exceptions.setWordWrap(True)

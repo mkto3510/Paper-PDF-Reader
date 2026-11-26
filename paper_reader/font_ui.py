@@ -35,7 +35,9 @@ class AreaFonts:
         self.preferences = preferences
 
     def base_font(self):
-        return QFont(self.base)
+        font = QFont(self.base)
+        font.setPointSizeF(self.base.pointSizeF())  # always an explicit size, so later app-font changes are not inherited
+        return font
 
     def percent(self, area):
         return self.preferences.data[fonts.AREA_BY_ID[area].key]

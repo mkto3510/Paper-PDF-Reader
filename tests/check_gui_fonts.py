@@ -1,6 +1,7 @@
 """Regression coverage for the per-area GUI font sizes."""
 
 import json
+from bisect import bisect_right
 from multiprocessing import freeze_support
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,8 +9,10 @@ from unittest.mock import patch
 
 from PySide6.QtCore import QRect
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
+from check_chrome_notes import make_annotated_pdf, wait
 from paper_reader import font_ui, fonts
 from paper_reader.application import Application
 from paper_reader.dialogs import SettingsDialog
@@ -235,6 +238,114 @@ def check_settings_dialog_fits_screen(app, root):
         control.shutdown()
 
 
+def audit(window):
+    """The point size of every widget in the window's own tree (top-level windows inside it are skipped)."""
+    sizes = {}
+    for widget in window.findChildren(QWidget):
+        node, inside = widget, True
+        while node is not window:
+            if node.isWindow():
+                inside = False
+                break
+            node = node.parentWidget()
+        if inside:
+            sizes[widget] = widget.font().pointSizeF()
+    return sizes
+
+
+def check_reader_fonts(app, root):
+    """The ground, the notes and outline areas, and the re-measuring of cards."""
+    fixed_base(app)
+    pdf = root / "notes.pdf"
+    other = root / "other.pdf"
+    make_annotated_pdf(pdf, 12)
+    make_annotated_pdf(other, 3)
+    control = Application(app, root)
+    try:
+        window = control.new_window()
+        window.resize(1100, 800)
+        window.open_paths([str(pdf), str(other)])
+        wait(lambda: window.tabs.count() == 2 and all(window.tabs.widget(i).document.annotations
+                                                       for i in range(2)), "The documents did not load")
+        panes = [window.tabs.widget(i) for i in range(2)]
+        pane, hidden = panes[0], panes[1]
+        window.tabs.setCurrentWidget(pane)
+        pane.show_sidebar("notes", True)
+        pane.splitter.setSizes([300, 800])
+        panel = pane.notes
+        QTest.qWait(200)
+        assert window.font().pointSizeF() == BASE
+        assert pane.outline.font().pointSizeF() == 11.5 and panel.font().pointSizeF() == 11.5, "130% defaults"
+        key = panel.keys[0]  # stays on screen when the cards grow, so its focus can be checked
+        window.activateWindow()
+        QTest.qWaitForWindowActive(window)
+        pane.pick_note(key, focus_card=True)
+        wait(lambda: key in panel.cards and panel.cards[key].editor.isVisible(), "The card editor did not open")
+        card = panel.cards[key]
+        editor = card.editor
+        editor.setFocus()
+        editor.selectAll()
+        editor.insertPlainText("first edit. ")
+        editor.insertPlainText("second edit. " * 3)
+        cursor = editor.textCursor()
+        cursor.setPosition(10)
+        editor.setTextCursor(cursor)
+        QTest.qWait(300)
+        bar = panel.scroll.verticalScrollBar()
+        before = card.editor_minimum
+
+        # Notes at 150%, outline at 160%, dialog at 180%: three different sizes, all kept apart.
+        control.preferences.save(control.preferences.data | {"fontNotes": 150, "fontOutline": 160,
+                                                              "fontDialog": 180})
+        def settled(notes):
+            # Only the cards on screen are placed; the hidden ones keep their old geometry until they scroll in.
+            return all(notes.heights.get(number) == shown.geometry().height()
+                       for number, shown in notes.cards.items() if not shown.isHidden())
+
+        wait(lambda: settled(panel), "The card heights did not settle")
+        QTest.qWait(300)
+        assert (pane.outline.font().pointSizeF(), panel.font().pointSizeF()) == (14.5, 13.5)
+        assert app.font().pointSizeF() == 16.0 and window.font().pointSizeF() == BASE
+        assert panel.cards[key] is card and card.editor is editor, "Cards must not be rebuilt"
+        assert editor.hasFocus() and editor.textCursor().position() == 10, (editor.hasFocus(), editor.textCursor().position(), card.isHidden(), window.isActiveWindow(), app.focusWidget())
+        assert editor.document().isUndoAvailable()
+        assert editor.font().pointSizeF() == 13.5 and card.editor_minimum > before
+        assert editor.height() >= card.editor_minimum, "The comment box must follow its font"
+        assert settled(panel) and any(not shown.isHidden() for shown in panel.cards.values())
+        for number, shown in panel.cards.items():
+            if not shown.isHidden():
+                assert shown.actions.height() == shown.actions.grid.sizeHint().height(), "Button group height"
+        side = max(25, panel.fontMetrics().height() + 5)
+        assert all((b.width(), b.height()) == (side, side) for b in panel.colors.values())
+        # Nothing in the window follows the dialog size; every size comes from the ground or one area.
+        sizes = audit(window)
+        assert set(sizes.values()) <= {BASE, 14.5, 13.5}, {s for s in sizes.values()}
+        assert 16.0 not in sizes.values()
+        # The cards on screen after a size change are the ones that were on screen before it.
+        bar.setValue(bar.maximum() // 2)
+        QTest.qWait(300)
+        anchor = panel.keys[bisect_right(panel.tops, bar.value()) - 1]
+        control.preferences.save(control.preferences.data | {"fontNotes": 120})
+        wait(lambda: settled(panel), "The card heights did not settle again")
+        QTest.qWait(300)
+        assert panel.keys[bisect_right(panel.tops, bar.value()) - 1] == anchor, "The scroll position was lost"
+        # A tab that was hidden while the sizes changed lays itself out when it is shown.
+        card.cancel_edit()  # an unsaved draft would make leaving this tab ask a question
+        window.tabs.setCurrentWidget(hidden)
+        hidden.show_sidebar("notes", True)
+        QTest.qWait(400)
+        hidden_panel = hidden.notes
+        assert hidden_panel.font().pointSizeF() == 11.0
+        assert settled(hidden_panel) and hidden_panel.cards
+        # Going back makes everything default again.
+        control.preferences.save(control.preferences.data | {"fontNotes": 130, "fontOutline": 130,
+                                                              "fontDialog": 100})
+        QTest.qWait(300)
+        assert panel.font().pointSizeF() == 11.5 and app.font().pointSizeF() == BASE
+    finally:
+        control.shutdown()
+
+
 if __name__ == "__main__":
     freeze_support()
     app = QApplication([])
@@ -251,4 +362,6 @@ if __name__ == "__main__":
         check_settings_dialog(app, Path(work).resolve())
     with TemporaryDirectory() as work:
         check_settings_dialog_fits_screen(app, Path(work).resolve())
-    print("PASS font sizes: preferences, arithmetic, saving, startup, settings")
+    with TemporaryDirectory() as work:
+        check_reader_fonts(app, Path(work).resolve())
+    print("PASS font sizes: preferences, arithmetic, saving, startup, settings, reader")

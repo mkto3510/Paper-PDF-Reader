@@ -33,6 +33,7 @@ class DocumentPane(QWidget):
     def __init__(self, window, document):
         super().__init__()
         self.window, self.document = window, document
+        self.fonts = window.fonts
         self.preferences = window.preferences
         self.history = []
         self.history_index = -1
@@ -147,6 +148,10 @@ class DocumentPane(QWidget):
         escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         escape.activated.connect(self.close_search)
         return panel
+
+    def apply_fonts(self):
+        self.outline.setFont(self.fonts.font("outline"))
+        self.notes.setFont(self.fonts.font("notes"))
 
     def relabel(self):
         self.query.setPlaceholderText(self.t("文書内で検索", "Find in document"))
