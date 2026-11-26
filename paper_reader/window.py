@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 from . import APP_NAME
 from .chrome import MINIMUM_WIDTH, DocumentTabs, Header, TabList
 from .dialogs import AboutDialog, SettingsDialog, ask
+from .font_ui import AreaMenu
 from .icons import icon
 from .pane import DocumentPane
 from .view import ACTUAL_SIZE
@@ -74,7 +75,7 @@ class Reader(QMainWindow):
 
     def apply_fonts(self):
         """Apply the saved sizes to this window. Each stage runs on its own, so one failure stops no other."""
-        for stage in (self.apply_roots, self.apply_translation_fonts):
+        for stage in (self.apply_roots, self.apply_menus, self.apply_translation_fonts):
             try:
                 stage()
             except Exception:
@@ -89,7 +90,17 @@ class Reader(QMainWindow):
             except Exception:
                 traceback.print_exc()
 
+    def apply_menus(self):
+        self.chrome.menus.apply_font()
+        for menu in self.findChildren(AreaMenu):
+            try:
+                menu.setFont(self.fonts.font("menu"))
+            except Exception:
+                traceback.print_exc()
+
     def apply_roots(self):
+        for widget in (self.tabs.tabBar(), self.tab_list_button):
+            widget.setFont(self.fonts.font("tab"))
         for index in range(self.tabs.count()):
             try:
                 self.tabs.widget(index).apply_fonts()
@@ -425,7 +436,7 @@ class Reader(QMainWindow):
         if index < 0:
             return
         # The menu works on the tab that was clicked; it does not switch to it (and so never asks to save).
-        menu = QMenu(self)
+        menu = AreaMenu(self.fonts, self)
         menu.addAction(self.t("タブを複製", "Duplicate tab"), lambda: self.duplicate(False, index))
         menu.addAction(self.t("別ウィンドウに複製", "Duplicate in new window"), lambda: self.duplicate(True, index))
         menu.addSeparator()

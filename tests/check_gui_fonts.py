@@ -10,11 +10,12 @@ from unittest.mock import patch
 from PySide6.QtCore import QRect
 from PySide6.QtGui import QFont
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QPushButton, QWidget
+from PySide6.QtWidgets import QApplication, QMenu, QPushButton, QWidget
 
 from check_chrome_notes import make_annotated_pdf, wait
 from check_layout_dialog import make_pdf
 from paper_reader import font_ui, fonts
+from paper_reader.font_ui import AreaMenu, AreaMenuBar
 from paper_reader.application import Application
 from paper_reader.dialogs import SettingsDialog
 from paper_reader.preferences import Preferences, load_preferences
@@ -384,6 +385,52 @@ def check_translation_window_font(app, root):
         control.shutdown()
 
 
+def check_menus_and_tabs(app, root):
+    """Every menu the app makes is an AreaMenu with the menu area's font; the tab area has its own roots."""
+    fixed_base(app)
+    pdf = root / "menus.pdf"
+    make_annotated_pdf(pdf, 6)
+    control = Application(app, root)
+    try:
+        window = control.new_window()
+        window.resize(1100, 800)
+        window.open_paths([str(pdf)])
+        wait(lambda: window.pane and window.pane.document.annotations, "The document did not load")
+        pane = window.pane
+        pane.show_sidebar("notes", True)
+        pane.pick_note(pane.notes.keys[0])
+        QTest.qWait(300)
+        menus = window.findChildren(QMenu)
+        assert len(menus) > 10, "The menu bar's menus, the overflow, the search options and the colour menus exist"
+        # Qt makes two kinds of menus itself: the standard menu of an input box (dialog area) and the one the
+        # menu bar opens for the items that do not fit (menu area, set by the bar).
+        internal = [menu for menu in menus if not isinstance(menu, AreaMenu)]
+        assert all(isinstance(menu.parent(), AreaMenuBar) for menu in internal), \
+            [type(menu.parent()).__name__ for menu in internal]
+        assert len(menus) - len(internal) > 10
+        assert {menu.font().pointSizeF() for menu in menus} == {BASE}
+
+        control.preferences.save(control.preferences.data | {"fontMenu": 200, "fontTab": 150})
+        QTest.qWait(200)
+        assert {menu.font().pointSizeF() for menu in menus} == {18.0}, "Open and closed menus follow the menu area"
+        assert window.tabs.tabBar().font().pointSizeF() == 13.5
+        assert window.tab_list_button.font().pointSizeF() == 13.5
+        assert window.font().pointSizeF() == BASE and pane.notes.font().pointSizeF() == 11.5
+        window.tab_list.open_list()
+        assert window.tab_list.font().pointSizeF() == 13.5
+        window.tab_list.hide()
+        # A menu created after the change starts at the new size too.
+        late = window.chrome.menus.addMenu("Late")
+        assert isinstance(late, AreaMenu) and late.font().pointSizeF() == 18.0
+        window.chrome.menus.removeAction(late.menuAction())
+        # The floor: 50% of 9 pt would be 4.5 pt.
+        control.preferences.save(control.preferences.data | {"fontMenu": 50})
+        QTest.qWait(100)
+        assert {menu.font().pointSizeF() for menu in menus} == {7.0}
+    finally:
+        control.shutdown()
+
+
 if __name__ == "__main__":
     freeze_support()
     app = QApplication([])
@@ -404,4 +451,6 @@ if __name__ == "__main__":
         check_reader_fonts(app, Path(work).resolve())
     with TemporaryDirectory() as work:
         check_translation_window_font(app, Path(work).resolve())
+    with TemporaryDirectory() as work:
+        check_menus_and_tabs(app, Path(work).resolve())
     print("PASS font sizes: preferences, arithmetic, saving, startup, settings, reader")

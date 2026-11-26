@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QSizePolicy, QStackedWidget, QTabBar, QToolButton, QVBoxLayout, QWidget,
 )
 
+from .font_ui import AreaMenu, AreaMenuBar
 from .icons import icon
 
 
@@ -49,6 +50,7 @@ class TabList(QFrame):
         layout.addWidget(self.items)
 
     def open_list(self):
+        self.setFont(self.window.fonts.font("tab"))
         self.query.clear()
         self.refresh()
         self.resize(420, 360)
@@ -129,7 +131,7 @@ class Header(QWidget):
         layout = QVBoxLayout(self)
         layout.setSpacing(0)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.menus = QMenuBar()
+        self.menus = AreaMenuBar(window.fonts, self)
         self.menus.setNativeMenuBar(False)
         layout.addWidget(self.menus)
         row = QWidget(self)
@@ -173,7 +175,7 @@ class Header(QWidget):
         self.tools.addStretch()
         self.more = QToolButton()
         self.more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.overflow = QMenu(self.more)
+        self.overflow = AreaMenu(window.fonts, self.more)
         self.more.setMenu(self.overflow)
         self.tools.addWidget(self.more)
         self.hidden_tools = None

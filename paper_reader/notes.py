@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QToolButton, QVBoxLayout, QWidget,
 )
 
+from .font_ui import AreaMenu
 from .icons import icon, swatch
 from .sidebar import ButtonGrid, WrappedLabel, wrapped_document
 
@@ -52,7 +53,7 @@ class Card(QFrame):
         header.addStretch(1)
         self.color = QToolButton()
         self.color.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        colors = QMenu(self.color)
+        colors = AreaMenu(self.pane.fonts, self.color)
         colors.aboutToShow.connect(lambda: self.show_colors(colors))
         self.color.setMenu(colors)
         header.addWidget(self.color)
@@ -276,7 +277,7 @@ class Notes(QWidget):
         self.bulk_color = QToolButton()
         self.bulk_color.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.bulk_color.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        colors = QMenu(self.bulk_color)
+        colors = AreaMenu(self.pane.fonts, self.bulk_color)
         colors.aboutToShow.connect(lambda: self.show_bulk_colors(colors))
         self.bulk_color.setMenu(colors)
         self.bulk_translate, self.bulk_delete = QPushButton(), QPushButton()

@@ -1,6 +1,6 @@
 """Qt side of the per-area font sizes: the base font, the area fonts and the menu classes."""
 
-from PySide6.QtCore import QSize
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication, QMenu, QMenuBar
 
@@ -72,7 +72,15 @@ class AreaMenuBar(QMenuBar):
     def __init__(self, fonts_, parent):
         super().__init__(parent)
         self.fonts = fonts_
-        self.setFont(fonts_.font("menu"))
+        self.apply_font()
+
+    def apply_font(self):
+        font = self.fonts.font("menu")
+        self.setFont(font)
+        # The menu Qt makes for the items that do not fit is a popup too; it takes the menu area's font.
+        for menu in self.findChildren(QMenu, options=Qt.FindChildOption.FindDirectChildrenOnly):
+            if not isinstance(menu, AreaMenu):
+                menu.setFont(font)
 
     def addMenu(self, *args):
         return add_area_menu(self, *args)
