@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from PySide6.QtCore import QRect
+from PySide6.QtCore import QRect, QSize
 from PySide6.QtGui import QFont
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMenu, QMenuBar, QPushButton, QWidget
@@ -477,6 +477,71 @@ def check_menu_bar(app, root):
     bar.close()
 
 
+def check_areas_apart(app, root):
+    """Each area changes only its own parts; the toolbar's icons follow the toolbar's size."""
+    fixed_base(app)
+    pdf = root / "areas.pdf"
+    make_annotated_pdf(pdf, 4)
+    control = Application(app, root)
+    try:
+        window = control.new_window()
+        window.resize(1100, 800)
+        window.open_paths([str(pdf)])
+        wait(lambda: window.pane and window.pane.document.annotations, "The document did not load")
+        pane = window.pane
+        chrome = window.chrome
+        probes = {"menu": chrome.menus, "toolbar": chrome.row, "tab": window.tabs.tabBar(), "outline": pane.outline,
+                  "notes": pane.notes, "notice": chrome.notice, "dialog": None}
+
+        def sizes():
+            current = {name: widget.font().pointSizeF() for name, widget in probes.items() if widget is not None}
+            current["dialog"] = app.font().pointSizeF()
+            current["ground"] = window.font().pointSizeF()
+            current["search panel"] = pane.search_panel.font().pointSizeF()
+            return current
+
+        QTest.qWait(200)
+        baseline = sizes()
+        assert baseline == {"menu": 9.0, "toolbar": 9.0, "tab": 9.0, "outline": 11.5, "notes": 11.5, "notice": 9.0,
+                            "dialog": 9.0, "ground": 9.0, "search panel": 9.0}, baseline
+        assert (chrome.page.minimumWidth(), chrome.page.maximumWidth()) == (42, 54), "The page box is as before"
+        for area in ("menu", "toolbar", "tab", "outline", "notes", "notice", "dialog"):
+            control.preferences.save(control.preferences.data | {fonts.AREA_BY_ID[area].key: 200})
+            QTest.qWait(150)
+            now = sizes()
+            changed = {name for name in now if now[name] != baseline[name]}
+            expected = {area} | ({"search panel"} if area == "toolbar" else set())
+            assert changed == expected, (area, changed, now)
+            assert now[area] == 18.0
+            control.preferences.save(control.preferences.data | {fonts.AREA_BY_ID[area].key:
+                                                                  fonts.AREA_BY_ID[area].default})
+            QTest.qWait(100)
+            assert sizes() == baseline, area
+        assert pane.lookup_notice.font().pointSizeF() == 9.0
+
+        # The toolbar's size sets the icon edge: buttons ask for it, menus keep 16 px.
+        control.preferences.save(control.preferences.data | {"fontToolbar": 200})
+        QTest.qWait(300)
+        assert window.icon_edge == 32 and chrome.buttons["open"].iconSize() == QSize(32, 32)
+        assert chrome.more.iconSize() == QSize(32, 32) and pane.prev_match.iconSize() == QSize(32, 32)
+        action = window.actions["open"][0]
+        assert QSize(96, 96) in action.icon().availableSizes(), "A 32 px picture at pixel ratio 3 is there"
+        assert action.icon().actualSize(QSize(16, 16)) == QSize(16, 16), "A menu asking for 16 px gets 16 px"
+        assert action.icon().actualSize(QSize(32, 32)) == QSize(32, 32)
+        assert (chrome.page.minimumWidth(), chrome.page.maximumWidth()) == (84, 108)
+        control.preferences.save(control.preferences.data | {"fontToolbar": 100})
+        QTest.qWait(300)
+        assert window.icon_edge == 16 and chrome.buttons["open"].iconSize() == QSize(16, 16)
+        assert QSize(96, 96) not in window.actions["open"][0].icon().availableSizes()
+        # A notice shown at the time of the change is laid out again for its new font.
+        chrome.show_notice("A notice")
+        control.preferences.save(control.preferences.data | {"fontNotice": 300})
+        QTest.qWait(200)
+        assert chrome.notice.font().pointSizeF() == 27.0 and chrome.notice.height() >= chrome.notice.fontMetrics().height()
+    finally:
+        control.shutdown()
+
+
 if __name__ == "__main__":
     freeze_support()
     app = QApplication([])
@@ -501,4 +566,6 @@ if __name__ == "__main__":
         check_menus_and_tabs(app, Path(work).resolve())
     with TemporaryDirectory() as work:
         check_menu_bar(app, Path(work).resolve())
+    with TemporaryDirectory() as work:
+        check_areas_apart(app, Path(work).resolve())
     print("PASS font sizes: preferences, arithmetic, saving, startup, settings, reader")

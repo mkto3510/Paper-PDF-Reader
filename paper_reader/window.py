@@ -46,6 +46,7 @@ class Reader(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.setAcceptDrops(True)
         self.language = None
+        self.icon_edge = None
         self.actions = {}
         self.action_groups = []
         self.opening = set()
@@ -75,7 +76,8 @@ class Reader(QMainWindow):
 
     def apply_fonts(self):
         """Apply the saved sizes to this window. Each stage runs on its own, so one failure stops no other."""
-        for stage in (self.apply_roots, self.apply_menus, self.apply_translation_fonts, self.chrome.timer.start):
+        for stage in (self.apply_roots, self.apply_menus, self.apply_icon_sizes, self.apply_translation_fonts,
+                      self.chrome.timer.start):
             try:
                 stage()
             except Exception:
@@ -87,6 +89,14 @@ class Reader(QMainWindow):
                 dialog = self.tabs.widget(index).annotation_dialog
                 if dialog is not None:
                     dialog.apply_font()
+            except Exception:
+                traceback.print_exc()
+
+    def apply_icon_sizes(self):
+        self.chrome.apply_icon_size()
+        for index in range(self.tabs.count()):
+            try:
+                self.tabs.widget(index).apply_icon_size()
             except Exception:
                 traceback.print_exc()
 
@@ -178,7 +188,7 @@ class Reader(QMainWindow):
                    "find_previous": "previous", "find_next": "next", "outline": "outline",
                    "notes": "notes", "save": "save", "save_as": "save", "properties": "properties"}
         if key in symbols:
-            action.setIcon(icon(self, symbols[key]))
+            action.setIcon(icon(self, symbols[key], self.icon_edge))
             action.setIconVisibleInMenu(True)
         if shortcut:
             action.setShortcut(QKeySequence(shortcut))
@@ -191,8 +201,10 @@ class Reader(QMainWindow):
         return action
 
     def refresh_settings(self):
-        if self.language != self.preferences.data["language"]:
+        # The actions' icons carry the toolbar's size, so they are made again when the language or that size changes.
+        if self.language != self.preferences.data["language"] or self.icon_edge != self.fonts.edge():
             self.language = self.preferences.data["language"]
+            self.icon_edge = self.fonts.edge()
             self.build_menu()
         self.tab_list_button.setArrowType(Qt.ArrowType.DownArrow)
         self.tab_list_button.setToolTip(self.t("開いている PDF の一覧", "Open PDFs"))

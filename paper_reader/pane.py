@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from urllib.parse import urlencode
 
-from PySide6.QtCore import QElapsedTimer, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QElapsedTimer, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QSizePolicy, QSplitter,
@@ -153,6 +153,13 @@ class DocumentPane(QWidget):
     def apply_fonts(self):
         self.outline.setFont(self.fonts.font("outline"))
         self.notes.setFont(self.fonts.font("notes"))
+        self.lookup_notice.setFont(self.fonts.font("notice"))
+        self.lookup_notice.adjustSize()
+
+    def apply_icon_size(self):
+        edge = self.fonts.edge()
+        for button in (self.prev_match, self.next_match):
+            button.setIconSize(QSize(edge, edge))
 
     def relabel(self):
         self.query.setPlaceholderText(self.t("文書内で検索", "Find in document"))
@@ -168,7 +175,7 @@ class DocumentPane(QWidget):
             (self.search_options, None, ("検索オプション", "Find options")),
         ):
             if symbol:
-                button.setIcon(icon(self, symbol))
+                button.setIcon(icon(self, symbol, self.fonts.edge()))
             button.setToolTip(self.t(*labels))
             button.setAccessibleName(button.toolTip())
         self.outline.setAccessibleName(self.t("目次", "Outline"))

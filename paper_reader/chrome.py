@@ -134,7 +134,7 @@ class Header(QWidget):
         self.menus = AreaMenuBar(window.fonts, self)
         self.menus.setNativeMenuBar(False)
         layout.addWidget(self.menus)
-        row = QWidget(self)
+        row = self.row = QWidget(self)
         row.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         row.installEventFilter(self)
         layout.addWidget(row)
@@ -196,8 +196,22 @@ class Header(QWidget):
         self.timer.timeout.connect(self.fit_tools)
 
     def apply_fonts(self):
+        fonts = self.window.fonts
         self.menus.apply_font()
         self.menus.setMinimumHeight(self.menus.fontMetrics().height() + 8)
+        self.row.setFont(fonts.font("toolbar"))
+        for label in (self.notice, self.external):
+            label.setFont(fonts.font("notice"))
+        # The page box is 42 to 54 px at the default size and grows with the toolbar's font.
+        scale = max(1.0, fonts.pt("toolbar") / fonts.base.pointSizeF())
+        self.page.setMinimumWidth(round(42 * scale))
+        self.page.setMaximumWidth(round(54 * scale))
+        self.place_notice()
+
+    def apply_icon_size(self):
+        edge = self.window.fonts.edge()
+        for button in (*self.buttons.values(), self.more):
+            button.setIconSize(QSize(edge, edge))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -245,7 +259,7 @@ class Header(QWidget):
         for name, button in self.buttons.items():
             button.setDefaultAction(actions[name][0])
             button.setAccessibleName(actions[name][0].text())
-        self.more.setIcon(icon(self, "more"))
+        self.more.setIcon(icon(self, "more", self.window.icon_edge))
         self.more.setToolTip(self.window.t("その他", "More"))
         self.more.setAccessibleName(self.more.toolTip())
         self.page.setAccessibleName(self.window.t("ページ番号", "Page number"))
