@@ -36,6 +36,7 @@ class Reader(QMainWindow):
     def __init__(self, controller):
         super().__init__()
         self.controller = controller
+        self.fonts = controller.fonts
         self.preferences = controller.preferences
         self.setMinimumWidth(MINIMUM_WIDTH)
         self.resize(1180, 820)
@@ -243,7 +244,7 @@ class Reader(QMainWindow):
             ("all", ("すべて選択", "Select all"), "view.select_all"),
         ):
             self.action(selection, key, names, lambda method=command: self.dispatch(method))
-        settings = self.action(None, "preferences", ("設定", "Settings"), self.open_settings, required=False)
+        settings = self.action(None, "preferences", ("設定", "Settings"), self.open_settings, "Ctrl+,", False)
         menu.insertAction(help_.menuAction(), settings)
         self.action(help_, "keys", ("ショートカット", "Keyboard shortcuts"), self.shortcuts, required=False)
         self.action(help_, "about", (f"{APP_NAME} について", f"About {APP_NAME}"), self.about, required=False)

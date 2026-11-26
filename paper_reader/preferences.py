@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from PySide6.QtCore import QObject, Signal
 
+from . import fonts
 from .analysis_rules import DEFAULT_RULES
 from .messages import localize
 from .paths import write_json
@@ -24,7 +25,11 @@ DEFAULTS = {
     "opacity": 40,
     "dialogSize": [486, 356],
     "rules": DEFAULT_RULES,
+    **{area.key: area.default for area in fonts.AREAS},
 }
+
+
+FONT_DEFAULTS = {area.key: area.default for area in fonts.AREAS}
 
 
 def bounded(value, default, low, high):
@@ -47,6 +52,8 @@ def load_preferences(path):
     settings["concurrency"] = bounded(settings["concurrency"], 2, 1, 8)
     settings["backupCount"] = bounded(settings["backupCount"], 5, 0, 200)
     settings["opacity"] = bounded(settings["opacity"], 40, 0, 100)
+    for area in fonts.AREAS:
+        settings[area.key] = bounded(raw.get(area.key), area.default, fonts.MINIMUM_PERCENT, fonts.MAXIMUM_PERCENT)
     dims = settings["dialogSize"]
     if len(dims) != 2 or any(type(value) is not int or value < 200 for value in dims):
         settings["dialogSize"] = DEFAULTS["dialogSize"].copy()
@@ -79,6 +86,7 @@ def load_preferences(path):
 
 class Preferences(QObject):
     changed = Signal()
+    fonts_changed = Signal()
 
     def __init__(self, directory):
         super().__init__()
@@ -87,9 +95,16 @@ class Preferences(QObject):
         self.data = load_preferences(self.path)
 
     def save(self, data):
-        write_json(self.path, data)
+        # A font size equal to its default is not written, so a later release can change the default
+        # for everyone who never chose a value; the in-memory copy keeps all eight keys.
+        written = {key: value for key, value in data.items()
+                   if not (key in FONT_DEFAULTS and value == FONT_DEFAULTS[key])}
+        write_json(self.path, written)
+        old = self.data
         self.data = data
         self.changed.emit()
+        if any(old.get(key) != data.get(key) for key in FONT_DEFAULTS):
+            self.fonts_changed.emit()
 
     def tr_text(self, japanese, english):
         return english if self.data["language"] == "en" else japanese

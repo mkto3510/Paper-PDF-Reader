@@ -15,7 +15,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from . import APP_NAME, EXECUTABLE_NAME, VERSION
+from . import APP_NAME, EXECUTABLE_NAME, VERSION, font_ui
 from .documents import Documents
 from .icons import ICON_DIR
 from .paths import data_dir
@@ -29,12 +29,20 @@ class Application:
     def __init__(self, app, directory):
         self.app = app
         self.preferences = Preferences(directory)
+        # The base font must be read before the first setFont; the saved dialog size is applied before
+        # any window exists, and again whenever a font size is saved.
+        self.fonts = font_ui.AreaFonts(font_ui.process_base_font(), self.preferences)
+        self.apply_dialog_font()
+        self.preferences.fonts_changed.connect(self.apply_dialog_font)
         self.windows = []
         self.documents = Documents(self.preferences, self.has_comment_drafts)
         self.server = None
         self.lock = None
         self.connections = {}
         app.aboutToQuit.connect(self.shutdown)
+
+    def apply_dialog_font(self):
+        self.app.setFont(self.fonts.font("dialog"))
 
     def new_window(self):
         window = Reader(self)
@@ -97,6 +105,7 @@ class Application:
         self.receive_paths(paths)
 
     def shutdown(self):
+        self.app.setFont(self.fonts.base_font())
         if self.server:
             self.server.close()
         for doc in tuple(self.documents.items.values()):
