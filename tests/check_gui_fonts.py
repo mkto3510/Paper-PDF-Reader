@@ -10,7 +10,7 @@ from unittest.mock import patch
 from PySide6.QtCore import QRect
 from PySide6.QtGui import QFont
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMenu, QPushButton, QWidget
+from PySide6.QtWidgets import QApplication, QMenu, QMenuBar, QPushButton, QWidget
 
 from check_chrome_notes import make_annotated_pdf, wait
 from check_layout_dialog import make_pdf
@@ -431,6 +431,52 @@ def check_menus_and_tabs(app, root):
         control.shutdown()
 
 
+def ink_height(widget):
+    image = widget.grab().toImage()
+    background = image.pixelColor(image.width() - 2, image.height() // 2)
+    rows = [y for y in range(image.height()) for x in range(image.width())
+            if sum(abs(a - b) for a, b in ((image.pixelColor(x, y).red(), background.red()),
+                                           (image.pixelColor(x, y).green(), background.green()),
+                                           (image.pixelColor(x, y).blue(), background.blue()))) > 120]
+    return (max(rows) - min(rows) + 1) if rows else 0
+
+
+def check_menu_bar(app, root):
+    """The menu bar's height follows its font, its width stays within the screen, and the windows11
+    replacement draws text at the widget's size."""
+    fixed_base(app)
+    control = Application(app, root)
+    try:
+        window = control.new_window()
+        QTest.qWait(200)
+        menus = window.chrome.menus
+        default_height, default_minimum = menus.height(), window.minimumWidth()
+        control.preferences.save(control.preferences.data | {"fontMenu": 300})
+        QTest.qWait(300)
+        assert menus.font().pointSizeF() == 27.0
+        assert menus.minimumHeight() == menus.fontMetrics().height() + 8 and menus.height() >= menus.minimumHeight()
+        assert window.minimumWidth() >= default_minimum
+        assert window.minimumWidth() <= window.screen().availableGeometry().width()
+        control.preferences.save(control.preferences.data | {"fontMenu": 100})
+        QTest.qWait(300)
+        assert menus.height() == default_height, "At the default size the bar is as before"
+        assert window.minimumWidth() == default_minimum
+    finally:
+        control.shutdown()
+    # The replacement style, tried on its own (the offscreen platform's default style does not need it).
+    bar = QMenuBar()
+    bar.addMenu("MMMM")
+    big = QFont(app.font())
+    big.setPointSizeF(27)
+    bar.setFont(big)
+    bar.setStyle(font_ui.MenuBarFontStyle("windows11"))
+    bar.resize(bar.sizeHint())
+    bar.show()
+    QTest.qWait(100)
+    assert ink_height(bar) >= 20, "The text must be drawn at the widget's size, not the style's fixed size"
+    bar.close()
+
+
 if __name__ == "__main__":
     freeze_support()
     app = QApplication([])
@@ -453,4 +499,6 @@ if __name__ == "__main__":
         check_translation_window_font(app, Path(work).resolve())
     with TemporaryDirectory() as work:
         check_menus_and_tabs(app, Path(work).resolve())
+    with TemporaryDirectory() as work:
+        check_menu_bar(app, Path(work).resolve())
     print("PASS font sizes: preferences, arithmetic, saving, startup, settings, reader")

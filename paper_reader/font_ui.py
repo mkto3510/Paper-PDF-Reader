@@ -1,8 +1,10 @@
 """Qt side of the per-area font sizes: the base font, the area fonts and the menu classes."""
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QApplication, QMenu, QMenuBar
+from PySide6.QtGui import QFont, QPalette
+from PySide6.QtWidgets import (
+    QApplication, QMenu, QMenuBar, QProxyStyle, QStyle, QStyleOptionMenuItem,
+)
 
 from . import fonts
 
@@ -68,15 +70,47 @@ class AreaMenu(QMenu):
         return add_area_menu(self, *args)
 
 
+class MenuBarFontStyle(QProxyStyle):
+    """Qt 6.12's windows11 style draws menu bar items at a fixed size and ignores the widget's font.
+
+    This style lets the base style draw the item without its text, then draws the text itself with the
+    widget's font, centred in the item.
+    """
+
+    def drawControl(self, element, option, painter, widget=None):
+        if element != QStyle.ControlElement.CE_MenuBarItem or widget is None:
+            super().drawControl(element, option, painter, widget)
+            return
+        item = QStyleOptionMenuItem(option)
+        text, item.text = item.text, ""
+        super().drawControl(element, item, painter, widget)
+        painter.save()
+        painter.setFont(widget.font())
+        self.drawItemText(painter, item.rect, int(Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextShowMnemonic),
+                          item.palette, bool(item.state & QStyle.StateFlag.State_Enabled), text,
+                          QPalette.ColorRole.WindowText)
+        painter.restore()
+
+
 class AreaMenuBar(QMenuBar):
     def __init__(self, fonts_, parent):
         super().__init__(parent)
         self.fonts = fonts_
+        self.proxy_style = None  # setStyle does not take ownership, so the style is kept here
         self.apply_font()
 
     def apply_font(self):
         font = self.fonts.font("menu")
         self.setFont(font)
+        # Only the windows11 style needs the replacement, and only when the size differs from the default
+        # look; at the default size the menu bar is drawn exactly as before.
+        wanted = QApplication.style().objectName() == "windows11" and font.pointSizeF() != self.fonts.base.pointSizeF()
+        if wanted and self.proxy_style is None:
+            self.proxy_style = MenuBarFontStyle("windows11")
+            self.setStyle(self.proxy_style)
+        elif not wanted and self.proxy_style is not None:
+            self.setStyle(None)
+            self.proxy_style = None
         # The menu Qt makes for the items that do not fit is a popup too; it takes the menu area's font.
         for menu in self.findChildren(QMenu, options=Qt.FindChildOption.FindDirectChildrenOnly):
             if not isinstance(menu, AreaMenu):

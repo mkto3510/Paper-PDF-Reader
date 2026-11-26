@@ -75,7 +75,7 @@ class Reader(QMainWindow):
 
     def apply_fonts(self):
         """Apply the saved sizes to this window. Each stage runs on its own, so one failure stops no other."""
-        for stage in (self.apply_roots, self.apply_menus, self.apply_translation_fonts):
+        for stage in (self.apply_roots, self.apply_menus, self.apply_translation_fonts, self.chrome.timer.start):
             try:
                 stage()
             except Exception:
@@ -91,7 +91,6 @@ class Reader(QMainWindow):
                 traceback.print_exc()
 
     def apply_menus(self):
-        self.chrome.menus.apply_font()
         for menu in self.findChildren(AreaMenu):
             try:
                 menu.setFont(self.fonts.font("menu"))
@@ -101,6 +100,10 @@ class Reader(QMainWindow):
     def apply_roots(self):
         for widget in (self.tabs.tabBar(), self.tab_list_button):
             widget.setFont(self.fonts.font("tab"))
+        try:
+            self.chrome.apply_fonts()
+        except Exception:
+            traceback.print_exc()
         for index in range(self.tabs.count()):
             try:
                 self.tabs.widget(index).apply_fonts()

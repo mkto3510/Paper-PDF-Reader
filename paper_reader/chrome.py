@@ -195,6 +195,10 @@ class Header(QWidget):
         self.timer = QTimer(self, singleShot=True, interval=0)
         self.timer.timeout.connect(self.fit_tools)
 
+    def apply_fonts(self):
+        self.menus.apply_font()
+        self.menus.setMinimumHeight(self.menus.fontMetrics().height() + 8)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.timer.start()
@@ -286,7 +290,8 @@ class Header(QWidget):
         menu_width = max(self.menus.sizeHint().width(),
                          max((self.menus.actionGeometry(action).right() + 1 for action in self.menus.actions()),
                              default=0))
-        self.window.setMinimumWidth(max(MINIMUM_WIDTH, menu_width, required(maximum_hidden)))
+        wanted = max(MINIMUM_WIDTH, menu_width, required(maximum_hidden))
+        self.window.setMinimumWidth(min(wanted, self.window.screen().availableGeometry().width()))
         hidden = set()
         for pair in self.OVERFLOW_ORDER:
             if required(hidden) <= self.width():
