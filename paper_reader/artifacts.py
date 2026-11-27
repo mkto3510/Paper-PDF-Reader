@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 import pymupdf
+from pypdf.errors import PyPdfError
 from pypdf.generic import ContentStream, DecodedStreamObject, NameObject
 
 
@@ -12,6 +13,9 @@ LAYER_NAME = "PaperPdfReader artifact analysis"
 LAYER_KEY = NameObject("/PaperPdfReaderArtifact")
 OPTIONAL_CONTENT = NameObject("/OC")
 PAINT = {b"Tj", b"TJ", b"'", b'"', b"Do"}
+# pypdf parses about 1 MB of content stream per 1.5 s. A larger stream is nearly always a figure drawn as paths;
+# its artifacts are left unmarked so that the page text does not wait for it.
+MAX_STREAM = 1_000_000
 ARTIFACT_NAME = re.compile(rb"/Artifact(?=[\s/<>\[\]()%]|$)")
 
 
@@ -20,13 +24,21 @@ def _decoded_names(data: bytes) -> bytes:
 
 
 def _mark(data):
+    if len(data) > MAX_STREAM:
+        return None
     stream = DecodedStreamObject()
     stream.set_data(data)
     content = ContentStream(stream, None)
+    try:
+        operations = content.operations
+    except PyPdfError:
+        # pypdf refuses streams past its parsing limits (a figure drawn as millions of path operators, for
+        # example). Its artifacts stay unmarked; the page text is read all the same.
+        return None
     marked = []
     result = []
     changed = False
-    for args, op in content.operations:
+    for args, op in operations:
         if op in (b"BMC", b"BDC"):
             marked.append(bool(args and args[0] == "/Artifact") or bool(marked and marked[-1]))
         elif op == b"EMC" and marked:
