@@ -106,6 +106,7 @@ class PaperView(QAbstractScrollArea):
         self.continuous = True
         self.rtl = False
         self.page = 0
+        self._arrow_page = None
         self.direction = (0, 1)
         self.generation = 0
         self.pending = set()
@@ -232,6 +233,7 @@ class PaperView(QAbstractScrollArea):
         self.restore(anchor)
 
     def _invalidate_pointer_position(self):
+        self._arrow_page = None
         self.viewport_revision += 1
         self.cancel_click_series()
         self.hover_position.emit(None)
@@ -297,6 +299,9 @@ class PaperView(QAbstractScrollArea):
 
     def keyPressEvent(self, event):
         key = event.key()
+        modifiers = event.modifiers()
+        command_modifiers = (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier
+                             | Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.MetaModifier)
         if key == Qt.Key.Key_Delete and self.selected_note and not self.selection_range and not self.highlight_drag:
             if not event.isAutoRepeat():
                 self.note_delete_requested.emit(self.selected_note)
@@ -304,14 +309,51 @@ class PaperView(QAbstractScrollArea):
         elif key == Qt.Key.Key_Escape:
             self.clear_selection()
         elif key in (Qt.Key.Key_PageDown, Qt.Key.Key_PageUp, Qt.Key.Key_Space):
-            back = key == Qt.Key.Key_PageUp or (key == Qt.Key.Key_Space and event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            back = key == Qt.Key.Key_PageUp or (key == Qt.Key.Key_Space and modifiers & Qt.KeyboardModifier.ShiftModifier)
             self.scroll_by(self.viewport().height() * (-1 if back else 1))
-        elif key in (Qt.Key.Key_Down, Qt.Key.Key_Up) and event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+        elif key in (Qt.Key.Key_Down, Qt.Key.Key_Up) and modifiers & Qt.KeyboardModifier.ShiftModifier:
             self.scroll_by(self.viewport().height() * (0.5 if key == Qt.Key.Key_Down else -0.5))
+        elif (self.pages and not modifiers & command_modifiers
+              and key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down)):
+            horizontal = key in (Qt.Key.Key_Left, Qt.Key.Key_Right)
+            bar = self.horizontalScrollBar() if horizontal else self.verticalScrollBar()
+            if self.zoom_mode == "fit" or bar.minimum() == bar.maximum():
+                self._turn_page_with_arrow(-1 if key in (Qt.Key.Key_Left, Qt.Key.Key_Up) else 1)
+                event.accept()
+            else:
+                super().keyPressEvent(event)
         else:
             super().keyPressEvent(event)
 
+    def _turn_page_with_arrow(self, step):
+        viewport = QRectF(self.viewport().rect())
+        page = self._arrow_page
+        if page is None:
+            visible = {}
+            for index in self._visible_pages():
+                rect = self._page_rectangle(index)
+                overlap = viewport.intersected(rect)
+                visible[index] = int(100 * overlap.width() * overlap.height() / (rect.width() * rect.height()))
+            if self.layout_mode == "single" and visible.get(self.page) == 100:
+                page = self.page
+            elif visible:
+                page = max(visible, key=lambda index: (visible[index], -index))
+            else:
+                page = self.current_page()
+
+        target = page + step
+        if target in self.positions and self.row_for[target] == self.row_for[page]:
+            rect = self._page_rectangle(target)
+            overlap = viewport.intersected(rect)
+            if overlap.width() == rect.width() and overlap.height() * 100 >= rect.height():
+                target += step
+        target = max(0, min(target, len(self.pages) - 1))
+        if target != page:
+            self.go_to(target, arrow=True)
+
     def current_page(self):
+        if self._arrow_page is not None:
+            return self._arrow_page
         if not self.pages or not self.continuous:
             return self.page
         center = self.viewport().rect().center()
@@ -325,6 +367,7 @@ class PaperView(QAbstractScrollArea):
     def restore(self, location, point=None):
         if not location or not self.pages:
             return
+        self._arrow_page = None
         index, x, y = location
         index = min(index, len(self.pages) - 1)
         if index not in self.positions:
@@ -399,9 +442,10 @@ class PaperView(QAbstractScrollArea):
         self._layout()
         self.restore(location)
 
-    def go_to(self, index, y=0, x=None):
+    def go_to(self, index, y=0, x=None, *, arrow=False):
         if not 0 <= index < len(self.pages):
             return
+        self._arrow_page = None
         self.input_revision += 1
         self.cancel_click_series()
         self.page = index
@@ -412,9 +456,19 @@ class PaperView(QAbstractScrollArea):
         left, top, width, _ = self.positions[index]
         if not x and not y:
             point = QPointF(0, 0)
-        horizontal = left + point.x() * self.zoom - MARGIN if x is not None else left + width / 2 - self.viewport().width() / 2
-        self.horizontalScrollBar().setValue(round(horizontal))
+        bar = self.horizontalScrollBar()
+        if arrow:
+            # Keep visible pages horizontally in place. Bring a clipped target's left edge into view.
+            if left < bar.value() or left + width > bar.value() + self.viewport().width():
+                bar.setValue(left - MARGIN)
+        else:
+            horizontal = (left + point.x() * self.zoom - MARGIN if x is not None
+                          else left + width / 2 - self.viewport().width() / 2)
+            bar.setValue(round(horizontal))
         self.verticalScrollBar().setValue(round(top + point.y() * self.zoom - MARGIN))
+        if arrow:
+            # A short page or a page in the same spread may share a scroll position with another page.
+            self._arrow_page = index
         self.location_changed.emit()
         self.viewport().update()
 
