@@ -766,7 +766,8 @@ class Reader(QMainWindow):
         lines.extend(f"{self.t(*names)}    {keys}" for names, keys in (
             (("コピー（選択中の本文）", "Copy selected text"), "Ctrl+C"),
             (("すべて選択（注釈一覧では注釈をすべて選択）", "Select all (all annotations in the list)"), "Ctrl+A"),
-            (("スクロール", "Scroll"), "↑ / ↓ / ← / →"),
+            (("PDF 本文をスクロール（全体表示またはその方向にスクロール範囲がなければページ送り）",
+              "Scroll the PDF (turn pages at Fit page or when that axis has no scroll range)"), "↑ / ↓ / ← / →"),
             (("ページ送り", "Page forward / back"), "PageDown / PageUp"),
             (("選択の解除（注釈の編集中は、編集を保存済みの内容に戻す）",
               "Clear the selection (while editing an annotation: revert to the saved comment)"), "Esc"),
