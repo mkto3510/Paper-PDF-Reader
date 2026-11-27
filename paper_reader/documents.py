@@ -33,7 +33,8 @@ class Documents(QObject):
         self.session = PdfSession(self)
         # A second worker that only reads page text quickly. Classifying a page (headers, tables, captions) can
         # keep the main worker busy for seconds, and the text of the next page should not wait behind it.
-        self._quick = None
+        # It starts with the app, so that it is ready by the time the first document has been opened.
+        self._quick = PdfSession(self)
         self.translations = Translations(self, preferences.data["concurrency"])
         self.cache = TileCache()
         self.items = {}
@@ -47,14 +48,11 @@ class Documents(QObject):
 
     @property
     def quick_session(self):
-        if self._quick is None:
-            self._quick = PdfSession(self)
         return self._quick
 
     def shutdown(self):
         self.session.shutdown()
-        if self._quick is not None:
-            self._quick.shutdown()
+        self._quick.shutdown()
 
     def for_path(self, filename):
         path = Path(filename).resolve()
