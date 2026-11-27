@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import replace
+import re
 from time import perf_counter
 import unicodedata
 
@@ -25,6 +26,7 @@ FIGURE_WINDOW = 6
 # Pages whose index lines, reading regions and caption decisions are kept for the scans.
 PAGE_LAYOUTS = 128
 
+CJK = re.compile(r"[　-ヿ㐀-鿿＀-￯]")
 _SPACING_ACCENTS = {"´": "\u0301", "ˆ": "\u0302", "˜": "\u0303",
                     "¨": "\u0308", "¸": "\u0327", "ˇ": "\u030c", "˚": "\u030a"}
 
@@ -98,7 +100,9 @@ def _rejoin_word_pieces(lines, single_glyph=False):
         glyphs = list(chain[0].glyphs)
         for previous, line in zip(chain, chain[1:]):
             gap = line.box[0] - previous.box[2]
-            if gap > max(previous.size, line.size) * .15 and glyphs[-1].text.strip() and line.glyphs[0].text.strip():
+            # Japanese and Chinese text has no spaces; a gap there is letter spacing or justification.
+            if (gap > max(previous.size, line.size) * .15 and glyphs[-1].text.strip() and line.glyphs[0].text.strip()
+                    and not CJK.match(glyphs[-1].text[-1:]) and not CJK.match(line.glyphs[0].text[:1])):
                 box = (previous.box[2], min(previous.box[1], line.box[1]), line.box[0], max(previous.box[3], line.box[3]))
                 quad = (((box[0], box[1]), (box[2], box[1]), (box[0], box[3]), (box[2], box[3]))
                         if glyphs[-1].quad else ())
@@ -110,16 +114,9 @@ def _rejoin_word_pieces(lines, single_glyph=False):
         count = sum(len(line.glyphs) for line in chain)
         size = sum(line.size * len(line.glyphs) for line in chain) / count
         joined.append(replace(chain[0], glyphs=tuple(glyphs), box=box, size=size))
-    block = 0
-    for index, line in enumerate(joined):
-        if index:
-            above = joined[index - 1]
-            size = max(above.size, line.size)
-            below = (line.horizontal and above.horizontal and -size * .2 <= line.box[1] - above.box[3] <= size * .8
-                     and min(line.box[2], above.box[2]) > max(line.box[0], above.box[0])
-                     and abs(line.size - above.size) <= size * .1)
-            block += not below
-        joined[index] = replace(line, paragraph=block)
+    # Each joined line keeps the block of its first piece. Blocks are not merged by position: the analysis reads
+    # "same block" as the PDF's own grouping, and a line under a figure's tick labels would otherwise look like
+    # the continuation of them.
     return joined
 
 
