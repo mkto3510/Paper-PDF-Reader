@@ -255,6 +255,10 @@ class DocumentPane(QWidget):
             self.view.clear_selection()
 
     @property
+    def history(self):
+        return self.navigation.entries
+
+    @property
     def history_index(self):
         return self.navigation.index
 
