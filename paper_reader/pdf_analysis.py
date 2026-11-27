@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import replace
+import re
 from time import perf_counter
 import unicodedata
 
@@ -16,7 +17,8 @@ from .citations import END, HEADING, Reference, ReferenceIndex, citation_at
 from .layout import PageLayout
 from .paragraphs import enumerate_paragraphs
 from .search import find_page
-from .selection import Glyph, Line, bounds, correct_stream_order, edge_band, furniture_key, reading_regions, select
+from .selection import (Glyph, Line, bounds, correct_stream_order, edge_band, furniture_key, reading_order,
+                        reading_regions, select)
 
 
 # Pages on each side of a figure mention that figure_nearby reads before the full scan is needed.
@@ -24,6 +26,7 @@ FIGURE_WINDOW = 6
 # Pages whose index lines, reading regions and caption decisions are kept for the scans.
 PAGE_LAYOUTS = 128
 
+CJK = re.compile(r"[　-ヿ㐀-鿿＀-￯]")
 _SPACING_ACCENTS = {"´": "\u0301", "ˆ": "\u0302", "˜": "\u0303",
                     "¨": "\u0308", "¸": "\u0327", "ˇ": "\u030c", "˚": "\u030a"}
 
@@ -60,6 +63,61 @@ def _is_raised(span, y, base):
     if count <= len(span["chars"]):
         return False  # the main text of the line is never a superscript
     return bool(span["flags"] & 1) or (span["size"] <= size * .8 and y < baseline - size * .15)
+
+
+def _continues_word(a, b):
+    """Tell whether line b goes on from line a on the same printed line, a word gap to its right."""
+    if not (a.horizontal and b.horizontal) or abs(a.size - b.size) > max(a.size, b.size) * .15:
+        return False
+    size = max(a.size, b.size)
+    height_a, height_b = a.box[3] - a.box[1], b.box[3] - b.box[1]
+    same_row = (abs(a.box[1] + a.box[3] - b.box[1] - b.box[3]) / 2 <= size * .2
+                and abs(height_a - height_b) <= size * .25)
+    return same_row and -size * .15 <= b.box[0] - a.box[2] <= size
+
+
+def _rejoin_word_pieces(lines, single_glyph=False):
+    """Join lines that a PDF stores as one text object per word back into printed lines.
+
+    Some publishers write every word as its own text object, and MuPDF then returns each word as a line of its own
+    block. Such words look like table cells or repeated headers to the analysis, and selections lose them. Only a
+    page where many lines continue the line before them on the same row is changed, so pages MuPDF reads as whole
+    lines keep their lines and blocks. The joined lines are grouped into blocks again by their vertical spacing.
+    """
+    if len(lines) < 20:
+        return lines
+    joins = sum(_continues_word(a, b) for a, b in zip(lines, lines[1:]))
+    if joins < 20 or joins < len(lines) * .3:
+        return lines
+    chains = []
+    for line in lines:
+        if chains and _continues_word(chains[-1][-1], line):
+            chains[-1].append(line)
+        else:
+            chains.append([line])
+    joined = []
+    for chain in chains:
+        glyphs = list(chain[0].glyphs)
+        for previous, line in zip(chain, chain[1:]):
+            gap = line.box[0] - previous.box[2]
+            # Japanese and Chinese text has no spaces; a gap there is letter spacing or justification.
+            if (gap > max(previous.size, line.size) * .15 and glyphs[-1].text.strip() and line.glyphs[0].text.strip()
+                    and not CJK.match(glyphs[-1].text[-1:]) and not CJK.match(line.glyphs[0].text[:1])):
+                box = (previous.box[2], min(previous.box[1], line.box[1]), line.box[0], max(previous.box[3], line.box[3]))
+                quad = (((box[0], box[1]), (box[2], box[1]), (box[0], box[3]), (box[2], box[3]))
+                        if glyphs[-1].quad else ())
+                glyphs.append(Glyph(" ", box, quad, glyphs[-1].artifact and line.glyphs[0].artifact))
+            glyphs.extend(line.glyphs)
+        box = bounds(line.box for line in chain)
+        if single_glyph:
+            glyphs = [Glyph("".join(glyph.text for glyph in glyphs), box, ())]
+        count = sum(len(line.glyphs) for line in chain)
+        size = sum(line.size * len(line.glyphs) for line in chain) / count
+        joined.append(replace(chain[0], glyphs=tuple(glyphs), box=box, size=size))
+    # Each joined line keeps the block of its first piece. Blocks are not merged by position: the analysis reads
+    # "same block" as the PDF's own grouping, and a line under a figure's tick labels would otherwise look like
+    # the continuation of them.
+    return joined
 
 
 def _join_spaced_headings(lines):
@@ -194,7 +252,7 @@ class PdfAnalysis:
                     lines.append(Line((Glyph(text, box, ()),), box, size,
                                       line["wmode"] == 0 and abs(line["dir"][1]) < .15, block_index,
                                       leading_bold=leading_bold))
-        lines = _close_spaced_letters(_join_spaced_headings(lines))
+        lines = _close_spaced_letters(_join_spaced_headings(_rejoin_word_pieces(lines, single_glyph=True)))
         width, height = page.rect.width, page.rect.height
         if page.rotation in (90, 270):
             width, height = height, width
@@ -376,7 +434,7 @@ class PdfAnalysis:
                     lines.append(Line(composed, bounds(g.box for g in composed),
                                       sum(sizes) / len(sizes), horizontal, block_index,
                                       leading_bold=leading_bold))
-        return lines
+        return _rejoin_word_pieces(lines)
 
     def _display_lines(self, lines, page):
         if not page.rotation:
@@ -438,6 +496,20 @@ class PdfAnalysis:
         if len(cache) > (12 if quads else 6):
             cache.popitem(last=False)
         return result
+
+    def quick_text(self, index):
+        """The lines of a page in reading order, before classification.
+
+        This is a provisional answer for hit testing and the blue selection while `text` is still deciding which
+        lines are headers, tables or captions: every line has an empty kind, and the list has no furniture moved
+        to its ends. Line indices therefore differ from those of `text`; callers match them up by position.
+        """
+        page = self.read_page(index)
+        width = page.rect.width
+        if page.rotation in (90, 270):
+            width = page.rect.height
+        lines = self._read_lines(page, False)
+        return self._display_lines(reading_order(lines, width), page)
 
     def paragraphs(self, first=0, last=None):
         """List the paragraphs of pages first..last that are handed to translation (see paragraphs.py)."""

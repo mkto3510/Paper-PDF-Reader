@@ -31,6 +31,10 @@ class Documents(QObject):
         self.preferences = preferences
         self.has_comment_drafts = has_comment_drafts
         self.session = PdfSession(self)
+        # A second worker that only reads page text quickly. Classifying a page (headers, tables, captions) can
+        # keep the main worker busy for seconds, and the text of the next page should not wait behind it.
+        # It starts with the app, so that it is ready by the time the first document has been opened.
+        self._quick = PdfSession(self)
         self.translations = Translations(self, preferences.data["concurrency"])
         self.cache = TileCache()
         self.items = {}
@@ -41,6 +45,14 @@ class Documents(QObject):
         self.watcher.directoryChanged.connect(lambda _: self.debounce.start())
         self.debounce.timeout.connect(self._changed)
         preferences.changed.connect(self._preferences_changed)
+
+    @property
+    def quick_session(self):
+        return self._quick
+
+    def shutdown(self):
+        self.session.shutdown()
+        self._quick.shutdown()
 
     def for_path(self, filename):
         path = Path(filename).resolve()
@@ -112,6 +124,8 @@ class Document(QObject):
         self.external = False
         self.external_message = ""
         self.stamp = None
+        self.password = ""
+        self.quick_open = False
         self.revision = self.saved_revision = 0
         self.can_undo = self.can_redo = False
         self.mutating = self.saving = 0
@@ -190,6 +204,9 @@ class Document(QObject):
             self.generation += 1
             self.info = info
             self.stamp = info["signature"]
+            if password is not None:
+                self.password = password
+            self.open_quick_reader()
             self.external = False
             self.external_message = ""
             self.revision = self.saved_revision = 0
@@ -215,6 +232,32 @@ class Document(QObject):
                 callback(info, None)
 
         self.request(command, args, ready, priority=-10)
+
+    def open_quick_reader(self):
+        """Open the same file, as it was when the main worker read it, in the quick worker."""
+        self.quick_open = True
+        self.store.quick_session.request(
+            "document", (self.identifier, "open", (str(self.path), self.password, self.stamp)),
+            lambda *_: None, priority=-10)
+
+    def quick_request(self, name, args, callback, *, priority=0, needed=None, key=None):
+        """Like `request`, for the quick worker. Its error replies only mean that the quick answer is
+        unavailable (the file changed since it was opened, for example); the main worker's answer still comes."""
+        generation = self.generation
+
+        def current():
+            return (self.quick_open and not self.disposed and generation == self.generation and not self.loading
+                    and (needed is None or needed()))
+
+        def done(value, error):
+            if not self.disposed and generation == self.generation:
+                callback(value, error)
+
+        self.store.quick_session.request("document", (self.identifier, name, args), done, priority=priority,
+                                         key=key, needed=current)
+
+    def promote_quick(self, key, priority):
+        self.store.quick_session.promote(key, priority)
 
     def update_rules(self):
         latest = self.store.preferences.data["rules"]
@@ -650,3 +693,6 @@ class Document(QObject):
         self.translation_sources.clear()
         self.detach_all_jobs(cancel=True)
         self.request("close", (), lambda *_: None, priority=-10)
+        if self.quick_open:
+            self.store.quick_session.request("document", (self.identifier, "close", ()), lambda *_: None,
+                                             priority=-10)

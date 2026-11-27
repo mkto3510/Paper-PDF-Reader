@@ -110,7 +110,7 @@ class Application:
             self.server.close()
         for doc in tuple(self.documents.items.values()):
             doc.detach_all_jobs(cancel=True)
-        self.documents.session.shutdown()
+        self.documents.shutdown()
         if self.lock:
             self.lock.unlock()
 

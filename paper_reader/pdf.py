@@ -38,9 +38,12 @@ class PdfEngine:
         self.state_ids = count(1)
         self.saved_revision = 0
 
-    def open(self, filename: str, password: str = ""):
+    def open(self, filename: str, password: str = "", expected=None):
         path = Path(filename).resolve(strict=True)
         stamp = _signature(path)
+        if expected is not None and stamp != tuple(expected):
+            # A second reader of the same document must see the file the first one saw.
+            raise ValueError("PDF changed while it was being opened.")
         # MuPDF's Windows file handles prevent atomic replacement of an open PDF.
         # Keep a private disk snapshot so editors can freely replace the original.
         with NamedTemporaryFile(suffix=".pdf", dir=self.working_directory, delete=False) as handle:
@@ -248,6 +251,9 @@ class PdfEngine:
 
     def text(self, index, *, quads=True):
         return self.analysis.text(index, quads=quads)
+
+    def quick_text(self, index):
+        return self.analysis.quick_text(index)
 
     def paragraphs(self, first=0, last=None):
         return self.analysis.paragraphs(first, last)
