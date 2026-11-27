@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QToolButton, QVBoxLayout, QWidget,
 )
 
+from .font_ui import AreaMenu
 from .icons import icon, swatch
 from .sidebar import ButtonGrid, WrappedLabel, wrapped_document
 
@@ -52,7 +53,7 @@ class Card(QFrame):
         header.addStretch(1)
         self.color = QToolButton()
         self.color.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        colors = QMenu(self.color)
+        colors = AreaMenu(self.pane.fonts, self.color)
         colors.aboutToShow.connect(lambda: self.show_colors(colors))
         self.color.setMenu(colors)
         header.addWidget(self.color)
@@ -62,14 +63,13 @@ class Card(QFrame):
         self.comment = WrappedLabel()
         layout.addWidget(self.comment)
         self.editor = QPlainTextEdit()
-        self.editor_minimum = max(66, self.editor.fontMetrics().lineSpacing() * 4 + 10)
-        self.editor.setFixedHeight(self.editor_minimum)
         self.editor.setMinimumWidth(0)
         self.editor.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.editor.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         self.editor.document().modificationChanged.connect(self.pane.document.drafts_changed)
         self.editor.textChanged.connect(self.editor_changed)
         layout.addWidget(self.editor)
+        self.editor.setFixedHeight(self.editor_minimum)
         self.commit, self.translate, self.delete = QPushButton(), QPushButton(), QPushButton()
         self.commit.clicked.connect(self.commit_comment)
         self.translate.clicked.connect(lambda: self.pane.translate_note(self.key))
@@ -87,6 +87,11 @@ class Card(QFrame):
         self.job_action.clicked.connect(self.job_clicked)
         layout.addWidget(self.job_action)
         self.relabel()
+
+    @property
+    def editor_minimum(self):
+        # Measured with the editor's own font, so it follows the annotation area's size.
+        return max(66, self.editor.fontMetrics().lineSpacing() * 4 + 10)
 
     def relabel(self):
         t = self.pane.t
@@ -272,7 +277,7 @@ class Notes(QWidget):
         self.bulk_color = QToolButton()
         self.bulk_color.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.bulk_color.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        colors = QMenu(self.bulk_color)
+        colors = AreaMenu(self.pane.fonts, self.bulk_color)
         colors.aboutToShow.connect(lambda: self.show_bulk_colors(colors))
         self.bulk_color.setMenu(colors)
         self.bulk_translate, self.bulk_delete = QPushButton(), QPushButton()
@@ -459,6 +464,16 @@ class Notes(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         self.layout_timer.start()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange and hasattr(self, "layout_timer"):
+            # Forget the measured card heights; layout_cards measures them again and keeps the scroll anchor.
+            side = max(25, self.fontMetrics().height() + 5)
+            for button in self.colors.values():
+                button.setFixedSize(side, side)
+            self.width_used = 0
+            self.layout_timer.start()
 
     def reset_document(self):
         for key in list(self.cards):

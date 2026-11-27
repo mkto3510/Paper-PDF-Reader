@@ -8,11 +8,12 @@ from unittest.mock import patch
 import pymupdf as mu
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMenu
+from PySide6.QtWidgets import QApplication
 
 from check_chrome_notes import wait
 from paper_reader import APP_NAME
 from paper_reader.application import Application
+from paper_reader.font_ui import AreaMenu
 from paper_reader.citations import Citation, citation_spans, normalize
 from paper_reader.pdf import PdfEngine
 from paper_reader.pane import HOVER_PRIORITY
@@ -253,13 +254,13 @@ def check_window(app, root, path):
 
         menus = []
 
-        class RecordingMenu(QMenu):
+        class RecordingMenu(AreaMenu):
             def exec(self, *args):
                 menus.append(args)
 
         prose_point = view._project(0, prose).toPoint()
         with patch.object(doc, "request", side_effect=delay_links), \
-                patch("paper_reader.pane.QMenu", RecordingMenu):
+                patch("paper_reader.pane.AreaMenu", RecordingMenu):
             pane.links.pop(0, None)
             pane.context_menu(view.viewport().mapToGlobal(prose_point), (0, *prose))
             assert len(page_links) == 1 and not menus

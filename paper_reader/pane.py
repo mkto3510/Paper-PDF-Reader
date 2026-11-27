@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from urllib.parse import urlencode
 
-from PySide6.QtCore import QElapsedTimer, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QElapsedTimer, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QSizePolicy, QSplitter,
@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 from shiboken6 import isValid
 
 from .dialogs import TranslationDialog
+from .font_ui import AreaMenu
 from .icons import icon, swatch
 from .notes import COLORS, Notes, add_color_actions, color_menu
 from .selection import bounds
@@ -33,6 +34,7 @@ class DocumentPane(QWidget):
     def __init__(self, window, document):
         super().__init__()
         self.window, self.document = window, document
+        self.fonts = window.fonts
         self.preferences = window.preferences
         self.history = []
         self.history_index = -1
@@ -134,7 +136,7 @@ class DocumentPane(QWidget):
         self.search_options = QToolButton()
         self.search_options.setText("Aa")
         self.search_options.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        menu = QMenu(self.search_options)
+        menu = AreaMenu(self.fonts, self.search_options)
         self.search_options.setMenu(menu)
         self.options = [QAction(menu, checkable=True) for _ in range(4)]
         for option in self.options:
@@ -147,6 +149,17 @@ class DocumentPane(QWidget):
         escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         escape.activated.connect(self.close_search)
         return panel
+
+    def apply_fonts(self):
+        self.outline.setFont(self.fonts.font("outline"))
+        self.notes.setFont(self.fonts.font("notes"))
+        self.lookup_notice.setFont(self.fonts.font("notice"))
+        self.lookup_notice.adjustSize()
+
+    def apply_icon_size(self):
+        edge = self.fonts.edge()
+        for button in (self.prev_match, self.next_match):
+            button.setIconSize(QSize(edge, edge))
 
     def relabel(self):
         self.query.setPlaceholderText(self.t("文書内で検索", "Find in document"))
@@ -162,7 +175,7 @@ class DocumentPane(QWidget):
             (self.search_options, None, ("検索オプション", "Find options")),
         ):
             if symbol:
-                button.setIcon(icon(self, symbol))
+                button.setIcon(icon(self, symbol, self.fonts.edge()))
             button.setToolTip(self.t(*labels))
             button.setAccessibleName(button.toolTip())
         self.outline.setAccessibleName(self.t("目次", "Outline"))
@@ -629,7 +642,7 @@ class DocumentPane(QWidget):
         if len(citation.keys) == 1:
             visit(targets[0])
             return
-        menu = self.lookup_menu = QMenu(self)
+        menu = self.lookup_menu = AreaMenu(self.fonts, self)
         menu.setAccessibleName(self.t("移動先を選択", "Choose a destination"))
         for key, entry in zip(citation.keys, targets):
             if entry:
@@ -663,7 +676,7 @@ class DocumentPane(QWidget):
             if not current():
                 return
             t = self.t
-            menu = QMenu(self)
+            menu = AreaMenu(self.fonts, self)
             if self.view.selection_range:
                 menu.addAction(t("選択範囲をコピー", "Copy selection"), self.copy_selection)
                 for symbol, label, callback in (

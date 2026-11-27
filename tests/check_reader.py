@@ -144,6 +144,10 @@ def main():
         (root / "settings.json").write_text(json.dumps(old), encoding="utf-8")
         controller = Application(app, root)
         try:
+            # A settings file from before the font sizes loads with the new defaults and is not rewritten.
+            assert [controller.preferences.data[key] for key in ("fontOutline", "fontNotes", "fontTranslation",
+                                                                  "fontMenu", "fontDialog")] == [130, 130, 130, 100, 100]
+            assert "fontNotes" not in json.loads((root / "settings.json").read_text(encoding="utf-8"))
             window = controller.new_window()
             window.open_paths([str(path)])
             wait(lambda: window.pane and window.pane.view.cache.tiles, "A visible tile was not painted")

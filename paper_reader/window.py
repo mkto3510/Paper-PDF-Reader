@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import traceback
 
 from PySide6.QtCore import QEvent, QEventLoop, QSignalBlocker, QTimer, Qt
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
 from . import APP_NAME
 from .chrome import MINIMUM_WIDTH, DocumentTabs, Header, TabList
 from .dialogs import AboutDialog, SettingsDialog, ask
+from .font_ui import AreaMenu
 from .icons import icon
 from .pane import DocumentPane
 from .view import ACTUAL_SIZE
@@ -36,12 +38,15 @@ class Reader(QMainWindow):
     def __init__(self, controller):
         super().__init__()
         self.controller = controller
+        self.fonts = controller.fonts
+        self.setFont(self.fonts.base_font())  # the ground: parts without an area of their own keep this size
         self.preferences = controller.preferences
         self.setMinimumWidth(MINIMUM_WIDTH)
         self.resize(1180, 820)
         self.setWindowTitle(APP_NAME)
         self.setAcceptDrops(True)
         self.language = None
+        self.icon_edge = None
         self.actions = {}
         self.action_groups = []
         self.opening = set()
@@ -65,7 +70,55 @@ class Reader(QMainWindow):
         bar.tabMoved.connect(lambda *_: self.tab_list.refresh() if self.tab_list.isVisible() else None)
         self.last_pane = None
         self.preferences.changed.connect(self.refresh_settings)
+        self.preferences.fonts_changed.connect(self.apply_fonts)
         self.refresh_settings()
+        self.apply_fonts()
+
+    def apply_fonts(self):
+        """Apply the saved sizes to this window. Each stage runs on its own, so one failure stops no other."""
+        for stage in (self.apply_roots, self.apply_menus, self.apply_icon_sizes, self.apply_translation_fonts,
+                      self.chrome.timer.start):
+            try:
+                stage()
+            except Exception:
+                traceback.print_exc()
+
+    def apply_translation_fonts(self):
+        for index in range(self.tabs.count()):
+            try:
+                dialog = self.tabs.widget(index).annotation_dialog
+                if dialog is not None:
+                    dialog.apply_font()
+            except Exception:
+                traceback.print_exc()
+
+    def apply_icon_sizes(self):
+        self.chrome.apply_icon_size()
+        for index in range(self.tabs.count()):
+            try:
+                self.tabs.widget(index).apply_icon_size()
+            except Exception:
+                traceback.print_exc()
+
+    def apply_menus(self):
+        for menu in self.findChildren(AreaMenu):
+            try:
+                menu.setFont(self.fonts.font("menu"))
+            except Exception:
+                traceback.print_exc()
+
+    def apply_roots(self):
+        for widget in (self.tabs.tabBar(), self.tab_list_button):
+            widget.setFont(self.fonts.font("tab"))
+        try:
+            self.chrome.apply_fonts()
+        except Exception:
+            traceback.print_exc()
+        for index in range(self.tabs.count()):
+            try:
+                self.tabs.widget(index).apply_fonts()
+            except Exception:
+                traceback.print_exc()
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -135,7 +188,7 @@ class Reader(QMainWindow):
                    "find_previous": "previous", "find_next": "next", "outline": "outline",
                    "notes": "notes", "save": "save", "save_as": "save", "properties": "properties"}
         if key in symbols:
-            action.setIcon(icon(self, symbols[key]))
+            action.setIcon(icon(self, symbols[key], self.icon_edge))
             action.setIconVisibleInMenu(True)
         if shortcut:
             action.setShortcut(QKeySequence(shortcut))
@@ -148,8 +201,10 @@ class Reader(QMainWindow):
         return action
 
     def refresh_settings(self):
-        if self.language != self.preferences.data["language"]:
+        # The actions' icons carry the toolbar's size, so they are made again when the language or that size changes.
+        if self.language != self.preferences.data["language"] or self.icon_edge != self.fonts.edge():
             self.language = self.preferences.data["language"]
+            self.icon_edge = self.fonts.edge()
             self.build_menu()
         self.tab_list_button.setArrowType(Qt.ArrowType.DownArrow)
         self.tab_list_button.setToolTip(self.t("開いている PDF の一覧", "Open PDFs"))
@@ -243,7 +298,7 @@ class Reader(QMainWindow):
             ("all", ("すべて選択", "Select all"), "view.select_all"),
         ):
             self.action(selection, key, names, lambda method=command: self.dispatch(method))
-        settings = self.action(None, "preferences", ("設定", "Settings"), self.open_settings, required=False)
+        settings = self.action(None, "preferences", ("設定", "Settings"), self.open_settings, "Ctrl+,", False)
         menu.insertAction(help_.menuAction(), settings)
         self.action(help_, "keys", ("ショートカット", "Keyboard shortcuts"), self.shortcuts, required=False)
         self.action(help_, "about", (f"{APP_NAME} について", f"About {APP_NAME}"), self.about, required=False)
@@ -366,6 +421,7 @@ class Reader(QMainWindow):
         pane.message.connect(self.show_message)
         doc.drafts_changed.connect(pane.location_changed)
         self.chrome.search.addWidget(pane.search_panel)
+        pane.apply_fonts()
         index = self.tabs.addTab(pane, tab_title(doc.path.name))
         self.tabs.setCurrentIndex(index)
         if self.pane is pane:
@@ -395,7 +451,7 @@ class Reader(QMainWindow):
         if index < 0:
             return
         # The menu works on the tab that was clicked; it does not switch to it (and so never asks to save).
-        menu = QMenu(self)
+        menu = AreaMenu(self.fonts, self)
         menu.addAction(self.t("タブを複製", "Duplicate tab"), lambda: self.duplicate(False, index))
         menu.addAction(self.t("別ウィンドウに複製", "Duplicate in new window"), lambda: self.duplicate(True, index))
         menu.addSeparator()

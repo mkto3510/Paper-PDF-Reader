@@ -7,15 +7,15 @@ import json
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import QPoint, QSize, QTimer, Qt
+from PySide6.QtCore import QEvent, QPoint, QSize, QTimer, Qt
 from PySide6.QtGui import QColor, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea, QSpinBox,
+    QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea, QSpinBox,
     QTabWidget, QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from . import APP_NAME, VERSION
+from . import APP_NAME, VERSION, font_ui, fonts
 from .analysis_rules import LABELS, RULES
 from .icons import swatch
 from .notes import COLORS
@@ -146,14 +146,33 @@ def dialog_corner(work_area, frame_size, preferred):
     return QPoint(x, y)
 
 
+AREA_TEXT = {
+    "menu": (("メニュー", "メニューバーと、開いたメニュー"), ("Menus", "the menu bar and opened menus")),
+    "toolbar": (("ツールバー", "ボタンの行、ページ欄、検索の一致数"),
+                ("Toolbar", "the button row, page box and match count")),
+    "tab": (("タブ", "タブの並びと、開いている PDF の一覧"), ("Tabs", "the tab strip and the list of open PDFs")),
+    "outline": (("目次", "左の目次"), ("Outline", "the table of contents")),
+    "notes": (("注釈", "注釈のパネルとカード"), ("Annotations", "the annotation panel and cards")),
+    "translation": (("翻訳ウィンドウ", "翻訳の結果の窓"), ("Translation window", "the translation result window")),
+    "dialog": (("ダイアログ", "設定、プロパティ、確認の窓、ツールチップなど（メインウィンドウの本体は変わりません）"),
+               ("Dialogs", "Settings, Properties, message boxes, tooltips and the rest "
+                           "(the main window itself is not affected)")),
+    "notice": (("お知らせ", "一時的な通知"), ("Notices", "temporary messages")),
+}
+
+
 class SettingsDialog(QDialog):
     def __init__(self, window):
         super().__init__(window)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.fonts = window.fonts
+        self.setFont(self.fonts.font("dialog"))
         self.preferences = window.preferences
         self.translate = self.preferences.tr_text
         self.translations = window.controller.documents.translations
         self.data = deepcopy(self.preferences.data)
+        # The sizes as they were when this dialog opened; Save writes only the rows that differ.
+        self.font_opened = {area.key: self.data[area.key] for area in fonts.AREAS}
         self.profile_key = None
         self.stop_test_handle = None
         self.finished.connect(self.stop_test)
@@ -208,12 +227,61 @@ class SettingsDialog(QDialog):
         scroller.setWidgetResizable(True)
         scroller.setWidget(rules_page)
         tabs.addTab(scroller, t("本文の除外", "Text exclusions"))
+        tabs.addTab(self.font_tab(), t("文字サイズ", "Font size"))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Save).setText(t("保存", "Save"))
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(t("キャンセル", "Cancel"))
         buttons.accepted.connect(self.commit)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        font_ui.fit_dialog_font(self, self.fonts, window)
+
+    def font_tab(self):
+        t = self.translate
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        inner = QWidget()
+        grid = QGridLayout(inner)
+        self.font_rows = {}
+        language = 1 if self.data["language"] == "en" else 0
+        for row, area in enumerate(fonts.AREAS):
+            name, note = AREA_TEXT[area.id][language]
+            label = QLabel(f"{name}: {note}")
+            label.setWordWrap(True)
+            box = spin(fonts.MINIMUM_PERCENT, fonts.MAXIMUM_PERCENT, self.data[area.key])
+            box.setSuffix("%")
+            size = QLabel()
+            sample = QLabel(t("見本 Aa あ 123", "Sample Aa 123"))
+            reset = QPushButton(t(f"初期値 {area.default}%", f"Default {area.default}%"))
+            box.valueChanged.connect(lambda _=0, area=area: self.show_font_row(area))
+            reset.clicked.connect(lambda _=False, area=area: self.font_rows[area.id][0].setValue(area.default))
+            for column, widget in enumerate((label, box, size, sample, reset)):
+                grid.addWidget(widget, row, column)
+            grid.setColumnStretch(0, 1)
+            self.font_rows[area.id] = (box, size, sample)
+            self.show_font_row(area)
+        scroller = QScrollArea()
+        scroller.setWidgetResizable(True)
+        scroller.setWidget(inner)
+        outer.addWidget(scroller, 1)
+        everything = QPushButton(t("すべて初期値へ戻す", "Reset all to defaults"))
+        everything.clicked.connect(lambda: [self.font_rows[area.id][0].setValue(area.default)
+                                            for area in fonts.AREAS])
+        outer.addWidget(everything, 0, Qt.AlignmentFlag.AlignLeft)
+        exceptions = QLabel(t("次は、文字サイズを変えられません: ファイルを選ぶ窓、ウィンドウの題名、起動時の失敗を知らせる窓。"
+                              "設定画面は、画面に収まる大きさに自動で縮みます。",
+                              "These cannot change size: file dialogs, window titles, and startup error messages. "
+                              "The Settings window shrinks automatically to fit the screen."))
+        exceptions.setWordWrap(True)
+        outer.addWidget(exceptions)
+        return page
+
+    def show_font_row(self, area):
+        box, size, sample = self.font_rows[area.id]
+        pt = self.fonts.pt(area.id, box.value())
+        at_floor = area.floored and pt == fonts.FLOOR_PT and box.value() * self.fonts.base.pointSizeF() / 100 < pt
+        size.setText(self.translate(f"{pt:g} pt（下限）", f"{pt:g} pt (minimum)") if at_floor else f"{pt:g} pt")
+        sample.setFont(self.fonts.font(area.id, box.value()))
 
     def service_tab(self):
         t = self.translate
@@ -259,8 +327,8 @@ class SettingsDialog(QDialog):
         self.prompts = {key: QTextEdit() for key in ("systemPrompt", "prompt", "extra")}
         for key, ja, en in (("systemPrompt", "システムプロンプト", "System prompt"),
                             ("prompt", "ユーザープロンプト", "User prompt"), ("extra", "追加 JSON", "Extra JSON")):
-            self.prompts[key].setFixedHeight(64)
             form.addRow(t(ja, en), self.prompts[key])
+        self.fit_prompt_heights()
         variables = QLabel(t("プロンプトでは ${sourceText}（原文）・${langFrom}（原文の言語）・${langTo}（翻訳先の言語）を使えます。",
                              "Prompts can use ${sourceText}, ${langFrom} (source language) and ${langTo} (target language)."))
         variables.setWordWrap(True)
@@ -268,6 +336,17 @@ class SettingsDialog(QDialog):
         self.profiles.currentIndexChanged.connect(self.profile_selected)
         self.reset_profiles(self.data["activeProfile"])
         return widget
+
+    def fit_prompt_heights(self):
+        """The three prompt boxes show about three lines: 64 px at 9 pt, taller for a larger font."""
+        height = max(64, self.fontMetrics().lineSpacing() * 3 + 10)
+        for editor in self.prompts.values():
+            editor.setFixedHeight(height)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange and hasattr(self, "prompts"):
+            self.fit_prompt_heights()
 
     def store_profile(self):
         if self.profile_key is None:
@@ -428,6 +507,11 @@ class SettingsDialog(QDialog):
         data.update({key: field.text().strip() for key, field in self.languages.items()})
         data["rules"] = {key: field.isChecked() for key, field in self.checks.items()}
         data["rules"].update(edge_band=self.edge_range.value(), small_text=self.small_size.value())
+        # Font sizes: a row changed here is written; any other row keeps the latest saved value, so a
+        # save from another window is not undone.
+        for area in fonts.AREAS:
+            value = self.font_rows[area.id][0].value()
+            data[area.key] = value if value != self.font_opened[area.key] else self.preferences.data[area.key]
         try:
             self.preferences.save(data)
         except OSError as error:
@@ -441,6 +525,7 @@ class TranslationDialog(QDialog):
         super().__init__(pane, Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.pane, self.document = pane, pane.document
+        self.fonts = pane.fonts
         self.preferences = pane.preferences
         self.translations = self.document.store.translations
         self.choices, self.key = choices, key
@@ -451,8 +536,11 @@ class TranslationDialog(QDialog):
         self.anchor = point
         self.preferred_size = QSize(*self.preferences.data["dialogSize"])
         self.fitting = False
+        self.applying_font = False  # set while a font change reflows the window, which is not a user resize
+        self.excerpt = None
         self.work_screen = None
         self.screen_monitoring = False
+        self.setFont(self.fonts.font("translation"))
         self.resize(self.preferred_size)
         t = pane.t
         self.setWindowTitle(t("翻訳", "Translate"))
@@ -502,15 +590,15 @@ class TranslationDialog(QDialog):
             form.addRow(summary)
             details = QPushButton(t("除外した箇所を表示", "Show excluded text"))
             details.setCheckable(True)
-            excerpt = QTextEdit()
+            excerpt = self.excerpt = QTextEdit()
             excerpt.setReadOnly(True)
             excerpt.setPlainText("\n\n".join(headings[key] + "\n" + "\n".join(parts)
                                              for key, parts in items.items()))
-            excerpt.setMaximumHeight(110)
             excerpt.hide()
             details.toggled.connect(excerpt.setVisible)
             form.addRow(details)
             form.addRow(excerpt)
+            self.fit_excerpt()
             include = QCheckBox(t("除外した箇所も翻訳に含める", "Include excluded text in translation"))
             include.toggled.connect(self.include)
             form.addRow(include)
@@ -554,8 +642,22 @@ class TranslationDialog(QDialog):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.isVisible() and not self.fitting and self.work_screen is not None:
+        if self.isVisible() and not self.fitting and not self.applying_font and self.work_screen is not None:
             self.preferred_size = event.size()
+
+    def apply_font(self):
+        """Take a new translation-area size. The reflow it causes must not replace the saved window size."""
+        self.applying_font = True
+        try:
+            self.setFont(self.fonts.font("translation"))
+            self.layout().activate()
+            self.fit_excerpt()
+        finally:
+            self.applying_font = False
+
+    def fit_excerpt(self):
+        if self.excerpt is not None:
+            self.excerpt.setMaximumHeight(max(110, self.excerpt.fontMetrics().lineSpacing() * 5 + 10))
 
     def schedule_fit(self, *_):
         QTimer.singleShot(0, self, lambda: self.fit_screen(self.screen()))
