@@ -2,23 +2,23 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import traceback
 
-from PySide6.QtCore import QEvent, QEventLoop, QSignalBlocker, QTimer, Qt
-from PySide6.QtGui import QAction, QActionGroup, QKeySequence
+from PySide6.QtCore import QEvent, QSignalBlocker, QTimer, Qt
 from PySide6.QtWidgets import (
     QDialog, QFileDialog, QFormLayout, QInputDialog, QLabel, QLineEdit, QMainWindow,
-    QMenu, QMessageBox, QTabWidget, QTextEdit, QToolButton, QVBoxLayout,
+    QMessageBox, QTabWidget, QTextEdit, QToolButton, QVBoxLayout,
 )
 
 from . import APP_NAME
 from .chrome import MINIMUM_WIDTH, DocumentTabs, Header, TabList
-from .dialogs import AboutDialog, SettingsDialog, ask
+from .dialogs import AboutDialog
+from .document_save import DocumentSave
 from .font_ui import AreaMenu
-from .icons import icon
 from .pane import DocumentPane
-from .view import ACTUAL_SIZE
+from .reader_menus import ReaderMenus
+from .settings_dialog import SettingsDialog
+from .viewport_layout import ACTUAL_SIZE
 
 
 def tab_title(name):
@@ -47,8 +47,8 @@ class Reader(QMainWindow):
         self.setAcceptDrops(True)
         self.language = None
         self.icon_edge = None
-        self.actions = {}
-        self.action_groups = []
+        self.menus = ReaderMenus(self)
+        self.document_save = DocumentSave(self)
         self.opening = set()
         self.switching = False
         self.tabs = QTabWidget()
@@ -179,33 +179,20 @@ class Reader(QMainWindow):
             else:
                 getattr(pane, name)(*args)
 
-    def action(self, menu, key, names, callback, shortcut="", required=True, check=False):
-        action = QAction(self.t(*names), self)
-        symbols = {"open": "open", "back": "back", "page_previous": "page-up", "page_next": "page-down",
-                   "single": "single", "spread": "spread",
-                   "width": "width", "fit": "fit", "left": "left", "right": "right",
-                   "bigger": "zoom-in", "smaller": "zoom-out", "find": "find",
-                   "find_previous": "previous", "find_next": "next", "outline": "outline",
-                   "notes": "notes", "save": "save", "save_as": "save", "properties": "properties"}
-        if key in symbols:
-            action.setIcon(icon(self, symbols[key], self.icon_edge))
-            action.setIconVisibleInMenu(True)
-        if shortcut:
-            action.setShortcut(QKeySequence(shortcut))
-        action.setCheckable(check)
-        action.triggered.connect(lambda checked=False: callback())
-        if menu is not None:
-            menu.addAction(action)
-        self.addAction(action)
-        self.actions[key] = action, required
-        return action
+    @property
+    def actions(self):
+        return self.menus.actions
+
+    @property
+    def view_menu(self):
+        return self.menus.view_menu
 
     def refresh_settings(self):
         # The actions' icons carry the toolbar's size, so they are made again when the language or that size changes.
         if self.language != self.preferences.data["language"] or self.icon_edge != self.fonts.edge():
             self.language = self.preferences.data["language"]
             self.icon_edge = self.fonts.edge()
-            self.build_menu()
+            self.menus.rebuild()
         self.tab_list_button.setArrowType(Qt.ArrowType.DownArrow)
         self.tab_list_button.setToolTip(self.t("開いている PDF の一覧", "Open PDFs"))
         self.tab_list_button.setAccessibleName(self.tab_list_button.toolTip())
@@ -213,98 +200,6 @@ class Reader(QMainWindow):
         for i in range(self.tabs.count()):
             self.tabs.widget(i).relabel()
         self.update_status()
-
-    def build_menu(self):
-        for action, _ in self.actions.values():
-            self.removeAction(action)
-            action.deleteLater()
-        self.actions.clear()
-        for group in self.action_groups:
-            group.deleteLater()
-        self.action_groups.clear()
-        menu = self.chrome.menus
-        old_menus = [action.menu() for action in menu.actions()]
-        menu.clear()
-        for old in old_menus:
-            if old:
-                old.deleteLater()
-        file, edit, view, go, zoom, selection, help_ = [menu.addMenu(self.t(*names)) for names in (
-            ("ファイル", "File"), ("編集", "Edit"), ("表示", "View"), ("移動", "Go to"), ("ズーム", "Zoom"),
-            ("選択", "Selection"), ("ヘルプ", "Help"),
-        )]
-        self.view_menu = view
-        self.action(file, "new", ("新しいウィンドウ", "New window"), self.controller.new_window, "Ctrl+N", False)
-        self.action(file, "open", ("開く…", "Open…"), self.browse, "Ctrl+O", False)
-        self.action(file, "close", ("文書を閉じる", "Close document"), lambda: self.close_tabs([self.tabs.currentIndex()]), "Ctrl+W")
-        self.action(file, "reload", ("再読み込み", "Reload"), self.reload, "Ctrl+R")
-        self.action(file, "duplicate_tab", ("タブを複製", "Duplicate tab"), lambda: self.duplicate(False))
-        self.action(file, "duplicate_window", ("別ウィンドウに複製", "Duplicate in new window"), lambda: self.duplicate(True))
-        file.addSeparator()
-        self.action(file, "save_as", ("名前を付けて保存…", "Save as…"), self.save_as, "Ctrl+Shift+S")
-        self.action(file, "save", ("注釈を保存", "Save annotations"), self.save, "Ctrl+S")
-        self.action(file, "properties", ("文書のプロパティ", "Document properties"), self.properties, "Ctrl+D")
-        self.action(file, "exit", ("終了", "Exit"), self.close, required=False)
-
-        self.action(edit, "undo", ("注釈を元に戻す", "Undo annotation edit"),
-                    self.move_annotation_history, "Ctrl+Z")
-        redo = self.action(edit, "redo", ("注釈をやり直す", "Redo annotation edit"),
-                           lambda: self.move_annotation_history(True))
-        redo.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
-
-        modes = QActionGroup(self)
-        modes.setExclusive(True)
-        self.action_groups.append(modes)
-        for mode, names in (("single", ("単ページ", "Single page")), ("spread", ("見開き", "Facing pages")),
-                            ("book", ("表紙付き見開き", "Book view"))):
-            modes.addAction(self.action(view, mode, names,
-                                       lambda value=mode: self.dispatch("view.set_layout", value), check=True))
-        self.action(view, "continuous", ("連続表示", "Continuous"), self.toggle_continuous, check=True)
-        self.action(view, "rtl", ("右開き", "Right to left"), self.toggle_rtl, check=True)
-        self.action(view, "left", ("左に90度回転", "Rotate left"), lambda: self.rotate(-90))
-        self.action(view, "right", ("右に90度回転", "Rotate right"), lambda: self.rotate(90))
-        self.action(view, "outline", ("目次", "Outline"), lambda: self.toggle_sidebar("outline"), check=True)
-        self.action(view, "notes", ("注釈一覧", "Annotations"), lambda: self.toggle_sidebar("notes"), check=True)
-
-        self.action(go, "page_previous", ("前のページ", "Previous page"), lambda: self.step_page(-1))
-        self.action(go, "page_next", ("次のページ", "Next page"), lambda: self.step_page(1))
-        self.action(go, "first", ("最初のページ", "First page"), lambda: self.dispatch("navigate", 0), "Ctrl+Home")
-        self.action(go, "last", ("最後のページ", "Last page"), lambda: self.dispatch("navigate", len(self.pane.view.pages) - 1), "Ctrl+End")
-        self.action(go, "page", ("ページへ移動…", "Go to page…"), self.go_page, "Ctrl+G")
-        self.action(go, "back", ("戻る", "Back"), lambda: self.dispatch("back_forward", -1), "Alt+Left")
-        self.action(go, "forward", ("進む", "Forward"), lambda: self.dispatch("back_forward", 1), "Alt+Right")
-        self.action(go, "find", ("文書内で検索…", "Find in document…"), lambda: self.dispatch("open_find"), "Ctrl+F")
-        self.action(go, "find_next", ("次の一致", "Next match"), lambda: self.dispatch("move_match", 1), "F3")
-        self.action(go, "find_previous", ("前の一致", "Previous match"), lambda: self.dispatch("move_match", -1), "Shift+F3")
-
-        self.action(zoom, "fit", ("ページ全体に合わせる", "Fit page"), lambda: self.dispatch("view.set_zoom", "fit"))
-        self.action(zoom, "actual", ("実寸", "Actual size"), lambda: self.dispatch("view.set_zoom", "custom", ACTUAL_SIZE))
-        self.action(zoom, "width", ("幅に合わせる", "Fit width"), lambda: self.dispatch("view.set_zoom", "width"), "Ctrl+0")
-        self.action(zoom, "content", ("内容に合わせる", "Fit content"), lambda: self.dispatch("view.set_zoom", "content"))
-        self.action(zoom, "bigger", ("拡大", "Zoom in"), lambda: self.dispatch("view.change_zoom", 1.2), "Ctrl++")
-        self.action(zoom, "smaller", ("縮小", "Zoom out"), lambda: self.dispatch("view.change_zoom", 1 / 1.2), "Ctrl+-")
-        self.action(zoom, "cycle", ("倍率を切り替える", "Cycle fit modes"), self.cycle_zoom, "Ctrl+Shift+0")
-        zoom.addSeparator()
-        for percent in (6400, 3200, 1600, 800, 400, 200, 150, 125, 100, 50, 25, 12.5, 8.33):
-            name = f"{percent:g}%"
-            self.action(zoom, name, (name, name),
-                        lambda value=percent: self.dispatch("view.set_zoom", "custom", ACTUAL_SIZE * value / 100))
-        self.action(zoom, "custom", ("倍率を指定…", "Custom zoom…"), self.custom_zoom)
-
-        for key, names, command in (
-            ("copy", ("選択範囲をコピー", "Copy selection"), "copy_selection"),
-            ("translate", ("翻訳…", "Translate…"), "translate_selection"),
-            ("find_selection", ("文書内で検索", "Find in document"), "find_selection"),
-            ("google", ("Google で検索", "Search Google"), "google_selection"),
-            ("all", ("すべて選択", "Select all"), "view.select_all"),
-        ):
-            self.action(selection, key, names, lambda method=command: self.dispatch(method))
-        settings = self.action(None, "preferences", ("設定", "Settings"), self.open_settings, "Ctrl+,", False)
-        menu.insertAction(help_.menuAction(), settings)
-        self.action(help_, "keys", ("ショートカット", "Keyboard shortcuts"), self.shortcuts, required=False)
-        self.action(help_, "about", (f"{APP_NAME} について", f"About {APP_NAME}"), self.about, required=False)
-        self.action(None, "next_tab", ("次のタブ", "Next tab"), lambda: self.cycle_tab(1), "Ctrl+Tab", False)
-        self.action(None, "previous_tab", ("前のタブ", "Previous tab"), lambda: self.cycle_tab(-1), "Ctrl+Shift+Tab", False)
-        self.chrome.bind(self.actions, zoom)
 
     def open_settings(self):
         SettingsDialog(self).open()
@@ -328,14 +223,10 @@ class Reader(QMainWindow):
         pane = self.pane
         ready = bool(pane and pane.document.info and not pane.document.loading)
         failed = ready and any(job.state == "failed" for job in pane.document.jobs.values())
-        self.view_menu.setTitle(self.t("表示", "View") + (" ●" if failed and pane.notes.isHidden() else ""))
-        for key, (action, required) in self.actions.items():
-            action.setEnabled(not required or ready)
-            if ready and key in ("copy", "translate", "find_selection", "google"):
-                action.setEnabled(bool(pane.view.selection_range))
+        self.menus.update_availability(pane, ready, failed)
         self.chrome.set_location(pane)
         if not ready:
-            self.actions["notes"][0].setText(self.t("注釈一覧", "Annotations"))
+            self.menus.clear_document_actions()
             self.chrome.set_external("")
             self.set_document_title()
             return
@@ -344,19 +235,7 @@ class Reader(QMainWindow):
         state = (self.t("保存中…", "Saving…") if doc.saving else
                  self.t("未保存の変更があります", "Unsaved changes") if unsaved else "")
         self.set_document_title(state, doc.path.name)
-        for key, active in ((pane.view.layout_mode, True), ("continuous", pane.view.continuous),
-                            ("rtl", pane.view.rtl), ("outline", not pane.outline.isHidden()),
-                            ("notes", not pane.notes.isHidden())):
-            self.actions[key][0].setChecked(active)
-        self.actions["notes"][0].setText(self.t("注釈一覧", "Annotations") + (" ●" if failed else ""))
-        self.actions["save"][0].setEnabled(unsaved and not doc.saving)
-        self.actions["undo"][0].setEnabled(doc.can_undo and not doc.busy)
-        self.actions["redo"][0].setEnabled(doc.can_redo and not doc.busy)
-        self.actions["back"][0].setEnabled(pane.history_index > 0)
-        self.actions["forward"][0].setEnabled(pane.history_index + 1 < len(pane.history))
-        current = pane.view.current_page()
-        self.actions["page_previous"][0].setEnabled(current > 0)
-        self.actions["page_next"][0].setEnabled(current + 1 < len(pane.view.pages))
+        self.menus.update_document_actions(pane, unsaved, failed)
         self.chrome.set_external(self.t("元の PDF が変更されました。別のファイルに保存するか、読み込み直してください。",
                                      "The PDF has changed on disk. Save a copy or reload.") if doc.external else "")
 
@@ -485,110 +364,13 @@ class Reader(QMainWindow):
             self.pane.document.move_history(redo)
 
     def confirm_discard(self, doc, reload=False):
-        if doc.loading:
-            self.show_message(self.t("PDF を更新しています。", "The PDF is being updated."))
-            return False
-        unsaved = self.controller.has_unsaved_changes(doc)
-        if not unsaved and not doc.has_active_jobs and not doc.saving:
-            return True
-        box = QMessageBox(self)
-        box.setWindowTitle(doc.path.name)
-        box.setText(self.t("未保存の変更または翻訳中の注釈があります。", "There are unsaved changes or active translations."))
-        discard = box.addButton(self.t("破棄して再読み込み", "Discard and reload") if reload else
-                                 self.t("破棄して閉じる", "Discard and close"), QMessageBox.ButtonRole.DestructiveRole)
-        cancel = box.addButton(self.t("キャンセル", "Cancel"), QMessageBox.ButtonRole.RejectRole)
-        save = box.addButton(self.t("保存して続行", "Save and continue"), QMessageBox.ButtonRole.AcceptRole)
-        save.setEnabled((unsaved or bool(doc.saving)) and not doc.has_active_jobs)
-        box.setDefaultButton(cancel)
-        box.exec()
-        chosen = box.clickedButton()
-        box.deleteLater()
-        if chosen is discard:
-            return True
-        if chosen is not save:
-            return False
-        return self.save_document(doc)
+        return self.document_save.confirm_discard(doc, reload)
 
     def confirm_switch(self, doc):
-        box = QMessageBox(self)
-        box.setWindowTitle(doc.path.name)
-        box.setText(self.t("未保存の変更があります。", "This document has unsaved changes."))
-        save = box.addButton(self.t("保存して切り替え", "Save and switch"), QMessageBox.ButtonRole.AcceptRole)
-        keep = box.addButton(self.t("未保存のまま切り替え", "Switch without saving"), QMessageBox.ButtonRole.ActionRole)
-        cancel = box.addButton(self.t("キャンセル", "Cancel"), QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(cancel)
-        box.exec()
-        chosen = box.clickedButton()
-        box.deleteLater()
-        return chosen is keep or (chosen is save and self.save_document(doc))
+        return self.document_save.confirm_switch(doc)
 
     def save_document(self, doc, destination=None):
-        if doc.loading or doc.disposed:
-            return False
-        if doc.external and destination is None:
-            destination = self.save_destination(doc)
-            if not destination:
-                return False
-        panels = [pane.notes for pane in self.controller.panes() if pane.document is doc]
-        drafts = {}
-        for panel in panels:
-            for key, value in panel.comment_drafts().items():
-                if key in drafts and drafts[key] != value:
-                    self.show_message(self.t("同じ注釈に異なる下書きがあります。各タブでコメントを確認してください。",
-                                             "Tabs have different drafts for the same annotation. Review their comments."))
-                    return False
-                drafts[key] = value
-        for panel in panels:
-            panel.commit_drafts()
-
-        wait = QEventLoop()
-
-        def settled():
-            if not doc.busy:
-                wait.quit()
-
-        if doc.busy:
-            doc.changed.connect(settled)
-            try:
-                wait.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-            finally:
-                doc.changed.disconnect(settled)
-        if self.controller.has_comment_drafts(doc):
-            return False
-        doc.auto_save.stop()
-
-        def write(allow_signature_loss=False):
-            result = []
-
-            def ready(ok):
-                result.append(ok)
-                wait.quit()
-
-            if destination:
-                doc.save(destination, ready, allow_signature_loss=allow_signature_loss,
-                         on_signature_loss=lambda: ready(None))
-            else:
-                doc.save(destination, ready)
-            if not result:
-                wait.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-            return result[0] if result else False
-
-        saved = write()
-        if saved is None:
-            confirmed = ask(
-                self, self.t("電子署名付き PDF", "Digitally signed PDF"),
-                self.t("別のファイルに保存すると、電子署名の検証に影響する可能性があります。保存しますか？",
-                       "Saving this copy may affect validation of the digital signature. Save a copy?"),
-                self.t("保存", "Save"), self.t("キャンセル", "Cancel"),
-            )
-            saved = confirmed and write(True)
-        if not saved:
-            return False
-        if destination is not None and Path(destination).resolve() != Path(doc.path).resolve():
-            # A copy was written; the open document and its unsaved marker are unchanged.
-            self.show_message(self.t("コピーを保存しました。開いているのは元のファイルです。",
-                                     "Saved a copy. The open file is still the original."))
-        return destination is not None or not self.controller.has_unsaved_changes(doc)
+        return self.document_save.save_document(doc, destination)
 
     def close_tabs(self, indices):
         panes = [pane for i in sorted(set(indices)) if (pane := self.tabs.widget(i))]
@@ -638,9 +420,7 @@ class Reader(QMainWindow):
             self.save_document(self.pane.document)
 
     def save_destination(self, doc):
-        path, _ = QFileDialog.getSaveFileName(self, self.t("名前を付けて保存", "Save as"),
-                                              str(doc.path.with_stem(doc.path.stem + "-notes")), "PDF (*.pdf)")
-        return path if not path or path.lower().endswith(".pdf") else path + ".pdf"
+        return self.document_save.save_destination(doc)
 
     def save_as(self):
         if self.pane:

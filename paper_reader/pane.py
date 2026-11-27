@@ -13,13 +13,15 @@ from PySide6.QtWidgets import (
 )
 from shiboken6 import isValid
 
-from .dialogs import TranslationDialog
+from .annotation_card import COLORS, add_color_actions, color_menu
 from .font_ui import AreaMenu
 from .icons import icon, swatch
-from .notes import COLORS, Notes, add_color_actions, color_menu
+from .navigation import NavigationHistory, PageLinks, check_hit
+from .notes import Notes
 from .selection import bounds
 from .sidebar import WrappingOutline
 from .translation import chat_request
+from .translation_dialog import TranslationDialog
 from .view import PaperView
 
 
@@ -36,9 +38,7 @@ class DocumentPane(QWidget):
         self.window, self.document = window, document
         self.fonts = window.fonts
         self.preferences = window.preferences
-        self.history = []
-        self.history_index = -1
-        self.navigation_target = None
+        self.navigation = NavigationHistory()
         self.lookup = None
         self.lookup_menu = None
         self.lookup_clock = QElapsedTimer()
@@ -46,8 +46,7 @@ class DocumentPane(QWidget):
         self.lookup_timer.timeout.connect(self.update_lookup)
         self.last_color = next(iter(COLORS))
         self.rules_generation = document.rules_generation
-        self.links = {}
-        self.link_reads = {}
+        self.page_links = PageLinks(document)
         self.hover_point = None
         self.hover_revision = 0
         self.hover_request = None
@@ -202,13 +201,11 @@ class DocumentPane(QWidget):
 
     def on_loaded(self, preserve):
         self.end_lookup()
-        self.navigation_target = None
-        self.links.clear()
-        self.link_reads.clear()
+        self.navigation.target = None
+        self.page_links.clear()
         self.track_hover(None)
         self.hover_request = None
-        self.history.clear()
-        self.history_index = -1
+        self.navigation.clear()
         self.pending_note = self.view.selected_note = None
         self.view.set_document(self.document.info["pages"], self.document.generation, preserve)
         self.outline.clear()
@@ -257,36 +254,29 @@ class DocumentPane(QWidget):
         if self.view.highlight_drag and self.view.highlight_drag.key in keys:
             self.view.clear_selection()
 
+    @property
+    def history_index(self):
+        return self.navigation.index
+
     def navigate(self, page, x=None, y=0, *, target=None):
         if not self.document.info or not 0 <= page < len(self.view.pages):
             return
         self.end_lookup()
-        before = self.view.location(), self.navigation_target
-        self.navigation_target = target
+        before = self.view.location(), self.navigation.target
+        self.navigation.target = target
         self.view.go_to(page, y, x)
         self.view.show_navigation_target(target)
-        after = self.view.location(), target
-        if before == after:
-            return
-        self.history = self.history[:self.history_index + 1]
-        if not self.history or self.history[-1] != before:
-            self.history.append(before)
-        self.history.append(after)
-        self.history_index = len(self.history) - 1
-        self.location_changed.emit()
+        if self.navigation.record(before, (self.view.location(), target)):
+            self.location_changed.emit()
 
     def back_forward(self, delta):
-        index = self.history_index + delta
-        if 0 <= index < len(self.history):
+        if self.navigation.can_move(delta):
             self.end_lookup()
             self.view.input_revision += 1
             self.view.cancel_click_series()
-            if delta < 0 and self.history_index == len(self.history) - 1:
-                self.history[self.history_index] = self.view.location(), self.navigation_target
-            self.history_index = index
-            position, self.navigation_target = self.history[index]
+            position = self.navigation.move(delta, self.view.location)
             self.view.restore(position)
-            self.view.show_navigation_target(self.navigation_target)
+            self.view.show_navigation_target(self.navigation.target)
             self.location_changed.emit()
 
     def visit_reference(self, entry):
@@ -411,58 +401,14 @@ class DocumentPane(QWidget):
         self.update_count()
         self.view.viewport().update()
 
-    @staticmethod
-    def check_hit(box, x, y):
-        return box[0] <= x <= box[2] and box[1] <= y <= box[3]
-
     def hit_annotation(self, position):
         index, x, y = position
         for key, note in reversed(tuple(self.document.annotations.get(index, {}).items())):
             for quad in note["quads"]:
                 xs, ys = zip(*quad)
-                if self.check_hit((min(xs), min(ys), max(xs), max(ys)), x, y):
+                if check_hit((min(xs), min(ys), max(xs), max(ys)), x, y):
                     return key
         return None
-
-    def link_at(self, position, navigable):
-        page, x, y = position
-        return next((link for link in self.links.get(page, ()) if self.check_hit(link["box"], x, y)
-                     and (not navigable or "page" in link or QUrl(link["uri"]).scheme() in ("http", "https"))),
-                    None)
-
-    def with_link(self, position, callback, *, needed=None, failed=None, cancelled=None,
-                  navigable=False, priority=-1):
-        page = position[0]
-
-        def deliver(error=None):
-            if needed is not None and not needed():
-                if cancelled is not None:
-                    cancelled()
-                return
-            if error and failed is not None:
-                failed(error)
-                return
-            callback(self.link_at(position, navigable))
-
-        if page in self.links:
-            deliver()
-            return
-        request_key = self.document.identifier, "page_links", self, page
-        if page in self.link_reads:
-            self.link_reads[page].append((needed, deliver))
-            self.document.promote(request_key, priority)
-            return
-        subscribers = self.link_reads[page] = [(needed, deliver)]
-
-        def loaded(value, error):
-            self.link_reads.pop(page, None)
-            if value is not None:
-                self.links[page] = value
-            for _, ready in subscribers:
-                ready(error)
-
-        self.document.request("page_links", (page,), loaded, priority=priority, key=request_key,
-                              needed=lambda: any(test is None or test() for test, _ in subscribers))
 
     def track_hover(self, position):
         if position is None and self.hover_point is None:
@@ -472,8 +418,8 @@ class DocumentPane(QWidget):
                 return
             page, x, y = position
             mark = self.view.link_hover
-            if mark and mark[0] == page and self.check_hit(mark[1], x, y):
-                native = self.link_at(position, True)
+            if mark and mark[0] == page and check_hit(mark[1], x, y):
+                native = self.page_links.at(position, True)
                 if (mark[2] and native and native["box"] == mark[1]) or (not mark[2] and not native):
                     return
             if position == self.hover_point:
@@ -517,7 +463,7 @@ class DocumentPane(QWidget):
                                       lambda citation, error: finish(citation.box if citation else None),
                                       priority=HOVER_PRIORITY, needed=current)
 
-        self.with_link(position, link_ready, needed=current, failed=lambda error: finish(), cancelled=finish,
+        self.page_links.read_at(position, link_ready, needed=current, failed=lambda error: finish(), cancelled=finish,
                        navigable=True, priority=HOVER_PRIORITY)
 
     def hideEvent(self, event):
@@ -588,7 +534,7 @@ class DocumentPane(QWidget):
             elif self.document.get_note(key) and self.hit_annotation(position) == key:
                 self.pick_note(key)
 
-        def named_target(value, error, page, point):
+        def named_target(value, page, point):
             if still_current():
                 clear_note()
                 if value:
@@ -606,29 +552,17 @@ class DocumentPane(QWidget):
             else:
                 no_target()
 
-        def open_link(link):
-            if not still_current():
-                return
-            if link is None:
-                self.document.resolve_citation(position, citation_ready, still_current)
-            elif "page" in link:
-                page, point = link["page"], link["point"]
-                if link.get("page_only"):
-                    self.document.request("named_figure_target", (position, page),
-                                          lambda value, error: named_target(value, error, page, point),
-                                          priority=2, needed=still_current)
-                else:
-                    named_target(None, None, page, point)
-            else:
-                self.end_lookup()
-                clear_note()
-                if not QDesktopServices.openUrl(QUrl(link["uri"])):
-                    self.message.emit(self.t("ブラウザーを開けませんでした。", "Could not open the browser."))
+        def open_external(uri):
+            self.end_lookup()
+            clear_note()
+            if not QDesktopServices.openUrl(QUrl(uri)):
+                self.message.emit(self.t("ブラウザーを開けませんでした。", "Could not open the browser."))
 
         self.lookup = still_current
         self.lookup_clock.start()
         self.lookup_timer.start()
-        self.with_link(position, open_link, needed=still_current, failed=failed, navigable=True)
+        self.page_links.resolve_destination(position, needed=still_current, failed=failed,
+                                            citation=citation_ready, location=named_target, external=open_external)
 
     def open_citation(self, position, citation, targets, still_current, clear_note):
         self.lookup_clock.invalidate()
@@ -704,7 +638,7 @@ class DocumentPane(QWidget):
             menu.deleteLater()
 
         if position and self.document.info:
-            self.with_link(position, show, needed=current)
+            self.page_links.read_at(position, show, needed=current)
         else:
             show(None)
 

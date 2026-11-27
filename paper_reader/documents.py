@@ -9,8 +9,8 @@ from pathlib import Path
 from PySide6.QtCore import QFileSystemWatcher, QObject, QTimer, Signal
 
 from .session import PdfSession
+from .tile_cache import TileCache
 from .translation import Translations
-from .view import TileCache
 
 # One reference or figure scan request reads pages for about this long, so the scan is not slowed by a
 # worker round trip per page. Requests that arrive meanwhile wait at most this long.

@@ -156,7 +156,7 @@ def main():
         engine = PdfEngine()
         engine.open(manifest[labels["key"]]["path"])
         try:
-            scanned = any(engine._page_evidence(int(page), engine._analysis_page(int(page)))[4]
+            scanned = any(engine.analysis._page_evidence(int(page), engine._analysis_page(int(page)))[4]
                           for page in labels["pages"])
             counts, notes = score(engine, labels, select, scanned)
         finally:
