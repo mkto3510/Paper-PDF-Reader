@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from heapq import heapify, heappop, heappush
 from itertools import count
 from multiprocessing import get_context
@@ -9,8 +10,20 @@ import sys
 from tempfile import TemporaryDirectory
 import traceback
 from threading import Thread
+from typing import Callable
 
 from PySide6.QtCore import QObject, QTimer, Signal
+
+
+@dataclass(order=True)
+class _QueuedRequest:
+    priority: int
+    sequence: int
+    key: object = field(compare=False)
+    name: str = field(compare=False)
+    args: tuple = field(compare=False)
+    callback: Callable = field(compare=False)
+    needed: Callable | None = field(compare=False)
 
 
 def _run_worker(peer, working_directory):
@@ -44,7 +57,7 @@ class PdfSession(QObject):
         if self.closed:
             self._call(callback, None, "PDF 処理を終了しました。")
             return
-        heappush(self.queue, (priority, next(self.sequence), key, name, args, callback, needed))
+        heappush(self.queue, _QueuedRequest(priority, next(self.sequence), key, name, args, callback, needed))
         self._pump()
 
     @staticmethod
@@ -67,13 +80,13 @@ class PdfSession(QObject):
 
     def _pump(self):
         while self.queue and self.current is None and not self.closed:
-            _, _, key, name, args, callback, needed = heappop(self.queue)
-            if not self._wanted(needed):
-                self._call(callback, None, None)
+            request = heappop(self.queue)
+            if not self._wanted(request.needed):
+                self._call(request.callback, None, None)
                 continue
-            self.current = callback, key
+            self.current = request.callback, request.key
             try:
-                self.pipe.send((name, args))
+                self.pipe.send((request.name, request.args))
             except (OSError, EOFError):
                 self._stopped()
 
@@ -96,9 +109,9 @@ class PdfSession(QObject):
             QTimer.singleShot(0, self._pump)
 
     def promote(self, key, priority):
-        for index, request in enumerate(self.queue):
-            if request[2] == key and request[0] > priority:
-                self.queue[index] = (priority, *request[1:])
+        for request in self.queue:
+            if request.key == key and request.priority > priority:
+                request.priority = priority
                 heapify(self.queue)
                 break
 
@@ -106,7 +119,7 @@ class PdfSession(QObject):
         keep = []
         while self.queue:
             request = heappop(self.queue)
-            if request[2] != key:
+            if request.key != key:
                 heappush(keep, request)
         self.queue = keep
 
@@ -120,7 +133,7 @@ class PdfSession(QObject):
             self.current = None
             self._call(callback, None, message)
         while self.queue:
-            self._call(heappop(self.queue)[5], None, message)
+            self._call(heappop(self.queue).callback, None, message)
 
     def shutdown(self):
         if self.pipe.closed:

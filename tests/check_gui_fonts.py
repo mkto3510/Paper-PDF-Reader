@@ -182,7 +182,7 @@ def check_settings_dialog(app, root):
         broken = SettingsDialog(window)
         broken.font_rows["tab"][0].setValue(200)
         broken.fields["endpoint"].setText("not a url")
-        with patch("paper_reader.dialogs.warn") as warning:
+        with patch("paper_reader.settings_dialog.warn") as warning:
             broken.commit()
             assert warning.call_count == 1
         assert control.preferences.data["fontTab"] == 100 and not events
@@ -191,7 +191,7 @@ def check_settings_dialog(app, root):
         # A write that fails warns, keeps the dialog open and applies nothing.
         failing = SettingsDialog(window)
         failing.font_rows["tab"][0].setValue(200)
-        with patch("paper_reader.dialogs.QMessageBox.warning") as warning, \
+        with patch("paper_reader.settings_dialog.QMessageBox.warning") as warning, \
                 patch("paper_reader.preferences.write_json", side_effect=OSError("read-only")):
             failing.commit()
             assert warning.call_count == 1

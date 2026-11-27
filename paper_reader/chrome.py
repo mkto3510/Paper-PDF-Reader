@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 
 from .font_ui import AreaMenu, AreaMenuBar
 from .icons import icon
+from .viewport_layout import ACTUAL_SIZE
 
 
 MINIMUM_WIDTH = 530
@@ -128,6 +129,7 @@ class Header(QWidget):
     def __init__(self, window):
         super().__init__(window)
         self.window = window
+        self._actions = {}
         layout = QVBoxLayout(self)
         layout.setSpacing(0)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -254,6 +256,7 @@ class Header(QWidget):
             pane.view.setFocus()
 
     def bind(self, actions, zoom_menu):
+        self._actions = actions
         self.zoom.setMenu(zoom_menu)
         self.hidden_tools = None
         for name, button in self.buttons.items():
@@ -279,7 +282,7 @@ class Header(QWidget):
         self.timer.start()
 
     def fit_tools(self):
-        if not self.window.actions:
+        if not self._actions:
             return
         search_visible = not self.search.isHidden()
         search_width = self.search.currentWidget().minimumSizeHint().width() if search_visible else 0
@@ -325,7 +328,7 @@ class Header(QWidget):
             self.hidden_tools = hidden
             self.overflow.clear()
             for group in self.GROUPS:
-                actions = [self.window.actions[name][0] for name in group if name in hidden]
+                actions = [self._actions[name][0] for name in group if name in hidden]
                 if actions and not self.overflow.isEmpty():
                     self.overflow.addSeparator()
                 self.overflow.addActions(actions)
@@ -344,5 +347,4 @@ class Header(QWidget):
         if not self.page.hasFocus() or not self.page.isModified():
             self.page.setText(str(view.current_page() + 1))
         self.total.setText(f"/ {len(view.pages)}")
-        from .view import ACTUAL_SIZE
         self.zoom.setText(f"{view.zoom / ACTUAL_SIZE * 100:.0f}%")

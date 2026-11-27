@@ -360,7 +360,7 @@ def check_data_protection(app, root):
         settings.fields["endpoint"].setText("not a url")
         settings.select_profile(settings.active_profile)
         assert settings.profile_key != broken
-        with patch("paper_reader.dialogs.warn") as warning:
+        with patch("paper_reader.settings_dialog.warn") as warning:
             settings.commit()
             assert warning.call_count == 1 and settings.profile_key == broken
             assert settings.data["profiles"][broken]["name"] in warning.call_args.args[2]

@@ -8,18 +8,15 @@ from dataclasses import dataclass
 from math import ceil
 
 from PySide6.QtCore import QEvent, QPointF, QRectF, QTextBoundaryFinder, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF, QTransform
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QAbstractScrollArea, QApplication
 from shiboken6 import isValid
 
 from .selection import join_selections, nearest, select
+from .tile_cache import TileCache
+from .viewport_layout import ACTUAL_SIZE, MARGIN, MAX_SCALE, MIN_SCALE, layout_pages, page_transform
 
 TILE = 768
-CACHE_BYTES = 64 * 1024 * 1024
-MARGIN = 16
-ACTUAL_SIZE = 96 / 72
-MIN_SCALE = ACTUAL_SIZE * 0.0833
-MAX_SCALE = ACTUAL_SIZE * 64
 DRAG_DISTANCE = 4
 
 
@@ -52,31 +49,6 @@ class HighlightDrag:
     preview: tuple = ()
     handle: tuple | None = None
     released: bool = False
-
-
-class TileCache:
-    def __init__(self):
-        self.tiles = OrderedDict()
-        self.bytes = 0
-
-    def get(self, key):
-        tile = self.tiles.get(key)
-        if tile is not None:
-            self.tiles.move_to_end(key)
-        return tile
-
-    def put(self, key, tile):
-        previous = self.tiles.pop(key, None)
-        if previous:
-            self.bytes -= previous[2].sizeInBytes()
-        self.tiles[key] = tile
-        self.bytes += tile[2].sizeInBytes()
-        while self.bytes > CACHE_BYTES:
-            self.bytes -= self.tiles.popitem(last=False)[1][2].sizeInBytes()
-
-    def discard(self, document):
-        for key in [key for key in self.tiles if key[0] == document]:
-            self.bytes -= self.tiles.pop(key)[2].sizeInBytes()
 
 
 class PaperView(QAbstractScrollArea):
@@ -173,54 +145,23 @@ class PaperView(QAbstractScrollArea):
         self.viewport().update()
 
     def _transform(self, index):
-        width, height = self.pages[index]
-        rotation = QTransform().rotate(self.rotation)
-        box = rotation.mapRect(QRectF(0, 0, width, height))
-        rotation *= QTransform.fromTranslate(-box.x(), -box.y())
-        return rotation, box.width(), box.height()
+        return page_transform(self.pages[index], self.rotation)
 
     def _layout(self):
         self._invalidate_pointer_position()
-        grouped = []
-        index = 0
-        while index < len(self.pages):
-            count = 1 if self.layout_mode == "single" or (self.layout_mode == "book" and index == 0) else 2
-            row = list(range(index, min(index + count, len(self.pages))))
-            grouped.append(row[::-1] if self.rtl else row)
-            index += count
-        self.row_for = {page: row for row, pages in enumerate(grouped) for page in pages}
-        shown = grouped if self.continuous or not grouped else [grouped[self.row_for[self.page]]]
-        sizes = {p: self._transform(p)[1:] for p in range(len(self.pages))}
         width, height = self.viewport().width(), self.viewport().height()
-        if shown and self.zoom_mode != "custom":
-            active = grouped[self.row_for[self.page]]
-            room_width = max(1, width - (len(active) + 1) * MARGIN - 2)
-            room_height = max(1, height - 2 * MARGIN - 2)
-            width_fit = room_width / sum(sizes[p][0] for p in active)
-            height_fit = room_height / max(sizes[p][1] for p in active)
-            if self.zoom_mode == "content" and self.content_box:
-                box = self._transform(self.page)[0].mapRect(QRectF(*self._rect_args(self.content_box)))
-                fit = min(room_width / max(box.width(), 1), room_height / max(box.height(), 1))
-            else:
-                fit = width_fit if self.zoom_mode == "width" else min(width_fit, height_fit)
-            self.zoom = max(MIN_SCALE, min(MAX_SCALE, fit))
-        widths = [sum(ceil(sizes[p][0] * self.zoom) for p in row) + (len(row) + 1) * MARGIN for row in shown]
-        self.content_width = max([width, *widths])
+        layout = layout_pages(self.pages, (width, height), page=self.page, mode=self.layout_mode,
+                              continuous=self.continuous, rtl=self.rtl, rotation=self.rotation,
+                              zoom_mode=self.zoom_mode, zoom=self.zoom, content_box=self.content_box)
+        self.zoom = layout.zoom
+        self.rows, self.row_for, self.row_tops = layout.rows, layout.row_for, layout.row_tops
+        self.content_width = layout.width
         self.positions.clear()
-        self.rows, self.row_tops = shown, []
-        top = MARGIN
-        for row, row_width in zip(shown, widths):
-            self.row_tops.append(top)
-            x = (self.content_width - row_width) // 2 + MARGIN
-            for page in row:
-                pw, ph = (ceil(value * self.zoom) for value in sizes[page])
-                self.positions[page] = x, top, pw, ph
-                x += pw + MARGIN
-            top += max(self.positions[p][3] for p in row) + MARGIN
-        for bar, extent, viewport in ((self.verticalScrollBar(), top, height),
-                                      (self.horizontalScrollBar(), self.content_width, width)):
+        self.positions.update(layout.positions)
+        for bar, extent, viewport in ((self.verticalScrollBar(), layout.height, height),
+                                      (self.horizontalScrollBar(), layout.width, width)):
             bar.setPageStep(viewport)
-            bar.setRange(0, max(0, extent - viewport) if shown else 0)
+            bar.setRange(0, max(0, extent - viewport) if layout.rows else 0)
 
     def resizeEvent(self, event):
         old = event.oldSize()

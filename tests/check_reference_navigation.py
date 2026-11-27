@@ -19,6 +19,7 @@ from paper_reader.captions import classify_captions, figure_mentions
 from paper_reader.citations import ReferenceIndex
 from paper_reader.notes import COLORS, add_color_actions
 from paper_reader.pdf import PdfEngine
+from paper_reader.pdf_analysis import PdfAnalysis
 from paper_reader.selection import Glyph, Line, select
 
 
@@ -323,7 +324,7 @@ def check_scan_order(folder):
             citation = engine.citation_at(*point)
             target, = engine.figure_nearby(point, citation.keys)
             assert (target.label.startswith(expected) and target.page == 2) if expected else target is None, label
-        assert engine.figure_page == 0, "The nearby lookup read the whole document"
+        assert engine.analysis.figure_page == 0, "The nearby lookup read the whole document"
     finally:
         engine.close()
 
@@ -417,7 +418,7 @@ def check_split_caption(folder):
     engine = PdfEngine(folder)
     try:
         engine.open(str(path))
-        rows, _ = engine._caption_rows(0)
+        rows, _ = engine.analysis._caption_rows(0)
         assert len(rows) == 1, rows
         text = rows[0][0].text
         assert text.startswith("Figure 1.") and "Tectonic setting" in text and "Topographic relief" in text, text
@@ -448,7 +449,7 @@ def check_scanned_caption(folder):
     engine = PdfEngine(folder)
     try:
         engine.open(str(path))
-        rows, _ = engine._caption_rows(0)
+        rows, _ = engine.analysis._caption_rows(0)
         labels = sorted(row[0].label for row in rows)
         assert labels == ["2"], labels
     finally:
@@ -750,7 +751,7 @@ def check_label_close_below_figure_text(folder):
     engine = PdfEngine(folder)
     try:
         engine.open(str(path))
-        rows, _ = engine._caption_rows(0)
+        rows, _ = engine.analysis._caption_rows(0)
         assert [row[0].label for row in rows] == ["7"], rows
         assert rows[0][0].text.startswith("Figure 7.") and "Concentrations" in rows[0][0].text, rows[0][0].text
     finally:
@@ -775,7 +776,7 @@ def check_label_on_band_row(folder):
     engine = PdfEngine(folder)
     try:
         engine.open(str(path))
-        rows, _ = engine._caption_rows(0)
+        rows, _ = engine.analysis._caption_rows(0)
         assert [row[0].label for row in rows] == ["2"], rows
     finally:
         engine.close()
@@ -792,13 +793,13 @@ def check_page_layout(folder):
     engine = PdfEngine(folder)
     try:
         engine.open(str(path))
-        layout = engine._page_layout(0)
-        assert engine._page_layout(0) is layout
+        layout = engine.analysis._page_layout(0)
+        assert engine.analysis._page_layout(0) is layout
         assert layout.regions is layout.regions and layout.reading_order
         assert any(key[1].startswith("running head") for key in layout.edges), layout.edges
         engine.update_rules({"edge_band": 3})
-        assert engine._page_layout(0) is not layout
-        assert not engine._page_layout(0).edges
+        assert engine.analysis._page_layout(0) is not layout
+        assert not engine.analysis._page_layout(0).edges
     finally:
         engine.close()
 
@@ -889,7 +890,7 @@ def check_panel_mentions():
 
     entries = [entry("3", "Figure 3. Displacement fields.", 2), entry("4", "Figure 4. (a) Map. (b) Section.", 3),
                entry("5", "Figure 5. First case.", 4), entry("5", "Figure 5. Second case (b).", 5)]
-    found = PdfEngine._figure_targets((("figure", "3b"), ("figure", "4b"), ("figure", "5b"), ("figure", "5c"),
+    found = PdfAnalysis._figure_targets((("figure", "3b"), ("figure", "4b"), ("figure", "5b"), ("figure", "5c"),
                                        ("figure", "9a")), entries)
     assert [target.page if target else None for target in found] == [2, 3, 5, None, None], found
 

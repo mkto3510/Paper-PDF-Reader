@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from check_chrome_notes import wait
 from paper_reader.application import Application
-from paper_reader.pdf import _compose_accents
+from paper_reader.pdf_analysis import _compose_accents
 from paper_reader.selection import Glyph, Line, Selection, join_selections, nearest, reading_order
 from paper_reader.translation import Job
 
