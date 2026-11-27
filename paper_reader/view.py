@@ -12,7 +12,7 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QAbstractScrollArea, QApplication
 from shiboken6 import isValid
 
-from .selection import join_selections, nearest, select
+from .selection import glyph_spot, join_selections, nearest, select
 from .tile_cache import TileCache
 from .viewport_layout import ACTUAL_SIZE, MARGIN, MAX_SCALE, MIN_SCALE, layout_pages, page_transform
 
@@ -84,6 +84,11 @@ class PaperView(QAbstractScrollArea):
         self.pending = set()
         self.text_pending = {}
         self.text_cache = OrderedDict()
+        # Pages whose cached lines are the quick, unclassified ones (see PdfAnalysis.quick_text). Their line
+        # indices differ from the classified lines that replace them. Callers that sit on `quick_waiting` run with
+        # whichever of the two arrives first.
+        self.provisional = set()
+        self.quick_waiting = {}
         self.notes = {}
         self.selected_note = None
         self.highlight_drag = None
@@ -102,6 +107,8 @@ class PaperView(QAbstractScrollArea):
         self.anchor = self.pointer = None
         self.selection_range = None
         self.selection_origin = ""
+        self.origin_spot = None  # (page, x, y) of the glyph where the selection started; gives the origin its kind
+        self.selection_all = False
         self.waiting = False
         self.press = self.pan_start = None
         self.dragging_selection = False
@@ -130,8 +137,7 @@ class PaperView(QAbstractScrollArea):
         self.show_navigation_target(None)
         self.pages, self.generation = pages, generation
         self.page = min(self.page, len(pages) - 1) if pages and preserve else 0
-        self.text_pending.clear()
-        self.text_cache.clear()
+        self.reset_text()
         self.search_results = {}
         self.current_match = None
         self.content_box = None
@@ -566,7 +572,8 @@ class PaperView(QAbstractScrollArea):
             if drag.released and self.highlight_drag is drag:
                 self._finish_highlight_drag()
 
-        self.load_text(page, ready)
+        # The handles are placed by line indices that the worker's classified lines also use.
+        self.load_text(page, ready, final=True)
         return True
 
     def _preview_highlight(self, lines):
@@ -713,45 +720,122 @@ class PaperView(QAbstractScrollArea):
                              .adjusted(-3, -2, 3, 2))
         painter.restore()
 
-    def load_text(self, index, callback=None, *, interactive=False):
-        if index in self.text_cache:
+    def reset_text(self):
+        self.text_pending.clear()
+        self.text_cache.clear()
+        self.provisional.clear()
+        self.quick_waiting.clear()
+
+    def _remember_text(self, index, lines, provisional=False):
+        self.text_cache[index] = lines
+        if provisional:
+            self.provisional.add(index)
+        else:
+            self.provisional.discard(index)
+        # Keep every visible page: a selection over more than 12 pages would otherwise evict
+        # pages it still needs, and the highlight would flicker as they are read again.
+        while len(self.text_cache) > min(64, max(12, len(self._visible_pages()) + 4)):
+            evicted, _ = self.text_cache.popitem(last=False)
+            self.provisional.discard(evicted)
+
+    def load_text(self, index, callback=None, *, interactive=False, final=False):
+        """Hand the lines of a page to `callback`.
+
+        The quick lines (not yet classified, from the second worker) are enough to start selecting, so they are
+        used unless `final` asks for the classified lines, whose kinds and order the copy and translation depend
+        on. The classified lines are always requested as well and replace the quick ones when they arrive.
+        """
+        cached = self.text_cache.get(index)
+        if cached is not None and not (final and index in self.provisional):
             self.text_cache.move_to_end(index)
             if callback:
-                callback(self.text_cache[index])
+                callback(cached)
             return
+        quick = getattr(self.session, "quick_request", None)
+        early = bool(callback) and not final and quick is not None and cached is None
         key = id(self), "text", self.generation, index
         if index in self.text_pending:
             if callback:
-                self.text_pending[index].append(callback)
+                (self.quick_waiting.setdefault(index, []) if early else self.text_pending[index]).append(callback)
             if interactive or callback:
                 self.session.promote(key, 5)
+                if hasattr(self.session, "promote_quick"):
+                    self.session.promote_quick((*key, "quick"), 4)
             return
         if self.session is None:
             return
-        callbacks = self.text_pending[index] = [callback] if callback else []
+        callbacks = self.text_pending[index] = [] if early or not callback else [callback]
+        if early:
+            self.quick_waiting[index] = [callback]
         generation = self.generation
 
         def received(lines, error):
             if not isValid(self) or generation != self.generation or self.text_pending.get(index) is not callbacks:
                 return
             self.text_pending.pop(index)
+            waiting = self.quick_waiting.pop(index, [])
             if lines is not None:
-                self.text_cache[index] = lines
-                # Keep every visible page: a selection over more than 12 pages would otherwise evict
-                # pages it still needs, and the highlight would flicker as they are read again.
-                while len(self.text_cache) > min(64, max(12, len(self._visible_pages()) + 4)):
-                    self.text_cache.popitem(last=False)
+                if index in self.provisional:
+                    self._remap_selection(index, self.text_cache[index], lines)
+                self._remember_text(index, lines)
                 self._select_endpoints()
                 self.viewport().update()
             if error:
                 self.message.emit(error)
-            for ready in callbacks:
+            for ready in (*callbacks, *waiting):
                 ready(lines)
 
+        def wanted():
+            return isValid(self) and generation == self.generation and (
+                index in self._visible_pages() or bool(callbacks) or bool(self.quick_waiting.get(index)) or
+                index in tuple(p[0] for p in (self.anchor, self.pointer) if p))
+
         self.session.request("text", (index,), received, priority=5 if interactive or callback else 7, key=key,
-                             needed=lambda: isValid(self) and generation == self.generation and (
-                                 index in self._visible_pages() or bool(callbacks) or
-                                 index in tuple(p[0] for p in (self.anchor, self.pointer) if p)))
+                             needed=wanted)
+
+        if quick is None or cached is not None:
+            return
+
+        def received_quick(lines, error):
+            if (lines is None or not isValid(self) or generation != self.generation
+                    or index in self.text_cache or index not in self.text_pending):
+                return  # unavailable, or the classified lines came first
+            self._remember_text(index, lines, provisional=True)
+            self._select_endpoints()
+            self.viewport().update()
+            for ready in self.quick_waiting.pop(index, []):
+                ready(lines)
+
+        quick("quick_text", (index,), received_quick, priority=4 if interactive or callback else 6,
+              key=(*key, "quick"), needed=wanted)
+
+    def _remap_selection(self, page, old, new):
+        """Carry the selection's ends on `page` from the quick lines to the classified ones, by position."""
+        def carry(position):
+            if position[0] != page:
+                return position
+            spot = glyph_spot(old, *position[1:])
+            hit = nearest(new, *spot) if spot else None
+            return (page, *hit) if hit else position
+
+        if self.selection_range and not self.selection_all:
+            self.selection_range = tuple(sorted(carry(position) for position in self.selection_range))
+        if self.unit_anchor:
+            first, last, kind = self.unit_anchor
+            first, last = sorted((carry(first), carry(last)))
+            if first[0] == page and first[1] < len(new):
+                kind = new[first[1]].kind
+            self.unit_anchor = first, last, kind
+        if self.origin_spot and self.origin_spot[0] == page:
+            hit = nearest(new, *self.origin_spot[1:])
+            if hit:
+                self.selection_origin = new[hit[0]].kind
+
+    def selection_pending(self):
+        """True while an end of the selection lies in lines that have not been classified yet."""
+        if not self.selection_range or self.selection_all:
+            return False
+        return any(position[0] in self.provisional for position in self.selection_range)
 
     def clear_selection(self):
         self.input_revision += 1
@@ -760,6 +844,8 @@ class PaperView(QAbstractScrollArea):
         self.end_selection_gesture()
         self.selection_range = None
         self.selection_origin = ""
+        self.origin_spot = None
+        self.selection_all = False
         self.waiting = False
         self.highlight_drag = None
         self.viewport().update()
@@ -768,14 +854,32 @@ class PaperView(QAbstractScrollArea):
         if self.pages:
             self.clear_selection()
             self.selection_range = (0, 0, 0), (len(self.pages) - 1, 2**31, 2**31)
+            self.selection_all = True
             self.viewport().update()
 
     def resolve_selection(self, callback):
         if not self.selection_range:
             return
+        revision, generation = self.selection_revision, self.generation
+        if self.selection_pending():
+            # The ends of the selection are positions in the quick lines. The worker counts in the classified
+            # lines, so wait for those; they also decide which lines the copy leaves out.
+            waiting = {position[0] for position in self.selection_range if position[0] in self.provisional}
+
+            def settled(page):
+                def done(lines):
+                    if lines is None or not isValid(self):
+                        return
+                    waiting.discard(page)
+                    if not waiting and revision == self.selection_revision and generation == self.generation:
+                        self.resolve_selection(callback)
+                return done
+
+            for page in tuple(waiting):
+                self.load_text(page, settled(page), final=True)
+            return
         bounds_ = self.selection_range
         origin = self.selection_origin
-        revision, generation = self.selection_revision, self.generation
         pending = iter(range(bounds_[0][0], bounds_[1][0] + 1))
         collected = [[], []]
 
@@ -990,6 +1094,7 @@ class PaperView(QAbstractScrollArea):
                     self.end_selection_gesture()
                 return
         first, last, origin = self.unit_anchor
+        anchor = first
         if self.dragging_selection:
             page = self.pointer[0]
             if page not in self.text_cache:
@@ -1003,6 +1108,8 @@ class PaperView(QAbstractScrollArea):
         if self.selection_range != selection:
             self.selection_revision += 1
             self.selection_origin = origin
+            spot = glyph_spot(self.text_cache.get(anchor[0], ()), *anchor[1:])
+            self.origin_spot = (anchor[0], *spot) if spot else None
             self.selection_range = selection
             self.viewport().update()
             self.location_changed.emit()

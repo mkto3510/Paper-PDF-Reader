@@ -194,8 +194,7 @@ class DocumentPane(QWidget):
             self.track_hover(None)
             self.end_lookup()
             # Callbacks already in flight belonged to the previous rules.
-            self.view.text_cache.clear()
-            self.view.text_pending.clear()
+            self.view.reset_text()
             self.view.clear_selection()
         self.location_changed.emit()
 
@@ -652,6 +651,9 @@ class DocumentPane(QWidget):
                 callback(choices)
             else:
                 self.message.emit(self.t("選択範囲に文字情報がありません。", "No text in the selection."))
+        if self.view.selection_pending():
+            self.message.emit(self.t("選択した文章を準備しています。ヘッダーや表などを除いてから続けます。",
+                                     "Preparing the selected text. Headers, tables and similar parts are left out first."))
         self.view.resolve_selection(apply)
 
     def copy_selection(self):

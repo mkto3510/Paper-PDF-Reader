@@ -88,6 +88,14 @@ def nearest(lines: tuple[Line, ...], x: float, y: float) -> tuple[int, int] | No
                 for glyph in range(len(line.glyphs))), key=glyph_distance, default=None)
 
 
+def glyph_spot(lines, row: int, glyph: int) -> Point | None:
+    """The centre of a glyph, or None when the position lies outside the lines (an end of "select all")."""
+    if row >= len(lines) or glyph >= len(lines[row].glyphs):
+        return None
+    x0, y0, x1, y1 = lines[row].glyphs[glyph].box
+    return (x0 + x1) / 2, (y0 + y1) / 2
+
+
 def _bands(lines: list[Line], axis: int) -> list[list[Line]]:
     ordered = sorted(lines, key=lambda line: line.box[axis])
     groups: list[list[Line]] = []

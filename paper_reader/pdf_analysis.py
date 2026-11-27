@@ -16,7 +16,8 @@ from .citations import END, HEADING, Reference, ReferenceIndex, citation_at
 from .layout import PageLayout
 from .paragraphs import enumerate_paragraphs
 from .search import find_page
-from .selection import Glyph, Line, bounds, correct_stream_order, edge_band, furniture_key, reading_regions, select
+from .selection import (Glyph, Line, bounds, correct_stream_order, edge_band, furniture_key, reading_order,
+                        reading_regions, select)
 
 
 # Pages on each side of a figure mention that figure_nearby reads before the full scan is needed.
@@ -498,6 +499,20 @@ class PdfAnalysis:
         if len(cache) > (12 if quads else 6):
             cache.popitem(last=False)
         return result
+
+    def quick_text(self, index):
+        """The lines of a page in reading order, before classification.
+
+        This is a provisional answer for hit testing and the blue selection while `text` is still deciding which
+        lines are headers, tables or captions: every line has an empty kind, and the list has no furniture moved
+        to its ends. Line indices therefore differ from those of `text`; callers match them up by position.
+        """
+        page = self.read_page(index)
+        width = page.rect.width
+        if page.rotation in (90, 270):
+            width = page.rect.height
+        lines = self._read_lines(page, False)
+        return self._display_lines(reading_order(lines, width), page)
 
     def paragraphs(self, first=0, last=None):
         """List the paragraphs of pages first..last that are handed to translation (see paragraphs.py)."""

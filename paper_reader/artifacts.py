@@ -69,7 +69,10 @@ def _set_layer_property(doc, owner, marker):
 def artifact_glyphs(page):
     """Return exact (origin, character) keys without modifying the open document."""
     document = page.parent
-    sources = (*page.get_contents(), *(item[0] for item in page.get_xobjects()))
+    contents = page.get_contents()
+    # _mark refuses a page body this large, so there is nothing to find in it.
+    oversized = sum(len(document.xref_stream(xref) or b"") for xref in contents) > MAX_STREAM
+    sources = (*(() if oversized else contents), *(item[0] for item in page.get_xobjects()))
     if not any(ARTIFACT_NAME.search(_decoded_names(document.xref_stream(xref) or b"")) for xref in sources):
         return set()
     with pymupdf.open() as scratch:
